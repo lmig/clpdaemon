@@ -19,7 +19,7 @@ Until the event loop lands (T3), a run without `--check` validates the configura
 
 ## File format
 
-One `key = value` per line. Blank lines and lines whose first non-blank character is `#` are ignored. Spaces around the key and the value are trimmed. Each key may appear once. Lists are comma-separated; spaces around items are trimmed.
+One `key = value` per line; lines may end in LF or CRLF, and spaces and tabs count as blanks. Blank lines and lines whose first non-blank character is `#` are ignored. Spaces around the key and the value are trimmed. Each key may appear once. Lists are comma-separated; spaces around items are trimmed.
 
 | Key | Type | Default |
 |---|---|---|
@@ -50,7 +50,8 @@ All messages go to stderr, except `--check` success and `--help`, which go to st
 | `--config` without a value | `clpdaemon: option --config requires a file` then the usage line, exit 2 |
 | Unknown option | `clpdaemon: unknown option '<arg>'` then the usage line, exit 2 |
 | File cannot be opened | `clpdaemon: <file>: cannot open: <system error>` |
-| File cannot be read (for example, a directory) | `clpdaemon: <file>: cannot read: <system error>`; the file-level checks below are skipped |
+| File cannot be read (for example, a directory, or out of memory) | `clpdaemon: <file>: cannot read: <system error>`; the file-level checks below are skipped |
+| Line containing a NUL byte | `clpdaemon: <file>:<line>: line contains a NUL byte`; the line is ignored |
 | Line without `=` | `clpdaemon: <file>:<line>: expected 'key = value'` |
 | Unknown key | `clpdaemon: <file>:<line>: unknown key '<key>'` |
 | Repeated key | `clpdaemon: <file>:<line>: duplicate key '<key>' (first set on line <n>)` |

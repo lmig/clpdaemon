@@ -22,7 +22,11 @@ check() {
   cases=$((cases + 1))
   "$BIN" "$@" >out.txt 2>err.txt
   rc=$?
-  out=$(cat out.txt) err=$(cat err.txt)
+  # The sentinel keeps trailing newlines visible to the comparison: every
+  # expected non-empty stream ends with exactly one newline.
+  out=$(cat out.txt; printf x) err=$(cat err.txt; printf x)
+  out=${out%x} err=${err%x}
+  want_out=${want_out:+$want_out$NL} want_err=${want_err:+$want_err$NL}
   if [ "$rc" != "$want_rc" ] || [ "$out" != "$want_out" ] || [ "$err" != "$want_err" ]; then
     failures=$((failures + 1))
     printf 'FAIL: %s\n  exit:   got %s, want %s\n  stdout: got [%s]\n          want [%s]\n  stderr: got [%s]\n          want [%s]\n' \
@@ -85,6 +89,13 @@ check "syntax, unknown and duplicate keys" 1 "" \
   "clpdaemon: syntax.conf:2: expected 'key = value'
 clpdaemon: syntax.conf:4: unknown key 'foo'
 clpdaemon: syntax.conf:5: duplicate key 'tick_interval_ms' (first set on line 3)" -- --config syntax.conf --check
+
+conf emptykey.conf 'node_id = n1
+ = 5'
+check "empty key" 1 "" "clpdaemon: emptykey.conf:2: expected 'key = value'" -- --config emptykey.conf --check
+
+printf 'node_id = n1\ntick_interval_ms = 1\0000\n' >nul.conf
+check "NUL byte in a line" 1 "" "clpdaemon: nul.conf:2: line contains a NUL byte" -- --config nul.conf --check
 
 conf missing.conf '# empty'
 check "node_id required" 1 "" "clpdaemon: missing.conf: missing required key 'node_id'" -- --config missing.conf --check

@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -60,10 +61,12 @@ typedef struct {
   long line;
 } parser;
 
-static void line_error(parser *p, const char *fmt, const char *a,
-                       const char *b) {
+static void line_error(parser *p, const char *fmt, ...) {
+  va_list ap;
   fprintf(p->err, "clpdaemon: %s:%ld: ", p->path, p->line);
-  fprintf(p->err, fmt, a, b);
+  va_start(ap, fmt);
+  vfprintf(p->err, fmt, ap);
+  va_end(ap);
   fputc('\n', p->err);
   p->errors++;
 }
@@ -142,7 +145,7 @@ static int parse_list(parser *p, const char *key, char *value, clpd_list *out,
     if (comma != NULL) *comma = '\0';
     item = trim(item);
     if (*item == '\0') {
-      line_error(p, "%s: empty list item", key, NULL);
+      line_error(p, "%s: empty list item", key);
       list_free(&list);
       return 0;
     }
@@ -152,8 +155,7 @@ static int parse_list(parser *p, const char *key, char *value, clpd_list *out,
       } else if (strcmp(item, "rules") == 0) {
         rules = 1;
       } else {
-        line_error(p, "watch: unknown item '%s' (expected facts, rules)", item,
-                   NULL);
+        line_error(p, "watch: unknown item '%s' (expected facts, rules)", item);
         return 0;
       }
     } else {
@@ -194,7 +196,7 @@ static int apply(parser *p, int key, char *value, clpd_config *cfg) {
   case K_NODE_ID:
     if (!valid_node_id(value)) {
       line_error(p, "node_id: expected 1-64 characters from [A-Za-z0-9._-], "
-                    "got '%s'%s", value, "");
+                    "got '%s'", value);
       return 0;
     }
     strcpy(cfg->node_id, value);
@@ -217,7 +219,7 @@ static int apply(parser *p, int key, char *value, clpd_config *cfg) {
       v = -1;
     } else if (!parse_int(value, &v) || v == 0) {
       line_error(p, "max_rules_per_cycle: expected -1 or a positive integer, "
-                    "got '%s'%s", value, "");
+                    "got '%s'", value);
       return 0;
     }
     break;
@@ -228,7 +230,7 @@ static int apply(parser *p, int key, char *value, clpd_config *cfg) {
       unit = end[0] == 's' ? 1 : end[0] == 'm' ? 60 : end[0] == 'h' ? 3600 : 0;
     if (unit == 0) {
       line_error(p, "idle_eviction_after: expected a duration such as 30s, "
-                    "30m or 2h, got '%s'%s", value, "");
+                    "30m or 2h, got '%s'", value);
       return 0;
     }
     cfg->idle_eviction_after_s = v * unit;
@@ -236,7 +238,7 @@ static int apply(parser *p, int key, char *value, clpd_config *cfg) {
   }
   case K_PATH:
     if (*value == '\0') {
-      line_error(p, "%s: expected a path%s", name, "");
+      line_error(p, "%s: expected a path", name);
       return 0;
     }
     set_path(&cfg->admin_socket, value);
@@ -265,12 +267,12 @@ static int apply(parser *p, int key, char *value, clpd_config *cfg) {
 
 static void set_defaults(clpd_config *cfg) {
   memset(cfg, 0, sizeof *cfg);
-  cfg->tick_interval_ms = 5000;
-  cfg->cycle_min_interval_ms = 200;
-  cfg->max_rules_per_cycle = 10000;
-  cfg->safety_poll_interval_ms = 5000;
-  cfg->idle_eviction_after_s = 30 * 60;
-  cfg->admin_socket = dup_str("/run/clpdaemon/admin.sock");
+  cfg->tick_interval_ms = CLPD_DEFAULT_TICK_INTERVAL_MS;
+  cfg->cycle_min_interval_ms = CLPD_DEFAULT_CYCLE_MIN_INTERVAL_MS;
+  cfg->max_rules_per_cycle = CLPD_DEFAULT_MAX_RULES_PER_CYCLE;
+  cfg->safety_poll_interval_ms = CLPD_DEFAULT_SAFETY_POLL_INTERVAL_MS;
+  cfg->idle_eviction_after_s = CLPD_DEFAULT_IDLE_EVICTION_AFTER_S;
+  cfg->admin_socket = dup_str(CLPD_DEFAULT_ADMIN_SOCKET);
   cfg->watch_facts = 1;
   cfg->watch_rules = 1;
 }
@@ -282,6 +284,7 @@ int clpd_config_load(const char *path, clpd_config *cfg, FILE *err) {
   char *buf = NULL;
   size_t cap = 0;
   FILE *f;
+  ssize_t len;
   int k, read_errno;
 
   set_defaults(cfg);
@@ -293,20 +296,28 @@ int clpd_config_load(const char *path, clpd_config *cfg, FILE *err) {
     return 1;
   }
 
-  while (getline(&buf, &cap, f) != -1) {
-    char *line = trim(buf), *eq, *key, *value;
+  for (;;) {
+    char *line, *eq, *key, *value;
+    errno = 0;
+    len = getline(&buf, &cap, f);
+    if (len == -1) break;
     p.line++;
+    if (memchr(buf, '\0', (size_t)len) != NULL) {
+      line_error(&p, "line contains a NUL byte");
+      continue;
+    }
+    line = trim(buf);
     if (*line == '\0' || *line == '#') continue;
     eq = strchr(line, '=');
     if (eq == NULL) {
-      line_error(&p, "expected 'key = value'%s%s", "", "");
+      line_error(&p, "expected 'key = value'");
       continue;
     }
     *eq = '\0';
     key = trim(line);
     value = trim(eq + 1);
     if (*key == '\0') {
-      line_error(&p, "expected 'key = value'%s%s", "", "");
+      line_error(&p, "expected 'key = value'");
       continue;
     }
     for (k = 0; k < KEY_COUNT && strcmp(keys[k].name, key) != 0; k++) {
@@ -316,18 +327,19 @@ int clpd_config_load(const char *path, clpd_config *cfg, FILE *err) {
       continue;
     }
     if (seen[k] != 0) {
-      char first[32];
-      sprintf(first, "%ld", seen[k]);
-      line_error(&p, "duplicate key '%s' (first set on line %s)", key, first);
+      line_error(&p, "duplicate key '%s' (first set on line %ld)", key, seen[k]);
       continue;
     }
     seen[k] = p.line;
     valid[k] = apply(&p, k, value, cfg);
   }
-  read_errno = errno; /* set by the getline call that ended the loop */
+  /* getline returned -1: end of file, or a failure (read error or ENOMEM)
+   * whose errno was set by that call; errno was cleared before it. Save it
+   * before free() may change it. */
+  read_errno = errno;
   free(buf);
-  if (ferror(f)) {
-    int saved = read_errno;
+  if (ferror(f) || !feof(f)) {
+    int saved = read_errno != 0 ? read_errno : EIO;
     fclose(f);
     fprintf(err, "clpdaemon: %s: cannot read: %s\n", path, strerror(saved));
     return 1;
