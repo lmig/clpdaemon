@@ -1,0 +1,7 @@
+# UBSan suppressions for the unmodified vendored CLIPS 6.4.2 sources only.
+# Upstream issues reported at environment creation, destruction and fact
+# hashing (L26); clpdaemon code stays fully checked.
+# usage: UBSAN_OPTIONS=suppressions=tests/sanitizers/ubsan-vendor.supp ctest ...
+null:*/vendor/clips/src/*
+nonnull-attribute:*/vendor/clips/src/*
+signed-integer-overflow:*/vendor/clips/src/*

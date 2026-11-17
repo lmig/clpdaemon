@@ -40,6 +40,16 @@ ctest --test-dir build --output-on-failure
 
 CLIPS is vendored unmodified under `vendor/clips/` (see its README).
 
+Sanitizer build (ASan + UBSan). Upstream CLIPS reports some undefined behavior at environment creation and destruction; the suppressions file silences it for `vendor/clips` only:
+
+```sh
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+cmake --build build-asan
+UBSAN_OPTIONS=suppressions=$PWD/tests/sanitizers/ubsan-vendor.supp \
+  ctest --test-dir build-asan --output-on-failure
+```
+
 ## Run
 
 ```sh
