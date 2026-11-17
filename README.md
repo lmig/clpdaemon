@@ -39,3 +39,11 @@ ctest --test-dir build --output-on-failure
 ```
 
 CLIPS is vendored unmodified under `vendor/clips/` (see its README).
+
+## Run
+
+```sh
+build/src/clpdaemon --config <file> --check
+```
+
+Command line, configuration keys, defaults and exact error messages: [`docs/configuration.md`](docs/configuration.md).

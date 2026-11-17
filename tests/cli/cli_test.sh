@@ -1,0 +1,138 @@
+#!/bin/sh
+# CLI and configuration tests for clpdaemon (T2, docs/configuration.md).
+# usage: cli_test.sh <path-to-clpdaemon>
+set -u
+
+BIN=${1:?usage: cli_test.sh <path-to-clpdaemon>}
+case $BIN in /*) ;; *) BIN=$PWD/$BIN ;; esac
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+cd "$WORK" || exit 2
+
+USAGE='usage: clpdaemon --config <file> [--foreground] [--check]'
+NL='
+'
+failures=0
+cases=0
+
+# check <name> <expected-exit> <expected-stdout> <expected-stderr> -- <args...>
+check() {
+  name=$1 want_rc=$2 want_out=$3 want_err=$4
+  shift 5
+  cases=$((cases + 1))
+  "$BIN" "$@" >out.txt 2>err.txt
+  rc=$?
+  out=$(cat out.txt) err=$(cat err.txt)
+  if [ "$rc" != "$want_rc" ] || [ "$out" != "$want_out" ] || [ "$err" != "$want_err" ]; then
+    failures=$((failures + 1))
+    printf 'FAIL: %s\n  exit:   got %s, want %s\n  stdout: got [%s]\n          want [%s]\n  stderr: got [%s]\n          want [%s]\n' \
+      "$name" "$rc" "$want_rc" "$out" "$want_out" "$err" "$want_err"
+  fi
+}
+
+conf() { printf '%s\n' "$2" >"$1"; }
+
+# --- command line -----------------------------------------------------------
+conf ok.conf 'node_id = n1'
+check "help" 0 "$USAGE" "" -- --help
+check "missing --config" 2 "" "clpdaemon: missing required option --config$NL$USAGE" -- --check
+check "--config without value" 2 "" "clpdaemon: option --config requires a file$NL$USAGE" -- --config
+check "unknown option" 2 "" "clpdaemon: unknown option '--bogus'$NL$USAGE" -- --config ok.conf --bogus
+check "check ok" 0 "clpdaemon: ok.conf: configuration OK" "" -- --config ok.conf --check
+check "foreground accepted" 0 "clpdaemon: ok.conf: configuration OK" "" -- --foreground --check --config ok.conf
+check "run without --check exits 0 until T3" 0 "" "" -- --config ok.conf
+check "cannot open" 1 "" "clpdaemon: nope.conf: cannot open: No such file or directory" -- --config nope.conf --check
+
+# --- full valid file (requirements section 7) ---------------------------------
+conf full.conf '# sample
+node_id                  = n1
+tick_interval_ms         = 5000
+cycle_min_interval_ms    = 200
+
+max_rules_per_cycle      = -1
+safety_poll_interval_ms  = 5000
+idle_eviction_after      = 2h
+admin_socket             = /run/clpdaemon/admin.sock
+trace_text               = /var/log/clpdaemon/trace.log
+trace_jsonl              =
+watch                    = rules
+packages                 = /etc/clpdaemon/packages/fibre-installation@v3
+plugins                  = /usr/lib/clpdaemon/clpd-orm.so, /usr/lib/clpdaemon/clpd-zmq.so'
+check "full valid file" 0 "clpdaemon: full.conf: configuration OK" "" -- --config full.conf --check
+conf equal.conf 'node_id = n1
+tick_interval_ms = 1000
+cycle_min_interval_ms = 1000
+cycle_min_interval_ms_dummy_absent_check = x'
+# equal intervals are valid; the unknown key line keeps this case honest about reporting
+check "equal intervals allowed, unknown key rejected" 1 "" \
+  "clpdaemon: equal.conf:4: unknown key 'cycle_min_interval_ms_dummy_absent_check'" -- --config equal.conf --check
+conf zero.conf 'node_id = n1
+cycle_min_interval_ms = 0
+watch =
+packages ='
+check "zero min interval and empty lists" 0 "clpdaemon: zero.conf: configuration OK" "" -- --config zero.conf --check
+
+# --- syntax -------------------------------------------------------------------
+conf syntax.conf 'node_id = n1
+just a line
+tick_interval_ms = 1000
+foo = 1
+tick_interval_ms = 2000'
+check "syntax, unknown and duplicate keys" 1 "" \
+  "clpdaemon: syntax.conf:2: expected 'key = value'
+clpdaemon: syntax.conf:4: unknown key 'foo'
+clpdaemon: syntax.conf:5: duplicate key 'tick_interval_ms' (first set on line 3)" -- --config syntax.conf --check
+
+conf missing.conf '# empty'
+check "node_id required" 1 "" "clpdaemon: missing.conf: missing required key 'node_id'" -- --config missing.conf --check
+
+# --- values -------------------------------------------------------------------
+conf values.conf 'node_id = a b
+tick_interval_ms = 0
+cycle_min_interval_ms = -1
+max_rules_per_cycle = 0
+safety_poll_interval_ms = 12x
+idle_eviction_after = 30d
+admin_socket =
+watch = facts,agenda
+packages = /a,,/b
+plugins = 2147483648'
+check "invalid values" 1 "" \
+  "clpdaemon: values.conf:1: node_id: expected 1-64 characters from [A-Za-z0-9._-], got 'a b'
+clpdaemon: values.conf:2: tick_interval_ms: expected a positive integer, got '0'
+clpdaemon: values.conf:3: cycle_min_interval_ms: expected a non-negative integer, got '-1'
+clpdaemon: values.conf:4: max_rules_per_cycle: expected -1 or a positive integer, got '0'
+clpdaemon: values.conf:5: safety_poll_interval_ms: expected a positive integer, got '12x'
+clpdaemon: values.conf:6: idle_eviction_after: expected a duration such as 30s, 30m or 2h, got '30d'
+clpdaemon: values.conf:7: admin_socket: expected a path
+clpdaemon: values.conf:8: watch: unknown item 'agenda' (expected facts, rules)
+clpdaemon: values.conf:9: packages: empty list item" -- --config values.conf --check
+
+conf range.conf 'node_id = n1
+tick_interval_ms = 2147483648
+max_rules_per_cycle = 2147483647
+idle_eviction_after = 0m'
+check "integer range and zero duration" 1 "" \
+  "clpdaemon: range.conf:2: tick_interval_ms: expected a positive integer, got '2147483648'
+clpdaemon: range.conf:4: idle_eviction_after: expected a duration such as 30s, 30m or 2h, got '0m'" -- --config range.conf --check
+
+long_id=$(printf 'a%.0s' $(seq 1 65))
+conf long.conf "node_id = $long_id"
+check "node_id longer than 64" 1 "" \
+  "clpdaemon: long.conf:1: node_id: expected 1-64 characters from [A-Za-z0-9._-], got '$long_id'" -- --config long.conf --check
+
+conf order.conf 'node_id = n1
+tick_interval_ms = 100
+cycle_min_interval_ms = 300'
+check "min interval above tick" 1 "" \
+  "clpdaemon: order.conf: cycle_min_interval_ms (300) must not exceed tick_interval_ms (100)" -- --config order.conf --check
+conf order2.conf 'node_id = n1
+cycle_min_interval_ms = 6000'
+check "min interval above default tick" 1 "" \
+  "clpdaemon: order2.conf: cycle_min_interval_ms (6000) must not exceed tick_interval_ms (5000)" -- --config order2.conf --check
+
+# Errors are reported even when a run is requested without --check.
+check "run validates" 1 "" "clpdaemon: missing.conf: missing required key 'node_id'" -- --config missing.conf
+
+printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
+[ "$failures" -eq 0 ]
