@@ -46,9 +46,11 @@ All messages go to stderr, except `--check` success and `--help`, which go to st
 |---|---|
 | `--check` success (stdout) | `clpdaemon: <file>: configuration OK` |
 | `--config` missing | `clpdaemon: missing required option --config` then the usage line, exit 2 |
+| `--config` given twice | `clpdaemon: option --config given more than once` then the usage line, exit 2 |
 | `--config` without a value | `clpdaemon: option --config requires a file` then the usage line, exit 2 |
 | Unknown option | `clpdaemon: unknown option '<arg>'` then the usage line, exit 2 |
 | File cannot be opened | `clpdaemon: <file>: cannot open: <system error>` |
+| File cannot be read (for example, a directory) | `clpdaemon: <file>: cannot read: <system error>`; the file-level checks below are skipped |
 | Line without `=` | `clpdaemon: <file>:<line>: expected 'key = value'` |
 | Unknown key | `clpdaemon: <file>:<line>: unknown key '<key>'` |
 | Repeated key | `clpdaemon: <file>:<line>: duplicate key '<key>' (first set on line <n>)` |

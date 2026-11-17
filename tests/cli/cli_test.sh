@@ -42,6 +42,9 @@ check "check ok" 0 "clpdaemon: ok.conf: configuration OK" "" -- --config ok.conf
 check "foreground accepted" 0 "clpdaemon: ok.conf: configuration OK" "" -- --foreground --check --config ok.conf
 check "run without --check exits 0 until T3" 0 "" "" -- --config ok.conf
 check "cannot open" 1 "" "clpdaemon: nope.conf: cannot open: No such file or directory" -- --config nope.conf --check
+mkdir confdir
+check "cannot read (directory)" 1 "" "clpdaemon: confdir: cannot read: Is a directory" -- --config confdir --check
+check "repeated --config" 2 "" "clpdaemon: option --config given more than once$NL$USAGE" -- --config ok.conf --config ok.conf --check
 
 # --- full valid file (requirements section 7) ---------------------------------
 conf full.conf '# sample

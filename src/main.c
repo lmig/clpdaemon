@@ -26,6 +26,8 @@ int main(int argc, char **argv) {
       return 0;
     } else if (strcmp(argv[i], "--config") == 0) {
       if (i + 1 >= argc) return usage_error("option --config requires a file%s", "");
+      if (config_path != NULL)
+        return usage_error("option --config given more than once%s", "");
       config_path = argv[++i];
     } else if (strcmp(argv[i], "--foreground") == 0) {
       /* Default mode: the daemon never double-forks (FR-1). */

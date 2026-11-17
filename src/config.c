@@ -325,6 +325,12 @@ int clpd_config_load(const char *path, clpd_config *cfg, FILE *err) {
     valid[k] = apply(&p, k, value, cfg);
   }
   free(buf);
+  if (ferror(f)) {
+    int saved = errno;
+    fclose(f);
+    fprintf(err, "clpdaemon: %s: cannot read: %s\n", path, strerror(saved));
+    return 1;
+  }
   fclose(f);
 
   if (seen[KEY_NODE_ID] == 0) {
