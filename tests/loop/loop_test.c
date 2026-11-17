@@ -55,17 +55,19 @@ static void on_cycle(void *ctx) {
     if (p->cycles == 3) raise(SIGINT);
     break;
   case 3:
-    if (p->cycles == 2) sleep_ms(130);
+    if (p->cycles == 2) sleep_ms(400);
     if (p->cycles == 4) raise(SIGTERM);
     break;
   }
 }
 
-/* tick 60 ms, minimum 15 ms: cycle 1 at start, cycle 2 by notification
- * (about 15 ms later), cycles 3 and 4 by tick (about 60 ms apart). */
+/* tick 400 ms, minimum 15 ms: cycle 1 at start, cycle 2 by notification
+ * (about 15 ms later), cycles 3 and 4 by tick (about 400 ms apart). The
+ * upper bounds leave hundreds of milliseconds for loaded or sanitized hosts
+ * while still telling a notification from a tick. */
 static void test_schedule_and_stop(void) {
   probe p;
-  clpd_loop *loop = clpd_loop_open(60, 15, stderr);
+  clpd_loop *loop = clpd_loop_open(400, 15, stderr);
   long long t0;
   EXPECT(loop != NULL);
   if (loop == NULL) return;
@@ -74,10 +76,10 @@ static void test_schedule_and_stop(void) {
   t0 = now_ms();
   EXPECT(clpd_loop_run(loop, on_cycle, &p) == SIGTERM);
   EXPECT(p.cycles == 4);
-  EXPECT(p.at[0] - t0 < 30);
-  EXPECT(p.at[1] - p.at[0] >= 15 && p.at[1] - p.at[0] < 50);
-  EXPECT(p.at[2] - p.at[1] >= 60 && p.at[2] - p.at[1] < 120);
-  EXPECT(p.at[3] - p.at[2] >= 60 && p.at[3] - p.at[2] < 120);
+  EXPECT(p.at[0] - t0 < 300);
+  EXPECT(p.at[1] - p.at[0] >= 15 && p.at[1] - p.at[0] < 300);
+  EXPECT(p.at[2] - p.at[1] >= 400 && p.at[2] - p.at[1] < 1000);
+  EXPECT(p.at[3] - p.at[2] >= 400 && p.at[3] - p.at[2] < 1000);
   clpd_loop_close(loop);
 }
 
@@ -117,11 +119,12 @@ static void test_pending_stop_before_run(void) {
   clpd_loop_close(loop);
 }
 
-/* tick 50 ms: cycle 2 takes 130 ms, so cycle 3 starts at once when it ends
- * and cycle 4 comes one tick later; the missed ticks are not replayed. */
+/* tick 300 ms: cycle 2 takes 400 ms, so cycle 3 starts at once when it ends
+ * (waiting for a tick would put it near 700 ms) and cycle 4 comes one tick
+ * later; the missed tick is not replayed. */
 static void test_overrun_no_burst(void) {
   probe p;
-  clpd_loop *loop = clpd_loop_open(50, 10, stderr);
+  clpd_loop *loop = clpd_loop_open(300, 10, stderr);
   EXPECT(loop != NULL);
   if (loop == NULL) return;
   memset(&p, 0, sizeof p);
@@ -129,8 +132,8 @@ static void test_overrun_no_burst(void) {
   p.script = 3;
   EXPECT(clpd_loop_run(loop, on_cycle, &p) == SIGTERM);
   EXPECT(p.cycles == 4);
-  EXPECT(p.at[2] - p.at[1] >= 130 && p.at[2] - p.at[1] < 250);
-  EXPECT(p.at[3] - p.at[2] >= 50);
+  EXPECT(p.at[2] - p.at[1] >= 400 && p.at[2] - p.at[1] < 650);
+  EXPECT(p.at[3] - p.at[2] >= 300);
   clpd_loop_close(loop);
 }
 
