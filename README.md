@@ -1,0 +1,33 @@
+# clpdaemon
+
+CLIPS 6.4.2 workflow engine daemon. Workflows are coded as CLIPS rule packages, persisted in PostgreSQL, and isolated from external systems through a single exchange table (inbox/outbox). Several engine nodes scale out behind a dispatcher.
+
+Status: specification complete, implementation starting (v1, task T1).
+
+## Documentation
+
+| Document | Content |
+|---|---|
+| [`docs/requirements.md`](docs/requirements.md) | Requirements specification, architecture, data model, decision record |
+| [`docs/exchange-contract.md`](docs/exchange-contract.md) | Contract for connector teams: exchange table, states, payload, rules |
+| [`odd/tasks/clpdaemon.md`](odd/tasks/clpdaemon.md) | Phased task plan with status and commit evidence |
+
+## Monorepo layout
+
+Directories are created by the task that introduces them.
+
+| Path | Content | Task |
+|---|---|---|
+| `vendor/clips/` | CLIPS 6.4.2 core sources, unmodified | T1 |
+| `engine/` | Daemon (engine node): event loop, tracing, plugin loader, admin socket, exchange consumer | T1–T15 |
+| `plugins/` | C plugins: `example/`, `orm/`, `zmq/` | T6, T8–T10, T14 |
+| `packages/` | Rule packages (workflow definitions and samples) | T4, T16 |
+| `contracts/` | Exchange table DDL and message JSON Schemas | T12 |
+| `dispatcher/` | `clpd-dispatch` | T18–T20 |
+| `connectors/` | Connectors to external systems, any language (later phase) | — |
+| `deploy/` | systemd units and deployment assets | T17 |
+| `tests/` | Integration and end-to-end tests | all |
+
+## Build
+
+C99 + CMake. Build instructions arrive with T1.

@@ -1,0 +1,21 @@
+# Build output
+/build/
+/build-*/
+/cmake-build-*/
+
+# C artifacts
+*.o
+*.a
+*.so
+*.so.*
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local runtime files
+*.log
+*.jsonl
+*.sock
