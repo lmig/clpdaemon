@@ -32,7 +32,7 @@ Route: `inline` unless noted. Risk items refer to the high-risk list (1 data, 2 
 
 Phase 1 — Foundations
 - [x] **T1** (S1, S2, S6) Repository skeleton, CMake, vendored CLIPS 6.4.2 core (unmodified) built as static `-fPIC` library, embed smoke test. Route: inline. Risk: item 5. Commit: f8657ba (vendor import), 12d33dc (build + test)
-- [x] **T2** (S1, S3, S18) Configuration file + CLI (`--config`, `--foreground`, `--check`), validation with exact error messages. Route: inline. Risk: none (new flags and file). Branch: `feat/t2-config` (stacked on `feat/t1-skeleton`). Commit: —
+- [x] **T2** (S1, S3, S18) Configuration file + CLI (`--config`, `--foreground`, `--check`), validation with exact error messages. Route: inline. Risk: none (new flags and file). Branch: `feat/t2-config` (stacked on `feat/t1-skeleton`). Commit: cf08663
 - [ ] **T3** (S1, S3) Event loop (`poll` + `timerfd` + `signalfd`), hybrid cycle scheduler (minimum interval + tick), graceful shutdown with periodic halt check (`AddPeriodicFunction` + `SetHaltRules`). Route: inline. Risk: item 4. Commit: —
 - [ ] **T4** (S2, S10) Rule package loader: package = `defmodule` named `definition@version`, manifest, fatal `LoadError` reporting, `wf-id` lint (templates carry `wf-id`, rules join on `?wf-id`). Route: inline. Commit: —
 
