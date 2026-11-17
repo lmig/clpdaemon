@@ -120,8 +120,9 @@ static void test_pending_stop_before_run(void) {
 }
 
 /* tick 300 ms: cycle 2 takes 400 ms, so cycle 3 starts at once when it ends
- * (waiting for a tick would put it near 700 ms) and cycle 4 comes one tick
- * later; the missed tick is not replayed. */
+ * (about 400 ms after cycle 2 starts; waiting for the next tick of the grid
+ * would give about 600 ms, counting the tick from the end about 700 ms) and
+ * cycle 4 comes one tick later; the missed tick is not replayed. */
 static void test_overrun_no_burst(void) {
   probe p;
   clpd_loop *loop = clpd_loop_open(300, 10, stderr);
@@ -132,7 +133,7 @@ static void test_overrun_no_burst(void) {
   p.script = 3;
   EXPECT(clpd_loop_run(loop, on_cycle, &p) == SIGTERM);
   EXPECT(p.cycles == 4);
-  EXPECT(p.at[2] - p.at[1] >= 400 && p.at[2] - p.at[1] < 650);
+  EXPECT(p.at[2] - p.at[1] >= 400 && p.at[2] - p.at[1] < 550);
   EXPECT(p.at[3] - p.at[2] >= 300);
   clpd_loop_close(loop);
 }
@@ -145,7 +146,8 @@ typedef struct {
 static void unlimited_cycle(void *ctx) {
   unlimited *u = ctx;
   u->cycles++;
-  if (u->cycles == MAX_CYCLES) raise(SIGTERM); /* cap, see on_cycle */
+  /* No cycle cap helps here: if the halt regresses, the first unlimited Run
+   * never returns. The ctest TIMEOUT is the guard for this test. */
   clpd_engine_run_cycle(u->engine, -1);
 }
 
@@ -161,7 +163,10 @@ static void test_external_stop_halts_unlimited_run(void) {
   u.cycles = 0;
   u.engine = clpd_engine_create();
   EXPECT(u.engine != NULL);
-  if (u.engine == NULL) return;
+  if (u.engine == NULL) {
+    clpd_loop_close(loop);
+    return;
+  }
   EXPECT(Build(clpd_engine_env(u.engine),
                "(defrule step ?f <- (tick ?n) => (retract ?f) "
                "(assert (tick (+ ?n 1))))") == BE_NO_ERROR);
@@ -173,12 +178,17 @@ static void test_external_stop_halts_unlimited_run(void) {
     _exit(0);
   }
   EXPECT(child > 0);
+  if (child < 0) { /* nobody would send the SIGTERM: do not run */
+    clpd_engine_destroy(u.engine);
+    clpd_loop_close(loop);
+    return;
+  }
   t0 = now_ms();
   EXPECT(clpd_loop_run(loop, unlimited_cycle, &u) == SIGTERM);
   EXPECT(u.cycles == 1);
   EXPECT(clpd_engine_halted(u.engine) == 1);
   EXPECT(now_ms() - t0 >= 150 && now_ms() - t0 < 2000);
-  if (child > 0) waitpid(child, NULL, 0);
+  waitpid(child, NULL, 0);
   clpd_engine_destroy(u.engine);
   clpd_loop_close(loop);
 }
