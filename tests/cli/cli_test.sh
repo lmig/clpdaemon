@@ -158,13 +158,38 @@ wait_line() {
   done
 }
 
-# daemon <name> <conf> <signals...> <expected-stderr>: starts the daemon, waits
-# until it is running, sends each signal (waiting after SIGHUP for its line),
-# and expects exit 0, empty stdout and the exact stderr.
+# wait_exit <pid>: waits up to 5 s for the process to exit and sets rc to its
+# exit status; a process still running is killed and rc is set to "hung".
+wait_exit() {
+  n=0
+  while kill -0 "$1" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 100 ]; then
+      kill -KILL "$1" 2>/dev/null
+      wait "$1" 2>/dev/null
+      rc=hung
+      return
+    fi
+    sleep 0.05
+  done
+  wait "$1"
+  rc=$?
+}
+
+# daemon <name> <conf> <signals> <expected-stderr> [ignore-int]: starts the
+# daemon (node_id must be n1), waits until it is running, sends each signal of
+# the space-separated list (waiting after SIGHUP for its line), and expects
+# exit 0, empty stdout and the exact stderr. With ignore-int the daemon is
+# started with SIGINT ignored, as a non-interactive shell does for background
+# jobs.
 daemon() {
-  name=$1 dconf=$2 sigs=$3 want_err=$4
+  name=$1 dconf=$2 sigs=$3 want_err=$4 mode=${5:-}
   cases=$((cases + 1))
-  "$BIN" --config "$dconf" >out.txt 2>err.txt &
+  if [ "$mode" = ignore-int ]; then
+    sh -c 'trap "" INT; exec "$0" --config "$1"' "$BIN" "$dconf" >out.txt 2>err.txt &
+  else
+    "$BIN" --config "$dconf" >out.txt 2>err.txt &
+  fi
   pid=$!
   ok=1
   wait_line err.txt "clpdaemon: n1: running" || ok=0
@@ -174,8 +199,7 @@ daemon() {
       wait_line err.txt "clpdaemon: received SIGHUP, reopening trace files" || ok=0
     fi
   done
-  wait "$pid"
-  rc=$?
+  wait_exit "$pid"
   out=$(cat out.txt; printf x) err=$(cat err.txt; printf x)
   out=${out%x} err=${err%x}
   if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$out" != "" ] || [ "$err" != "$want_err$NL" ]; then
@@ -192,6 +216,8 @@ daemon "SIGTERM stops gracefully" fast.conf TERM "clpdaemon: n1: running
 clpdaemon: received SIGTERM, stopping"
 daemon "SIGINT stops gracefully" fast.conf INT "clpdaemon: n1: running
 clpdaemon: received SIGINT, stopping"
+daemon "SIGINT with SIGINT inherited as ignored" fast.conf INT "clpdaemon: n1: running
+clpdaemon: received SIGINT, stopping" ignore-int
 daemon "SIGHUP keeps running" fast.conf "HUP TERM" "clpdaemon: n1: running
 clpdaemon: received SIGHUP, reopening trace files
 clpdaemon: received SIGTERM, stopping"

@@ -105,7 +105,14 @@ int clpd_loop_run(clpd_loop *l, clpd_cycle_fn *cycle, void *ctx) {
       return -1;
     }
     /* Signals first: a pending stop wins over a due cycle. */
-    while (read(l->sig_fd, &si, sizeof si) == (ssize_t)sizeof si) {
+    for (;;) {
+      ssize_t n = read(l->sig_fd, &si, sizeof si);
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+      if (n != (ssize_t)sizeof si) {
+        if (n >= 0) errno = EIO; /* short read: the kernel never does this */
+        return -1;
+      }
       if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT)
         return (int)si.ssi_signo;
       if (si.ssi_signo == SIGHUP) {
