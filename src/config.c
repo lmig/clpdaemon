@@ -282,7 +282,7 @@ int clpd_config_load(const char *path, clpd_config *cfg, FILE *err) {
   char *buf = NULL;
   size_t cap = 0;
   FILE *f;
-  int k;
+  int k, read_errno;
 
   set_defaults(cfg);
   for (k = 0; k < KEY_COUNT; k++) valid[k] = 1;
@@ -324,9 +324,10 @@ int clpd_config_load(const char *path, clpd_config *cfg, FILE *err) {
     seen[k] = p.line;
     valid[k] = apply(&p, k, value, cfg);
   }
+  read_errno = errno; /* set by the getline call that ended the loop */
   free(buf);
   if (ferror(f)) {
-    int saved = errno;
+    int saved = read_errno;
     fclose(f);
     fprintf(err, "clpdaemon: %s: cannot read: %s\n", path, strerror(saved));
     return 1;
