@@ -19,6 +19,8 @@ struct clpd_loop {
   int sig_fd, timer_fd, event_fd;
   int tick_ms, min_ms;
   FILE *log;
+  clpd_hup_fn *on_hup;
+  void *hup_ctx;
 };
 
 static long long now_ms(void) {
@@ -70,6 +72,11 @@ void clpd_loop_notify(clpd_loop *l) {
   }
 }
 
+void clpd_loop_on_hup(clpd_loop *l, clpd_hup_fn *fn, void *ctx) {
+  l->on_hup = fn;
+  l->hup_ctx = ctx;
+}
+
 static int arm(clpd_loop *l, long long due_ms) {
   struct itimerspec its = {{0, 0}, {0, 0}};
   if (due_ms < 1) due_ms = 1; /* zero would disarm; a past time fires at once */
@@ -116,9 +123,9 @@ int clpd_loop_run(clpd_loop *l, clpd_cycle_fn *cycle, void *ctx) {
       if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT)
         return (int)si.ssi_signo;
       if (si.ssi_signo == SIGHUP) {
-        /* Trace files arrive with T5; until then this only acknowledges. */
         fputs("clpdaemon: received SIGHUP, reopening trace files\n", l->log);
         fflush(l->log);
+        if (l->on_hup != NULL) l->on_hup(l->hup_ctx);
       }
     }
     if (fds[1].revents & POLLIN) {

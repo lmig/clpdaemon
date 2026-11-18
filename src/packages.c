@@ -3,6 +3,7 @@
 #include "packages.h"
 
 #include "lint.h"
+#include "log.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -35,8 +36,7 @@ static void capture_write(Environment *env, const char *name, const char *str,
     while (c->len + n + 1 > cap) cap *= 2;
     grown = realloc(c->buf, cap);
     if (grown == NULL) {
-      perror("clpdaemon");
-      exit(1);
+      clpd_log_die_errno();
     }
     c->buf = grown;
     c->cap = cap;
@@ -162,8 +162,7 @@ int clpd_packages_load(Environment *env, const clpd_list *dirs,
     }
     grown = realloc(out->items, (out->count + 1) * sizeof *grown);
     if (grown == NULL) {
-      perror("clpdaemon");
-      exit(1);
+      clpd_log_die_errno();
     }
     out->items = grown;
     out->items[out->count].dir = clpd_strdup(dirs->items[i]);

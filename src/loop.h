@@ -1,6 +1,8 @@
 /* Event loop (FR-3, FR-5): poll over signalfd (SIGTERM, SIGINT, SIGHUP),
  * a monotonic timerfd armed at the next cycle and an eventfd for wake-up
- * notifications. Single-threaded. */
+ * notifications. The loop runs on the main thread; with a trace, the fd
+ * capture reader thread (fdcapture.h) blocks every signal, so the signals
+ * blocked here reach only the signalfd. */
 #ifndef CLPD_LOOP_H
 #define CLPD_LOOP_H
 
@@ -8,6 +10,7 @@
 
 typedef struct clpd_loop clpd_loop;
 typedef void clpd_cycle_fn(void *ctx);
+typedef void clpd_hup_fn(void *ctx);
 
 /* Blocks SIGTERM, SIGINT and SIGHUP for the process, restores their default
  * disposition and creates the descriptors. A shell may start background jobs
@@ -19,6 +22,8 @@ clpd_loop *clpd_loop_open(int tick_ms, int min_ms, FILE *log);
 /* Requests a cycle (subject to the minimum interval). Safe to call from a
  * cycle callback. */
 void clpd_loop_notify(clpd_loop *l);
+/* Called on SIGHUP after its message is logged (trace reopen). */
+void clpd_loop_on_hup(clpd_loop *l, clpd_hup_fn *fn, void *ctx);
 /* Runs cycles until SIGTERM or SIGINT arrives and returns that signal; a
  * pending stop signal wins over a due cycle. SIGHUP is logged and the loop
  * continues. Returns -1 with errno set on a system error, including a

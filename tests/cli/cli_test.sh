@@ -6,7 +6,8 @@ set -u
 BIN=${1:?usage: cli_test.sh <path-to-clpdaemon>}
 case $BIN in /*) ;; *) BIN=$PWD/$BIN ;; esac
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# A background child left by a case (ypid) is killed even on failure.
+trap 'if [ -s "$WORK/ypid" ]; then kill -KILL "$(cat "$WORK/ypid")" 2>/dev/null; fi; rm -rf "$WORK"' EXIT
 cd "$WORK" || exit 2
 
 USAGE='usage: clpdaemon --config <file> [--foreground] [--check]'
@@ -20,7 +21,9 @@ check() {
   name=$1 want_rc=$2 want_out=$3 want_err=$4
   shift 5
   cases=$((cases + 1))
-  "$BIN" "$@" >out.txt 2>err.txt
+  # RUN (default empty) bounds cases that would start a daemon on a
+  # regression, e.g. RUN='timeout 10'; a timeout then fails with exit 124.
+  ${RUN:-} "$BIN" "$@" >out.txt 2>err.txt
   rc=$?
   # The sentinel keeps trailing newlines visible to the comparison: every
   # expected non-empty stream ends with exactly one newline.
@@ -67,7 +70,7 @@ max_rules_per_cycle      = -1
 safety_poll_interval_ms  = 5000
 idle_eviction_after      = 2h
 admin_socket             = /run/clpdaemon/admin.sock
-trace_text               = /var/log/clpdaemon/trace.log
+trace_text               = full-trace.log
 trace_jsonl              =
 watch                    = rules
 packages                 = pkg
@@ -282,6 +285,285 @@ clpdaemon: received SIGINT, stopping" ignore-int
 daemon "SIGHUP keeps running" fast.conf "HUP TERM" "clpdaemon: n1: running
 clpdaemon: received SIGHUP, reopening trace files
 clpdaemon: received SIGTERM, stopping"
+
+# --- trace files (FR-2, FR-5, L48) -------------------------------------------
+# fail <name> <detail>: records a failed custom case.
+fail() {
+  failures=$((failures + 1))
+  printf 'FAIL: %s\n  %s\n' "$1" "$2"
+}
+
+conf trnodir.conf 'node_id = n1
+trace_text = nodir/t.log'
+check "trace cannot open" 1 "" "clpdaemon: nodir/t.log: cannot open: No such file or directory" -- --config trnodir.conf --check
+RUN='timeout 10'
+check "run opens the trace first" 1 "" "clpdaemon: nodir/t.log: cannot open: No such file or directory" -- --config trnodir.conf
+RUN=
+conf trdir.conf 'node_id = n1
+trace_jsonl = confdir'
+check "trace path is a directory" 1 "" "clpdaemon: confdir: cannot open: Is a directory" -- --config trdir.conf --check
+conf trok.conf 'node_id = n1
+trace_text = tr.log
+trace_jsonl = tr.jsonl'
+check "check opens the trace files" 0 "clpdaemon: trok.conf: configuration OK" "" -- --config trok.conf --check
+cases=$((cases + 1))
+[ -f tr.log ] && [ ! -s tr.log ] && [ -f tr.jsonl ] && [ ! -s tr.jsonl ] ||
+  fail "check creates empty trace files" "$(ls -l tr.log tr.jsonl 2>&1)"
+
+# wait_has <file> <text>: waits up to 5 s for <text> anywhere in <file>.
+wait_has() {
+  n=0
+  while ! grep -qF "$2" "$1" 2>/dev/null; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && return 1
+    sleep 0.05
+  done
+}
+
+# size <file>: byte size, 0 when missing.
+size() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
+
+# wait_grows <file> <bytes>: waits up to 5 s for <file> to exceed <bytes>.
+wait_grows() {
+  n=0
+  while [ "$(size "$1")" -le "$2" ]; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && return 1
+    sleep 0.05
+  done
+}
+
+# The engine is traced from Reset on (T5b): the deffacts assert, then the
+# firing of rule start and its modify as one event. Timestamps are stripped.
+conf trpkg.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = pkg
+trace_text = run.log
+trace_jsonl = run.jsonl'
+cases=$((cases + 1))
+"$BIN" --config trpkg.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has run.jsonl '"event":"modify"' || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want_text="n1 w1 FACT+ f-1 (order (wf-id w1) (status new))
+n1 w1 FIRE fibre-installation@v3::start f-1
+n1 w1 FACT~ f-1 (order (wf-id w1) (status started))"
+want_jsonl='{"node_id":"n1","wf_id":"w1","event":"assert","fact":1,"template":"order","text":"(order (wf-id w1) (status new))"}
+{"node_id":"n1","wf_id":"w1","event":"fire","module":"fibre-installation@v3","rule":"start","facts":[1]}
+{"node_id":"n1","wf_id":"w1","event":"modify","fact":1,"template":"order","text":"(order (wf-id w1) (status started))"}'
+got_text=$(cut -d' ' -f2- run.log)
+got_jsonl=$(sed 's/"ts":"[^"]*",//' run.jsonl)
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  [ "$got_text" != "$want_text" ] || [ "$got_jsonl" != "$want_jsonl" ]; then
+  fail "trace of Reset and a rule firing" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]
+  text [$got_text]
+  jsonl [$got_jsonl]"
+fi
+
+# SIGHUP after rotation: the moved text file is recreated and receives the
+# next lines; the JSONL file, whose directory was moved away, cannot be
+# reopened, so its old stream (now jdir.1/t.jsonl) keeps receiving lines and
+# the failure is reported. A rule firing once per cycle keeps both busy.
+mkdir rot jdir tick
+conf tick/package.conf 'definition = tick
+version = 1
+files = t.clp'
+conf tick/t.clp '(deftemplate counter (slot wf-id) (slot n))
+(defrule step ?c <- (counter (wf-id ?w) (n ?n)) => (modify ?c (n (+ ?n 1))))
+(deffacts seed (counter (wf-id c1) (n 0)))'
+conf trhup.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+max_rules_per_cycle = 1
+packages = tick
+trace_text = rot/t.log
+trace_jsonl = jdir/t.jsonl'
+cases=$((cases + 1))
+"$BIN" --config trhup.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has rot/t.log 'FACT~' || ok=0
+mv rot/t.log rot/t.log.1 && mv jdir jdir.1
+kill -HUP "$pid"
+wait_line err.txt "clpdaemon: jdir/t.jsonl: cannot reopen: No such file or directory" || ok=0
+before=$(size jdir.1/t.jsonl)
+wait_grows rot/t.log 0 || ok=0
+wait_grows jdir.1/t.jsonl "$before" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: received SIGHUP, reopening trace files
+clpdaemon: jdir/t.jsonl: cannot reopen: No such file or directory
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  ! grep -q 'FIRE tick@1::step f-1' rot/t.log || ! grep -q 'FIRE tick@1::step f-1' rot/t.log.1 ||
+  [ -e jdir ]; then
+  fail "SIGHUP reopens the trace files" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)], files [$(ls -l rot jdir.1)]"
+fi
+
+# With a trace, fds 1 and 2 go to pipes whose lines become stdout/stderr
+# output events (FR-16, L48): a child started by CLIPS system writes to
+# them, while the daemon messages stay on the original stderr.
+mkdir sys
+conf sys/package.conf 'definition = sys
+version = 1
+files = s.clp'
+conf sys/s.clp '(defrule shell => (system "echo out-child; echo err-child >&2"))'
+conf trsys.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = sys
+trace_text = sys.log
+trace_jsonl = sys.jsonl'
+cases=$((cases + 1))
+"$BIN" --config trsys.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has sys.log 'stdout out-child' || ok=0
+wait_has sys.log 'stderr err-child' || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+got_text=$(cut -d' ' -f2- sys.log | LC_ALL=C sort)
+got_jsonl=$(sed 's/"ts":"[^"]*",//' sys.jsonl | LC_ALL=C sort)
+want_text='n1 - FIRE sys@1::shell
+n1 - stderr err-child
+n1 - stdout out-child'
+want_jsonl='{"node_id":"n1","event":"fire","module":"sys@1","rule":"shell","facts":[]}
+{"node_id":"n1","event":"output","stream":"stderr","text":"err-child"}
+{"node_id":"n1","event":"output","stream":"stdout","text":"out-child"}'
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  [ "$got_text" != "$want_text" ] || [ "$got_jsonl" != "$want_jsonl" ]; then
+  fail "process stdout and stderr go to the trace" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]
+  text [$got_text]
+  jsonl [$got_jsonl]"
+fi
+
+# Without a trace nothing is redirected: the child writes to the console.
+conf nosys.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = sys'
+cases=$((cases + 1))
+"$BIN" --config nosys.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_line err.txt "err-child" || ok=0
+wait_line out.txt "out-child" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != out-child ] ||
+  [ "$(grep -cv '^clpdaemon: ' err.txt)" != 1 ]; then
+  fail "no trace: process output on the console" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# S5/T5c D2: a busy background child (it inherits the blocked SIGTERM)
+# must not hang stop; once the daemon is gone it gets SIGPIPE or EPIPE.
+mkdir yes
+conf yes/package.conf 'definition = yes
+version = 1
+files = y.clp'
+conf yes/y.clp '(defrule busy => (system "yes busy & echo $! > ypid"))'
+conf tryes.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = yes
+trace_text = yes.log'
+cases=$((cases + 1))
+"$BIN" --config tryes.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has yes.log 'stdout busy' || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+# The child must end by itself shortly after the daemon (no reader left).
+child=gone
+if [ -s ypid ]; then
+  n=0
+  while kill -0 "$(cat ypid)" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 100 ]; then child=running; break; fi
+    sleep 0.05
+  done
+  kill -KILL "$(cat ypid)" 2>/dev/null
+fi
+before=$(size yes.log)
+sleep 0.2
+after=$(size yes.log)
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  [ "$child" != gone ] || [ "$before" != "$after" ]; then
+  fail "busy background child does not hang stop" "exit $rc, lines seen $ok, child $child, trace $before -> $after bytes, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+: >ypid
+
+# L52 R4: while the trace cannot be written, CLIPS STDERR lines also go to
+# the daemon log stream, the original stderr (fds 1 and 2 are captured).
+mkdir errpkg
+conf errpkg/package.conf 'definition = err
+version = 1
+files = e.clp'
+conf errpkg/e.clp '(defrule warn => (printout stderr "engine-error" crlf) (printout t "engine-out" crlf))'
+conf trfull.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = errpkg
+trace_text = /dev/full'
+cases=$((cases + 1))
+"$BIN" --config trfull.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: STDERR: engine-error" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: /dev/full: cannot write: No space left on device
+clpdaemon: STDERR: engine-error
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "failing trace: engine errors on stderr" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# T5d A2: router lines at the 65536-byte cap. A 65535-byte line is one
+# event; 65536 bytes then "a" give a 65536-byte event and "a".
+mkdir cappkg
+conf cappkg/package.conf 'definition = cap
+version = 1
+files = c.clp'
+conf cappkg/c.clp '(defrule big => (bind ?s "x") (loop-for-count 16 (bind ?s (str-cat ?s ?s))) (printout t (sub-string 1 65535 ?s) crlf) (printout t ?s "a" crlf))'
+conf trcap.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = cappkg
+trace_text = t.txt'
+cases=$((cases + 1))
+"$BIN" --config trcap.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has t.txt ' - STDOUT a' || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+got=$(grep -F ' STDOUT ' t.txt | sed 's/^[^ ]* n1 - STDOUT //' | awk '{ printf "%s%d", sep, length($0); sep = "," }')
+last=$(grep -F ' STDOUT ' t.txt | tail -n 1 | sed 's/^[^ ]* n1 - STDOUT //')
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  [ "$got" != "65535,65536,1" ] || [ "$last" != a ]; then
+  fail "router line cap" "exit $rc, lines seen $ok, lengths [$got], last [$last], stderr [$(cat err.txt)]"
+fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]
