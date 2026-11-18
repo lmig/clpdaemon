@@ -2,13 +2,18 @@
 
 #include "cstrnchk.h" /* ConstraintCheckDataObject: not in clips.h */
 
+#include <assert.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
-const clpd_json_limits clpd_ingest_limits = {65536, 4, 8192, 1024, 4096};
+const clpd_json_limits clpd_ingest_limits = {.max_bytes = 65536,
+                                              .max_depth = 4,
+                                              .max_string = 8192,
+                                              .max_elements = 1024,
+                                              .max_nodes = 4096};
 
 /* --- queue ------------------------------------------------------------- */
 
@@ -88,9 +93,14 @@ static int take(item *out) {
   return got;
 }
 
-void clpd_ingest_clear(void) {
+size_t clpd_ingest_clear(void) {
+  size_t dropped = 0;
   item it;
-  while (take(&it)) free(it.text);
+  while (take(&it)) {
+    free(it.text);
+    dropped++;
+  }
+  return dropped;
 }
 
 /* --- validation -------------------------------------------------------- */
@@ -128,9 +138,10 @@ static int fail(ctx *c, const char *fmt, ...) {
   return -1;
 }
 
-/* A symbol CLIPS could read back as one symbol: non-empty, no space,
- * control or delimiter byte ("()&|<~; and the quote), not a variable
- * (leading ? or $?). */
+/* A symbol that reads as one token, not a variable: non-empty, no space,
+ * control or delimiter byte ("()&|<~; and the quote), no leading ? or $?.
+ * Number-like text such as "3" or "1e2" is accepted too: it becomes a
+ * SYMBOL that prints like a number (docs/ingest.md). */
 static int valid_symbol(const char *s) {
   const unsigned char *p = (const unsigned char *)s;
   if (*p == '\0' || *p == '?' || (p[0] == '$' && p[1] == '?')) return 0;
@@ -247,6 +258,27 @@ static int put_slot(ctx *c, FactBuilder *fb, TemplateSlot *ts,
                     c->slot);
 }
 
+#ifndef NDEBUG
+/* 1 when no decoded string or key of v holds a NUL before its end. */
+static int no_inner_nul(const clpd_json *v) {
+  size_t i;
+  switch (v->type) {
+  case CLPD_JSON_STRING: return strlen(v->u.str.s) == v->u.str.len;
+  case CLPD_JSON_ARRAY:
+    for (i = 0; i < v->u.arr.count; i++)
+      if (!no_inner_nul(&v->u.arr.items[i])) return 0;
+    return 1;
+  case CLPD_JSON_OBJECT:
+    for (i = 0; i < v->u.obj.count; i++)
+      if (strlen(v->u.obj.members[i].key) != v->u.obj.members[i].key_len ||
+          !no_inner_nul(&v->u.obj.members[i].value))
+        return 0;
+    return 1;
+  default: return 1;
+  }
+}
+#endif
+
 /* Checks the document and fills a fact builder for its template, then
  * asserts it when do_assert is set. Order of the checks (docs/ingest.md):
  * JSON, top-level keys in document order, 'template', 'slots', the
@@ -272,6 +304,9 @@ static int ingest(Environment *env, const clpd_packages *p, const char *json,
   msg[0] = '\0';
   doc = clpd_json_parse(json, len, &clpd_ingest_limits, &jerr);
   if (doc == NULL) return fail(&c, "invalid JSON: %s", jerr.message);
+  /* Names and values are used as C strings below: the parser never decodes
+   * a NUL into a string or key (src/json.h), checked in debug builds. */
+  assert(no_inner_nul(doc));
   if (doc->type != CLPD_JSON_OBJECT) {
     clpd_json_free(doc);
     return fail(&c, "expected a JSON object");

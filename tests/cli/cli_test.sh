@@ -923,5 +923,93 @@ RUN='timeout 10' check "ingest template listed by two packages" 1 "" \
   "clpdaemon: bad@1: ingest names template 'order', already listed by shop@1
 clpdaemon: bad@1: ingest names unknown template 'nope'" -- --config ingdup.conf --check
 
+# An implied (ordered-pattern) template is not a deftemplate of the package.
+mkdir ingimp
+conf ingimp/package.conf 'definition = imp
+version = 1
+files = s.clp
+ingest = imp'
+conf ingimp/s.clp '(defrule r (imp ?w) =>)'
+conf ingimp.conf 'node_id = n1
+packages = ingimp'
+RUN='timeout 10' check "ingest names an implied template" 1 "" \
+  "clpdaemon: imp@1: lint: template 'imp' has no wf-id slot
+clpdaemon: imp@1: lint: rule 'r': pattern 1 (imp) does not bind wf-id to a variable
+clpdaemon: imp@1: ingest names unknown template 'imp'" -- --config ingimp.conf --check
+# A package that failed to load still claims the names of its ingest list.
+mkdir ingfail
+conf ingfail/package.conf 'definition = fail
+version = 1
+files = missing.clp
+ingest = order'
+conf ingfaildup.conf 'node_id = n1
+packages = ingfail, ingpkg'
+RUN='timeout 10' check "ingest template listed by a package that failed" 1 "" \
+  "clpdaemon: ingfail/missing.clp: cannot open: No such file or directory
+clpdaemon: shop@1: ingest names template 'order', already listed by fail@1" -- --config ingfaildup.conf --check
+# Facts still queued at teardown are dropped with one line on stderr: under
+# --check the facts a plugin posts in init are never drained.
+conf ingcheck.conf "node_id = n1
+plugins = $PLUGINS/test_poster.so
+packages = ingpkg"
+RUN='timeout 10' check "queued facts dropped at shutdown under --check" 0 \
+  "clpdaemon: ingcheck.conf: configuration OK" "clpdaemon: poster: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: poster: posted 0 0
+clpdaemon: poster: shutdown
+clpdaemon: 2 queued facts dropped at shutdown" -- --config ingcheck.conf --check
+conf ingone.conf "node_id = n1
+plugins = $PLUGINS/test_thread.so"
+RUN='timeout 10' check "one queued fact dropped at shutdown" 0 \
+  "clpdaemon: ingone.conf: configuration OK" "clpdaemon: thread: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: thread: thread post_fact=0
+clpdaemon: thread: shutdown
+clpdaemon: 1 queued fact dropped at shutdown" -- --config ingone.conf --check
+conf ingonefail.conf "node_id = n1
+plugins = $PLUGINS/test_thread.so
+packages = nopkg"
+RUN='timeout 10' check "queued fact dropped after a startup failure" 1 "" \
+  "clpdaemon: thread: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: thread: thread post_fact=0
+clpdaemon: nopkg/package.conf: cannot open: No such file or directory
+clpdaemon: thread: shutdown
+clpdaemon: 1 queued fact dropped at shutdown" -- --config ingonefail.conf
+# A post wakes the loop: with a 60 s tick, a fact a plugin thread posts
+# 200 ms after init fires its rule within 2 s, long before the next tick.
+mkdir ingwake
+conf ingwake/package.conf 'definition = wake
+version = 1
+files = s.clp
+ingest = order'
+conf ingwake/s.clp '(deftemplate order (slot wf-id))
+(defrule seen (order (wf-id ?w)) => (printout t "seen " ?w crlf))'
+conf ingwake.conf "node_id = n1
+tick_interval_ms = 60000
+plugins = $PLUGINS/test_late.so
+packages = ingwake"
+cases=$((cases + 1))
+"$BIN" --config ingwake.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+n=0
+while ! grep -qxF "seen late" out.txt 2>/dev/null; do
+  n=$((n + 1))
+  if [ "$n" -gt 40 ]; then ok=0; break; fi
+  sleep 0.05
+done
+kill -TERM "$pid"
+wait_exit "$pid"
+want='clpdaemon: late: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: late: after_load
+clpdaemon: n1: running
+clpdaemon: late: cycle_begin
+clpdaemon: late: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: late: shutdown late post_fact=0'
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != "seen late" ] ||
+  [ "$(cat err.txt)" != "$want" ]; then
+  fail "a post wakes the loop" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

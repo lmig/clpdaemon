@@ -52,8 +52,12 @@ static void host_log(const clpd_plugin *plugin, const char *fmt, ...) {
 
 /* Any thread (docs/ingest.md). post_fact has no context argument, so the
  * origin of a fact is the load address of the library its caller's code
- * is in: clpd_plugins_post_rejected maps it back to the plugin name. The
- * queue itself is process-wide (src/ingest.h). */
+ * is in: clpd_plugins_post_rejected maps it back to the plugin name. That
+ * is the return address, so a tail or sibling call (`return
+ * host->post_fact(...)` compiled as a jump) is attributed to the code its
+ * caller returns to, and a call from a helper library to that library:
+ * either shows `?` (outside every plugin) or the plugin that code is in.
+ * The queue itself is process-wide (src/ingest.h). */
 static int host_post_fact(const char *fact_text) {
   Dl_info info;
   const void *origin = NULL;

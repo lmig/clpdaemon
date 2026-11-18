@@ -171,8 +171,14 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   }
   clpd_plugins_shutdown(plugins);
   /* After shutdown, which stops the plugins' threads: facts still queued
-   * (posted after the last cycle, or under --check) are dropped. */
-  clpd_ingest_clear();
+   * (posted after the last cycle, under --check, or before a startup
+   * failure) are dropped, and the daemon log stream says how many. */
+  {
+    size_t dropped = clpd_ingest_clear();
+    if (dropped > 0)
+      fprintf(clpd_log(), "clpdaemon: %zu queued fact%s dropped at shutdown\n",
+              dropped, dropped == 1 ? "" : "s");
+  }
   clpd_clips_trace_detach(ct);
   clpd_packages_free(&packages);
   clpd_engine_destroy(engine);

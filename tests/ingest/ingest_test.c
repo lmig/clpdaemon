@@ -340,8 +340,9 @@ static void test_post_errors(void) {
   EXPECT(clpd_ingest_post(NULL, big, len) == -1 && errno == EINVAL);
   EXPECT(clpd_ingest_post(NULL, big + 1, len - 1) == 0); /* 65536 bytes */
   EXPECT(clpd_ingest_queue_length() == 1);
-  clpd_ingest_clear();
+  EXPECT(clpd_ingest_clear() == 1); /* the number of facts dropped */
   EXPECT(clpd_ingest_queue_length() == 0);
+  EXPECT(clpd_ingest_clear() == 0);
   free(big);
   /* The text is copied: the caller's buffer may change after the post. */
   {
@@ -428,10 +429,110 @@ static void test_threads(void) {
   for (i = 0; i < THREADS; i++) EXPECT(fails[i] == 0);
   EXPECT(clpd_ingest_queue_length() == THREADS * PER_THREAD);
   EXPECT(notified == THREADS * PER_THREAD);
-  /* Equal facts: CLIPS keeps one. */
+  /* Equal facts: CLIPS keeps one, but the drain counts every fact CLIPS
+   * accepted, so all 800 count. */
   EXPECT(clpd_ingest_drain(env, &pkgs, on_reject, NULL) ==
          THREADS * PER_THREAD);
   EXPECT(clpd_ingest_queue_length() == 0);
+}
+
+/* sym_accepted <symbol-json> <symbol>: {"sym":...} in slot kind asserts a
+ * SYMBOL with exactly that text. */
+static void sym_accepted(const char *sym, const char *want) {
+  char json[160], msg[CLPD_INGEST_MESSAGE_MAX];
+  size_t before = fact_count();
+  snprintf(json, sizeof json,
+           "{\"template\":\"order\",\"slots\":{\"kind\":{\"sym\":%s}}}", sym);
+  if (clpd_ingest_assert(env, &pkgs, json, strlen(json), msg, sizeof msg) !=
+          0 ||
+      fact_count() != before + 1 ||
+      !slot_is(last_fact("order"), "kind", SYMBOL_TYPE, want)) {
+    failures++;
+    fprintf(stderr, "FAIL symbol %s accepted: [%s]\n", sym, msg);
+  }
+}
+
+static void test_symbols(void) {
+  static const char *const bad[] = {
+      "\"\"",    "\" a\"",  "\"a\\tb\"", "\"?x\"",  "\"$?x\"", "\"?\"",
+      "\"$?\"",  "\"a(b\"", "\"a)b\"",   "\"a\\\"b\"", "\"a&b\"", "\"a|b\"",
+      "\"<-\"",  "\"~a\"",  "\"a;b\"",   "\"\\u007f\""};
+  char json[160];
+  size_t i;
+  for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    snprintf(json, sizeof json,
+             "{\"template\":\"order\",\"slots\":{\"kind\":{\"sym\":%s}}}",
+             bad[i]);
+    rejects(json, "slot 'kind': invalid symbol");
+  }
+  sym_accepted("\"a?b\"", "a?b");
+  sym_accepted("\"$x\"", "$x");
+  sym_accepted("\"x$?\"", "x$?");
+  sym_accepted("\"nil\"", "nil");
+  sym_accepted("\"=>\"", "=>");
+  /* Number-like text is a SYMBOL too (it prints like a number). */
+  sym_accepted("\"3\"", "3");
+}
+
+static void test_constraint_edges(void) {
+  char msg[CLPD_INGEST_MESSAGE_MAX], name[80], json[200], want[200];
+  const char *ok =
+      "{\"template\":\"plain\",\"slots\":{\"wf-id\":1,\"n\":0,\"nums\":[9,0]}}";
+  EXPECT(clpd_ingest_assert(env, &pkgs, ok, strlen(ok), msg, sizeof msg) ==
+         0);
+  EXPECT(slot_is(last_fact("plain"), "n", INTEGER_TYPE, "0"));
+  rejects("{\"template\":\"plain\",\"slots\":{\"wf-id\":1,\"n\":-1}}",
+          "slot 'n': value outside the slot's range");
+  rejects("{\"template\":\"plain\",\"slots\":{\"wf-id\":1,\"nums\":[10]}}",
+          "slot 'nums': value outside the slot's range");
+  rejects("{\"template\":\"plain\",\"slots\":{\"wf-id\":1,\"nums\":"
+          "[-1,5]}}",
+          "slot 'nums': value outside the slot's range");
+  rejects("{\"template\":\"plain\",\"slots\":{\"wf-id\":1,\"nums\":"
+          "[1.5,2]}}",
+          "slot 'nums': value type not allowed by the slot");
+  rejects("{\"template\":\"plain\",\"slots\":{\"wf-id\":1,\"nums\":"
+          "[2,{\"sym\":\"x\"}]}}",
+          "slot 'nums': value type not allowed by the slot");
+  /* A 64-byte template name is shown in full. */
+  memset(name, 't', 64);
+  name[64] = '\0';
+  snprintf(json, sizeof json, "{\"template\":\"%s\",\"slots\":{}}", name);
+  snprintf(want, sizeof want, "template '%s' is not ingestible", name);
+  rejects(json, want);
+  /* 63 bytes and a 2-byte character: cut before the character, not in it. */
+  memset(name, 't', 63);
+  snprintf(name + 63, sizeof name - 63, "%s", "\xc3\xa9");
+  snprintf(json, sizeof json, "{\"template\":\"%s\",\"slots\":{}}", name);
+  snprintf(want, sizeof want, "template '%.63s...' is not ingestible", name);
+  rejects(json, want);
+}
+
+/* Reject callback that posts a valid fact from inside the drain. */
+static int reposted;
+static void post_on_reject(void *ctx, const void *origin,
+                           const char *message) {
+  on_reject(ctx, origin, message);
+  reposted = post("{\"template\":\"order\",\"slots\":{\"qty\":555}}") == 0;
+}
+
+static void test_post_during_drain(void) {
+  Defmodule *main_module = GetCurrentModule(env);
+  Defmodule *pkg_module = FindDefmodule(env, "shop@1");
+  size_t before = fact_count();
+  int seen = rejections;
+  EXPECT(post("{\"template\":\"order\",\"slots\":{\"nope\":1}}") == 0);
+  SetCurrentModule(env, pkg_module);
+  EXPECT(clpd_ingest_drain(env, &pkgs, post_on_reject, NULL) == 0);
+  EXPECT(GetCurrentModule(env) == pkg_module); /* unchanged */
+  EXPECT(reposted && rejections == seen + 1);
+  /* The fact posted during the drain waits for the next one. */
+  EXPECT(clpd_ingest_queue_length() == 1 && fact_count() == before);
+  SetCurrentModule(env, main_module);
+  EXPECT(clpd_ingest_drain(env, &pkgs, post_on_reject, NULL) == 1);
+  EXPECT(GetCurrentModule(env) == main_module);
+  EXPECT(clpd_ingest_queue_length() == 0 && fact_count() == before + 1 &&
+         slot_is(last_fact("order"), "qty", INTEGER_TYPE, "555"));
 }
 
 int main(void) {
@@ -440,6 +541,9 @@ int main(void) {
   test_defaults();
   test_check_does_not_assert();
   test_rejections();
+  test_symbols();
+  test_constraint_edges();
+  test_post_during_drain();
   test_post_errors();
   test_full_queue();
   test_notify();

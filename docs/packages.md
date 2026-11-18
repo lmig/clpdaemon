@@ -32,7 +32,7 @@ At startup (FR-2), after the configuration and the CLIPS environment, the daemon
 1. It reads the manifest and creates the module `(defmodule definition@version)`; package files must not declare a `defmodule` of their own.
 2. It loads `files` in order into that module. Loading a package stops at its first failed file.
 3. It runs the `wf-id` lint on the package (FR-7, see below).
-4. It checks the `ingest` list: every name must be a deftemplate of the package (not an implied one), and not listed by an earlier package.
+4. It checks the `ingest` list: every name must be a deftemplate of the package (not an implied one), and not listed by an earlier package (also one that failed to load).
 
 Every package is checked even when an earlier one failed, so one run reports all errors; any error makes the daemon exit 1. With `--check`, the daemon stops after loading and linting. Otherwise it calls `Reset` once and enters the event loop.
 
@@ -79,7 +79,6 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Pattern without a `wf-id` variable | `clpdaemon: <pkg>: lint: rule '<r>': pattern <n> (<template>) does not bind wf-id to a variable` |
 | Rule without pretty-print form | `clpdaemon: <pkg>: lint: rule '<r>': cannot be checked without its pretty-print form` |
 | Different `wf-id` variables | `clpdaemon: <pkg>: lint: rule '<r>': pattern <n> (<template>) binds wf-id to ?<x>, expected ?<w> from pattern <m>` |
-
 | `ingest` names no deftemplate of the package | `clpdaemon: <pkg>: ingest names unknown template '<t>'` |
 | `ingest` names a template an earlier package lists | `clpdaemon: <pkg>: ingest names template '<t>', already listed by <first pkg>` |
 

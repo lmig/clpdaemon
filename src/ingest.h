@@ -47,8 +47,9 @@ size_t clpd_ingest_queue_length(void);
  * are queued, it is called once at once. Set it after the event loop opens
  * and clear it before the loop closes. Any thread. */
 void clpd_ingest_set_notify(clpd_ingest_notify_fn *fn, void *ctx);
-/* Frees every queued fact without asserting it (teardown). Any thread. */
-void clpd_ingest_clear(void);
+/* Frees every queued fact without asserting it (teardown) and returns how
+ * many it dropped. Any thread. */
+size_t clpd_ingest_clear(void);
 
 /* Validates one fact document against env and the ingest lists of p
  * without asserting it. Returns 0 when it would be asserted; otherwise -1
@@ -62,8 +63,9 @@ int clpd_ingest_assert(Environment *env, const clpd_packages *p,
                        const char *json, size_t len, char *msg, size_t n);
 /* Asserts the facts queued when it is called, in posting order; each one
  * rejected is passed to reject (if not NULL). Leaves the current module
- * unchanged. Returns the number of facts asserted. Engine thread, outside
- * Run. */
+ * unchanged. Returns the number of facts CLIPS accepted: a fact equal to an
+ * existing one counts too, although CLIPS keeps only one, so the fact list
+ * may grow by less. Engine thread, outside Run. */
 size_t clpd_ingest_drain(Environment *env, const clpd_packages *p,
                          clpd_ingest_reject_fn *reject, void *ctx);
 
