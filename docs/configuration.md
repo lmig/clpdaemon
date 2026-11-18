@@ -10,10 +10,10 @@ usage: clpdaemon --config <file> [--foreground] [--check]
 |---|---|
 | `--config <file>` | Configuration file. Required. |
 | `--foreground` | Run in the foreground. This is the default (systemd `Type=notify`); the daemon never double-forks. |
-| `--check` | Validate the configuration, load and lint the rule packages, and exit. |
+| `--check` | Validate the configuration, open the trace files, load and lint the rule packages, and exit. |
 | `--help` | Print the usage line on stdout and exit 0. |
 
-Exit codes: `0` success, `1` invalid configuration, `2` command-line error.
+Exit codes: `0` success, `1` invalid configuration or a startup failure (trace files, rule packages), `2` command-line error.
 
 With `--check`, the daemon validates the configuration, loads and lints the rule packages ([`packages.md`](packages.md)), and exits. Without `--check`, it does the same and then runs until it receives `SIGTERM` or `SIGINT`. It always stays in the foreground, with or without `--foreground`; there is no detached mode (systemd supervises it, T17).
 
@@ -24,7 +24,7 @@ A cycle runs `Run` with the `max_rules_per_cycle` limit. The first cycle runs at
 | Signal | Effect |
 |---|---|
 | `SIGTERM`, `SIGINT` | Graceful stop: a running cycle halts after the current rule firing, then the daemon exits 0. |
-| `SIGHUP` | Reopens the trace files (T5); the daemon keeps running. |
+| `SIGHUP` | Reopens the trace files ([`trace.md`](trace.md)); the daemon keeps running. |
 
 Runtime messages (stderr): `clpdaemon: <node_id>: running` once the daemon accepts signals; `clpdaemon: received <SIGTERM|SIGINT>, stopping`; `clpdaemon: received SIGHUP, reopening trace files`. A startup failure prints `clpdaemon: cannot start the event loop: <system error>` or `clpdaemon: cannot create the CLIPS environment` and exits 1. A system error while running prints `clpdaemon: event loop failed: <system error>` and exits 1.
 
@@ -41,8 +41,8 @@ One `key = value` per line; lines may end in LF or CRLF, and spaces and tabs cou
 | `safety_poll_interval_ms` | positive integer | `5000` |
 | `idle_eviction_after` | duration: positive integer followed by `s`, `m` or `h` | `30m` |
 | `admin_socket` | path | `/run/clpdaemon/admin.sock` |
-| `trace_text` | path, empty = disabled | empty |
-| `trace_jsonl` | path, empty = disabled | empty |
+| `trace_text` | path, empty = disabled ([`trace.md`](trace.md)) | empty |
+| `trace_jsonl` | path, empty = disabled ([`trace.md`](trace.md)) | empty |
 | `watch` | list of `facts`, `rules` (may be empty) | `facts,rules` |
 | `packages` | list of paths | empty |
 | `plugins` | list of paths | empty |

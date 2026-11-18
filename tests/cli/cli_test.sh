@@ -20,7 +20,9 @@ check() {
   name=$1 want_rc=$2 want_out=$3 want_err=$4
   shift 5
   cases=$((cases + 1))
-  "$BIN" "$@" >out.txt 2>err.txt
+  # RUN (default empty) bounds cases that would start a daemon on a
+  # regression, e.g. RUN='timeout 10'; a timeout then fails with exit 124.
+  ${RUN:-} "$BIN" "$@" >out.txt 2>err.txt
   rc=$?
   # The sentinel keeps trailing newlines visible to the comparison: every
   # expected non-empty stream ends with exactly one newline.
@@ -67,7 +69,7 @@ max_rules_per_cycle      = -1
 safety_poll_interval_ms  = 5000
 idle_eviction_after      = 2h
 admin_socket             = /run/clpdaemon/admin.sock
-trace_text               = /var/log/clpdaemon/trace.log
+trace_text               = full-trace.log
 trace_jsonl              =
 watch                    = rules
 packages                 = pkg
@@ -282,6 +284,56 @@ clpdaemon: received SIGINT, stopping" ignore-int
 daemon "SIGHUP keeps running" fast.conf "HUP TERM" "clpdaemon: n1: running
 clpdaemon: received SIGHUP, reopening trace files
 clpdaemon: received SIGTERM, stopping"
+
+# --- trace files (FR-2, FR-5, L48) -------------------------------------------
+# fail <name> <detail>: records a failed custom case.
+fail() {
+  failures=$((failures + 1))
+  printf 'FAIL: %s\n  %s\n' "$1" "$2"
+}
+
+conf trnodir.conf 'node_id = n1
+trace_text = nodir/t.log'
+check "trace cannot open" 1 "" "clpdaemon: nodir/t.log: cannot open: No such file or directory" -- --config trnodir.conf --check
+RUN='timeout 10'
+check "run opens the trace first" 1 "" "clpdaemon: nodir/t.log: cannot open: No such file or directory" -- --config trnodir.conf
+RUN=
+conf trdir.conf 'node_id = n1
+trace_jsonl = confdir'
+check "trace path is a directory" 1 "" "clpdaemon: confdir: cannot open: Is a directory" -- --config trdir.conf --check
+conf trok.conf 'node_id = n1
+trace_text = tr.log
+trace_jsonl = tr.jsonl'
+check "check opens the trace files" 0 "clpdaemon: trok.conf: configuration OK" "" -- --config trok.conf --check
+cases=$((cases + 1))
+[ -f tr.log ] && [ ! -s tr.log ] && [ -f tr.jsonl ] && [ ! -s tr.jsonl ] ||
+  fail "check creates empty trace files" "$(ls -l tr.log tr.jsonl 2>&1)"
+
+# SIGHUP after rotation: the moved text file is recreated; the JSONL file,
+# whose directory is gone, keeps its old stream and the failure is reported.
+mkdir rot gone
+conf trhup.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+trace_text = rot/t.log
+trace_jsonl = gone/t.jsonl'
+cases=$((cases + 1))
+"$BIN" --config trhup.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+mv rot/t.log rot/t.log.1 && rm -r gone
+kill -HUP "$pid"
+wait_line err.txt "clpdaemon: gone/t.jsonl: cannot reopen: No such file or directory" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: received SIGHUP, reopening trace files
+clpdaemon: gone/t.jsonl: cannot reopen: No such file or directory
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat err.txt)" != "$want" ] || [ ! -f rot/t.log ]; then
+  fail "SIGHUP reopens the trace files" "exit $rc, lines seen $ok, stderr [$(cat err.txt)], files [$(ls rot)]"
+fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

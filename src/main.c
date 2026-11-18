@@ -4,6 +4,7 @@
 #include "engine.h"
 #include "loop.h"
 #include "packages.h"
+#include "trace.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -35,9 +36,11 @@ static void run_cycle(void *ctx) {
   clpd_engine_run_cycle(c->engine, c->max_rules);
 }
 
+static void reopen_trace(void *trace) { clpd_trace_reopen(trace, stderr); }
+
 /* Runs engine cycles until a stop signal. Returns the exit code. */
 static int serve(const clpd_config *cfg, clpd_engine *engine,
-                 const clpd_packages *packages) {
+                 const clpd_packages *packages, clpd_trace *trace) {
   cycle_ctx ctx;
   clpd_loop *loop;
   int sig;
@@ -49,6 +52,7 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
             strerror(errno));
     return 1;
   }
+  clpd_loop_on_hup(loop, reopen_trace, trace);
   ctx.engine = engine;
   ctx.packages = packages;
   ctx.max_rules = cfg->max_rules_per_cycle;
@@ -63,15 +67,23 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   return sig < 0 ? 1 : 0;
 }
 
-/* Startup after the configuration (FR-2): environment, rule packages, then
- * either the --check report or Reset once and the event loop. */
+/* Startup after the configuration (FR-2): trace files, environment, rule
+ * packages, then either the --check report or Reset once and the event
+ * loop. --check opens the trace files too, so it reports paths the daemon
+ * could not write. */
 static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_packages packages;
-  clpd_engine *engine = clpd_engine_create();
+  clpd_engine *engine;
+  clpd_trace *trace;
   int rc;
 
+  trace = clpd_trace_open(cfg->trace_text, cfg->trace_jsonl, cfg->node_id,
+                          stderr);
+  if (trace == NULL) return 1;
+  engine = clpd_engine_create();
   if (engine == NULL) {
     fputs("clpdaemon: cannot create the CLIPS environment\n", stderr);
+    clpd_trace_close(trace);
     return 1;
   }
   rc = clpd_packages_load(clpd_engine_env(engine), &cfg->packages, &packages,
@@ -82,10 +94,11 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     printf("clpdaemon: %s: configuration OK\n", config_path);
   } else {
     Reset(clpd_engine_env(engine));
-    rc = serve(cfg, engine, &packages);
+    rc = serve(cfg, engine, &packages, trace);
   }
   clpd_packages_free(&packages);
   clpd_engine_destroy(engine);
+  clpd_trace_close(trace);
   return rc;
 }
 
