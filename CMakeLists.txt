@@ -19,4 +19,5 @@ set(CLPD_WARNINGS -Wall -Wextra -Werror)
 enable_testing()
 
 add_subdirectory(vendor/clips)
+add_subdirectory(src)
 add_subdirectory(tests)
