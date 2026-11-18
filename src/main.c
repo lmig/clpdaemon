@@ -108,6 +108,16 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_trace *trace;
   int rc;
 
+  /* Before the plugins load (T6c): threads a plugin starts in init inherit
+   * the blocked mask, so a stop signal reaches only the loop's signalfd,
+   * and one that arrives during startup waits for the loop instead of
+   * killing the process before the plugins' shutdown. --check never runs
+   * the loop and keeps the default dispositions. */
+  if (!check && clpd_loop_block_signals() != 0) {
+    fprintf(clpd_log(), "clpdaemon: cannot block the stop signals: %s\n",
+            strerror(errno));
+    return 1;
+  }
   trace = clpd_trace_open(cfg->trace_text, cfg->trace_jsonl, cfg->node_id,
                           clpd_log());
   if (trace == NULL) return 1;

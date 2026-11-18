@@ -35,10 +35,27 @@ static void close_fds(clpd_loop *l) {
   if (l->event_fd >= 0) close(l->event_fd);
 }
 
-clpd_loop *clpd_loop_open(int tick_ms, int min_ms, FILE *log) {
-  static const int sigs[] = {SIGTERM, SIGINT, SIGHUP};
+static const int stop_sigs[] = {SIGTERM, SIGINT, SIGHUP};
+
+static void stop_set(sigset_t *set) {
+  size_t i;
+  sigemptyset(set);
+  for (i = 0; i < sizeof stop_sigs / sizeof stop_sigs[0]; i++)
+    sigaddset(set, stop_sigs[i]);
+}
+
+int clpd_loop_block_signals(void) {
   sigset_t set;
   size_t i;
+  stop_set(&set);
+  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) return -1;
+  for (i = 0; i < sizeof stop_sigs / sizeof stop_sigs[0]; i++)
+    if (signal(stop_sigs[i], SIG_DFL) == SIG_ERR) return -1;
+  return 0;
+}
+
+clpd_loop *clpd_loop_open(int tick_ms, int min_ms, FILE *log) {
+  sigset_t set;
   int saved;
   clpd_loop *l = calloc(1, sizeof *l);
 
@@ -47,11 +64,8 @@ clpd_loop *clpd_loop_open(int tick_ms, int min_ms, FILE *log) {
   l->tick_ms = tick_ms;
   l->min_ms = min_ms;
   l->log = log;
-  sigemptyset(&set);
-  for (i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaddset(&set, sigs[i]);
-  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) goto fail;
-  for (i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
-    if (signal(sigs[i], SIG_DFL) == SIG_ERR) goto fail;
+  if (clpd_loop_block_signals() != 0) goto fail;
+  stop_set(&set);
   l->sig_fd = signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK);
   l->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
   l->event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);

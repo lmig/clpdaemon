@@ -6,16 +6,24 @@
  * later contract revision), HOOKS_THREAD (init also calls post_fact from
  * another thread) and HOOKS_MARKERS (shutdown, the CLIPS environment
  * cleanup and the library destructor append a line each to the file named
- * by CLPD_TEST_MARKERS). Every variant registers <name>-answer, which
- * returns 42, and <name>-throw, which calls UDFThrowError. */
+ * by CLPD_TEST_MARKERS), HOOKS_SLEEPER (init starts a thread that lives
+ * until shutdown) and HOOKS_SLOW (init sleeps 300 ms after its log line).
+ * Every variant registers <name>-answer, which returns 42; every variant
+ * except HOOKS_FAIL_INIT also registers <name>-throw, which calls
+ * UDFThrowError. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "clpd_plugin.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-#ifdef HOOKS_THREAD
+#if defined(HOOKS_THREAD) || defined(HOOKS_SLEEPER)
 #include <pthread.h>
+#endif
+#ifdef HOOKS_SLOW
+#include <time.h>
 #endif
 
 #ifndef HOOKS_NAME
@@ -25,7 +33,25 @@
 typedef struct {
   const clpd_host *host;
   int cycles, ended;
+#ifdef HOOKS_SLEEPER
+  pthread_t sleeper;
+  pthread_mutex_t lock;
+  pthread_cond_t wake;
+  int stop;
+#endif
 } hooks_state;
+
+#ifdef HOOKS_SLEEPER
+/* Waits until shutdown; it never touches its signal mask, so it keeps the
+ * one it inherited from the thread that ran init. */
+static void *sleep_until_stop(void *arg) {
+  hooks_state *s = arg;
+  pthread_mutex_lock(&s->lock);
+  while (!s->stop) pthread_cond_wait(&s->wake, &s->lock);
+  pthread_mutex_unlock(&s->lock);
+  return NULL;
+}
+#endif
 
 #ifdef HOOKS_BIG
 /* A descriptor with fields this daemon does not know about. */
@@ -91,6 +117,13 @@ static int hooks_init(const clpd_host *host, Environment *env, void **state) {
   rc = host->post_fact("(x)");
   host->log(SELF, "init node_id=%s post_fact=%d%s", host->node_id, rc,
             errno == ENOSYS ? " ENOSYS" : "");
+#ifdef HOOKS_SLOW
+  {
+    struct timespec pause = {0, 300000000L};
+    while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+    }
+  }
+#endif
 #ifdef HOOKS_THREAD
   {
     post_result r = {NULL, 0, 0};
@@ -121,6 +154,14 @@ static int hooks_init(const clpd_host *host, Environment *env, void **state) {
     s = calloc(1, sizeof *s);
     if (s == NULL) return -1;
     s->host = host;
+#ifdef HOOKS_SLEEPER
+    pthread_mutex_init(&s->lock, NULL);
+    pthread_cond_init(&s->wake, NULL);
+    if (pthread_create(&s->sleeper, NULL, sleep_until_stop, s) != 0) {
+      free(s);
+      return -1;
+    }
+#endif
     *state = s;
     return 0;
   }
@@ -145,6 +186,15 @@ static void hooks_cycle_end(void *state, int ok) {
 static void hooks_shutdown(void *state) {
   hooks_state *s = state;
   s->host->log(SELF, "shutdown");
+#ifdef HOOKS_SLEEPER
+  pthread_mutex_lock(&s->lock);
+  s->stop = 1;
+  pthread_cond_signal(&s->wake);
+  pthread_mutex_unlock(&s->lock);
+  pthread_join(s->sleeper, NULL);
+  pthread_cond_destroy(&s->wake);
+  pthread_mutex_destroy(&s->lock);
+#endif
 #ifdef HOOKS_MARKERS
   mark("shutdown");
 #endif

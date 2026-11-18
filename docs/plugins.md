@@ -52,9 +52,11 @@ With `--check`, steps 1-3 run and then `shutdown` (no `after_load`, no cycle). A
 
 Every hook runs on the engine thread, the only thread that may call CLIPS (NFR-1). A plugin that starts its own threads must not call CLIPS or `host->log` from them; `host->post_fact` is the only host function callable from any thread (FR-19). Stop those threads in `shutdown`.
 
+The daemon blocks `SIGTERM`, `SIGINT` and `SIGHUP` before it loads the plugins, so a thread started from a hook inherits that mask and the signals reach only the daemon's event loop: once the loop runs, a stop signal ends in the graceful stop above, with `shutdown`. A plugin thread must not unblock them. A stop signal that arrives during `init` or package loading waits until the event loop starts, which then stops before the first cycle; if startup fails first, the daemon exits 1 with the startup error (after the plugins' `shutdown`) and the signal is not reported. Under `--check` the signals keep their default action.
+
 ## Output
 
-With a trace configured, what a plugin writes to file descriptors 1 and 2 (for example with `printf`), and what it writes through CLIPS routers, goes to the trace ([`trace.md`](trace.md), FR-16); `host->log` lines never go to the trace.
+With a trace configured, what a plugin writes to file descriptors 1 and 2 (for example with `printf`), and what it writes through CLIPS routers, goes to the trace ([`trace.md`](trace.md), FR-16) from `after_load` until `shutdown` of a normal stop. The capture starts after the plugins and packages loaded, so output from `init`, and from `shutdown` when startup fails, goes to the console, not the trace. `host->log` lines never go to the trace.
 
 ## Messages
 

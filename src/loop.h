@@ -12,12 +12,18 @@ typedef struct clpd_loop clpd_loop;
 typedef void clpd_cycle_fn(void *ctx);
 typedef void clpd_hup_fn(void *ctx);
 
-/* Blocks SIGTERM, SIGINT and SIGHUP for the process, restores their default
- * disposition and creates the descriptors. A shell may start background jobs
- * with SIGINT ignored; POSIX leaves unspecified whether a blocked, ignored
- * signal stays pending (Linux keeps it), so the reset makes delivery to the
- * signalfd independent of the parent. Messages go to log. Returns NULL with
- * errno set on failure. */
+/* Blocks SIGTERM, SIGINT and SIGHUP in the calling thread and restores their
+ * default disposition. A shell may start background jobs with SIGINT
+ * ignored; POSIX leaves unspecified whether a blocked, ignored signal stays
+ * pending (Linux keeps it), so the reset makes delivery to the signalfd
+ * independent of the parent. Threads created afterwards inherit the mask, so
+ * call it before any thread that must not take these signals is started
+ * (the daemon calls it before loading plugins). A signal that arrives
+ * before clpd_loop_open stays pending and is read by the loop. Returns -1
+ * with errno set on failure. */
+int clpd_loop_block_signals(void);
+/* clpd_loop_block_signals (idempotent) and creates the descriptors.
+ * Messages go to log. Returns NULL with errno set on failure. */
 clpd_loop *clpd_loop_open(int tick_ms, int min_ms, FILE *log);
 /* Requests a cycle (subject to the minimum interval). Safe to call from a
  * cycle callback. */

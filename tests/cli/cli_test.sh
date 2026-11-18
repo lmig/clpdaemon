@@ -778,5 +778,97 @@ clpdaemon: hooks-a: cycle_end ok=1
 clpdaemon: received SIGTERM, stopping
 clpdaemon: hooks-a: shutdown"
 
+# T6c: the stop signals are blocked before the plugins load. A thread a
+# plugin starts in init inherits that mask, so SIGTERM still reaches the
+# signalfd and the daemon stops gracefully instead of taking the default
+# action (exit 143) on that thread.
+conf plugsleeper.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_sleeper.so"
+plugdaemon "SIGTERM with a plugin thread stops gracefully" plugsleeper.conf \
+  "clpdaemon: sleeper: cycle_end ok=1" "clpdaemon: sleeper: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: sleeper: after_load
+clpdaemon: n1: running
+clpdaemon: sleeper: cycle_begin
+clpdaemon: sleeper: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: sleeper: shutdown"
+# A SIGTERM during plugin init is held until the loop starts, which stops
+# before any cycle.
+conf plugslow.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_slow.so"
+cases=$((cases + 1))
+"$BIN" --config plugslow.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: slow: after_load
+clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping
+clpdaemon: slow: shutdown"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "SIGTERM during plugin init stops gracefully after startup" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+# A SIGHUP during plugin init is handled once the loop starts, which keeps
+# running; a later SIGINT stops it.
+cases=$((cases + 1))
+"$BIN" --config plugslow.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+kill -HUP "$pid"
+wait_line err.txt "clpdaemon: received SIGHUP, reopening trace files" || ok=0
+wait_line err.txt "clpdaemon: slow: cycle_end ok=1" || ok=0
+kill -INT "$pid"
+wait_exit "$pid"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] ||
+  ! grep -qxF "clpdaemon: received SIGINT, stopping" err.txt ||
+  [ "$(tail -n 1 err.txt)" != "clpdaemon: slow: shutdown" ]; then
+  fail "SIGHUP during plugin init reopens and keeps running" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+# A SIGTERM during package loading is held as well.
+mkdir slowpkg
+conf slowpkg/package.conf 'definition = slowpkg
+version = 1
+files = s.clp'
+conf slowpkg/s.clp '(defglobal ?*z* = (system "sleep 0.6"))'
+conf plugslowpkg.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_hooks_a.so
+packages = slowpkg"
+cases=$((cases + 1))
+"$BIN" --config plugslowpkg.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "SIGTERM during package loading stops gracefully after startup" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+# --check never runs the loop and keeps the default SIGTERM action.
+cases=$((cases + 1))
+"$BIN" --config plugslow.conf --check >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+if [ "$ok" != 1 ] || [ "$rc" != 143 ]; then
+  fail "--check keeps the default SIGTERM action" "exit $rc, lines seen $ok, stderr [$(cat err.txt)]"
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]
