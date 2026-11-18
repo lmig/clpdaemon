@@ -31,6 +31,7 @@ typedef struct {
   char *trace_jsonl; /* NULL = disabled */
   int watch_facts;
   int watch_rules;
+  char *database; /* NULL = no database; checked by clpd_db_check_spec */
   clpd_list packages;
   clpd_list plugins;
 } clpd_config;

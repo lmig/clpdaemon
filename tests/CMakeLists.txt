@@ -29,6 +29,16 @@ foreach(t scheduler engine loop lint manifest packages trace clips_trace fdcaptu
   add_test(NAME clpdaemon_${t} COMMAND ${t}_test)
 endforeach()
 
+# Database interface (T8a): spec checks, and the shared backend suite on a
+# temporary SQLite file (RED until the SQLite backend, T8b).
+add_executable(db_test db/db_test.c db/db_suite.c)
+target_link_libraries(db_test PRIVATE clpd_core)
+target_include_directories(db_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+target_compile_options(db_test PRIVATE ${CLPD_WARNINGS})
+add_test(NAME clpdaemon_db COMMAND db_test)
+add_test(NAME clpdaemon_db_sqlite_suite COMMAND db_test sqlite-suite)
+set_tests_properties(clpdaemon_db clpdaemon_db_sqlite_suite PROPERTIES TIMEOUT 30)
+
 # Link seam for the reader-failure cases, this test binary only: the test
 # wraps poll and read (production objects are unchanged).
 target_link_options(fdcapture_test PRIVATE -Wl,--wrap=poll -Wl,--wrap=read)

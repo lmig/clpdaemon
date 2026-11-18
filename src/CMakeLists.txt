@@ -1,7 +1,13 @@
-add_library(clpd_core STATIC kvfile.c config.c manifest.c packages.c scheduler.c engine.c loop.c lint.c trace.c clips_trace.c fdcapture.c log.c plugins.c json.c ingest.c admin.c)
+add_library(clpd_core STATIC kvfile.c config.c manifest.c packages.c scheduler.c engine.c loop.c lint.c trace.c clips_trace.c fdcapture.c log.c plugins.c json.c ingest.c admin.c db.c db_sqlite.c db_pg.c)
 target_include_directories(clpd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
+# Database backends (src/db.h, T8): both required. libpq from Homebrew is
+# keg-only: put its lib/pkgconfig on PKG_CONFIG_PATH.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SQLITE3 REQUIRED IMPORTED_TARGET sqlite3)
+pkg_check_modules(LIBPQ REQUIRED IMPORTED_TARGET libpq)
 target_link_libraries(clpd_core PUBLIC clips::clips Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(clpd_core PRIVATE PkgConfig::SQLITE3 PkgConfig::LIBPQ)
 target_compile_options(clpd_core PRIVATE ${CLPD_WARNINGS})
 
 # Plugin contract (include/clpd_plugin.h, docs/plugins.md): a plugin

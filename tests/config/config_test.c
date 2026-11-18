@@ -183,6 +183,65 @@ static void test_admin_socket_none(void) {
   clpd_config_free(&cfg);
 }
 
+/* database (T8a, L74): sqlite:<path> or a libpq conninfo without a
+ * password; absent = NULL = no database; the value is never echoed. */
+static void test_database(void) {
+  static const char *const good[] = {
+      "sqlite:/var/lib/clpd/x.db", "sqlite:rel.db",
+      "host=/tmp dbname=clpd user=clpd", "postgresql://clpd@localhost/clpd",
+      "postgres://localhost:5432/clpd?sslmode=disable"};
+  static const struct {
+    const char *value, *message;
+  } bad[] = {
+      {"", "database: expected a connection string"},
+      {"sqlite:", "database: expected sqlite:<path>"},
+      {"sqlite", "database: expected sqlite:<path>"},
+      {"not a conninfo", "database: invalid PostgreSQL connection string"},
+      {"host='unterminated", "database: invalid PostgreSQL connection string"},
+      {"postgresql://[::1", "database: invalid PostgreSQL connection string"},
+      {"host=/tmp password=s3cr3t",
+       "database: the connection string must not contain a password (use a "
+       "password file, see PGPASSFILE)"},
+      {"host=/tmp sslpassword=s3cr3t",
+       "database: the connection string must not contain a password (use a "
+       "password file, see PGPASSFILE)"},
+      {"postgresql://clpd:s3cr3t@localhost/clpd",
+       "database: the connection string must not contain a password (use a "
+       "password file, see PGPASSFILE)"},
+      {"postgresql://localhost/clpd?password=s3cr3t",
+       "database: the connection string must not contain a password (use a "
+       "password file, see PGPASSFILE)"},
+  };
+  clpd_config cfg;
+  char text[256], eb[512], expect[sizeof path + 256];
+  size_t i;
+
+  EXPECT(LOAD("db.conf", "node_id = n1\n", &cfg, eb) == 0);
+  EXPECT(cfg.database == NULL);
+  clpd_config_free(&cfg);
+  for (i = 0; i < sizeof good / sizeof good[0]; i++) {
+    snprintf(text, sizeof text, "node_id = n1\ndatabase = %s\n", good[i]);
+    EXPECT(load("db.conf", text, strlen(text), &cfg, eb, sizeof eb) == 0);
+    EXPECT(strcmp(eb, "") == 0);
+    EXPECT(cfg.database != NULL && strcmp(cfg.database, good[i]) == 0);
+    clpd_config_free(&cfg);
+  }
+  for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    snprintf(text, sizeof text, "node_id = n1\ndatabase = %s\n", bad[i].value);
+    EXPECT(load("db.conf", text, strlen(text), &cfg, eb, sizeof eb) == 1);
+    snprintf(expect, sizeof expect, "clpdaemon: %s:2: %s\n", path,
+             bad[i].message);
+    EXPECT(strcmp(eb, expect) == 0);
+    EXPECT(strstr(eb, "s3cr3t") == NULL); /* never echoed */
+    EXPECT(cfg.database == NULL);          /* the rejected line set nothing */
+    clpd_config_free(&cfg);
+  }
+  /* A duplicate key is still reported once, as for every key. */
+  EXPECT(LOAD("db.conf", "node_id = n1\ndatabase = sqlite:a\ndatabase = sqlite:b\n",
+              &cfg, eb) == 1);
+  clpd_config_free(&cfg);
+}
+
 static void test_nul_byte_rejected(void) {
   clpd_config cfg;
   char eb[512], want[sizeof path + 64];
@@ -205,6 +264,7 @@ int main(void) {
   test_nul_byte_rejected();
   test_admin_socket_mode();
   test_admin_socket_none();
+  test_database();
   rmdir(dir);
   if (failures != 0) {
     fprintf(stderr, "%d config checks failed\n", failures);

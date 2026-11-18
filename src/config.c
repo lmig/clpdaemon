@@ -1,5 +1,7 @@
 #include "config.h"
 
+#include "db.h"
+
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +16,8 @@ typedef enum {
   K_MODE,
   K_OPTIONAL_PATH,
   K_WATCH,
-  K_PATH_LIST
+  K_PATH_LIST,
+  K_DATABASE
 } key_kind;
 
 enum {
@@ -31,6 +34,7 @@ enum {
   KEY_WATCH,
   KEY_PACKAGES,
   KEY_PLUGINS,
+  KEY_DATABASE,
   KEY_COUNT
 };
 
@@ -42,13 +46,14 @@ static const char *const key_names[KEY_COUNT] = {
     "admin_socket",     "admin_socket_mode",       "trace_text",
     "trace_jsonl",
     "watch",            "packages",                "plugins",
+    "database",
 };
 
 static const key_kind key_kinds[KEY_COUNT] = {
     K_NODE_ID,     K_POSITIVE,      K_NON_NEGATIVE,  K_MAX_RULES,
     K_POSITIVE,    K_DURATION,      K_PATH,          K_MODE,
     K_OPTIONAL_PATH, K_OPTIONAL_PATH, K_WATCH,       K_PATH_LIST,
-    K_PATH_LIST,
+    K_PATH_LIST,   K_DATABASE,
 };
 
 typedef struct {
@@ -204,6 +209,17 @@ static int apply(clpd_kv *kv, int key, char *value, clpd_config *cfg) {
     return clpd_kv_list(kv, name, value,
                         key == KEY_PACKAGES ? &cfg->packages : &cfg->plugins,
                         NULL, NULL);
+  case K_DATABASE: {
+    /* The value may hold credentials: the message never echoes it. */
+    char msg[160];
+    if (!clpd_db_check_spec(value, msg, sizeof msg)) {
+      clpd_kv_error(kv, "%s", msg);
+      return 0;
+    }
+    free(cfg->database);
+    cfg->database = clpd_strdup(value);
+    return 1;
+  }
   }
 
   switch (key) {
@@ -266,6 +282,7 @@ void clpd_config_free(clpd_config *cfg) {
   free(cfg->admin_socket);
   free(cfg->trace_text);
   free(cfg->trace_jsonl);
+  free(cfg->database);
   clpd_list_free(&cfg->packages);
   clpd_list_free(&cfg->plugins);
   memset(cfg, 0, sizeof *cfg);
