@@ -1,4 +1,4 @@
-add_library(clpd_core STATIC kvfile.c config.c manifest.c packages.c scheduler.c engine.c loop.c lint.c trace.c clips_trace.c fdcapture.c log.c plugins.c json.c ingest.c)
+add_library(clpd_core STATIC kvfile.c config.c manifest.c packages.c scheduler.c engine.c loop.c lint.c trace.c clips_trace.c fdcapture.c log.c plugins.c json.c ingest.c admin.c)
 target_include_directories(clpd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
 target_link_libraries(clpd_core PUBLIC clips::clips Threads::Threads ${CMAKE_DL_LIBS})

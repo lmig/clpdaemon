@@ -11,6 +11,7 @@ typedef enum {
   K_MAX_RULES,
   K_DURATION,
   K_PATH,
+  K_MODE,
   K_OPTIONAL_PATH,
   K_WATCH,
   K_PATH_LIST
@@ -24,6 +25,7 @@ enum {
   KEY_SAFETY_POLL,
   KEY_IDLE_EVICTION,
   KEY_ADMIN_SOCKET,
+  KEY_ADMIN_SOCKET_MODE,
   KEY_TRACE_TEXT,
   KEY_TRACE_JSONL,
   KEY_WATCH,
@@ -37,14 +39,16 @@ enum {
 static const char *const key_names[KEY_COUNT] = {
     "node_id",          "tick_interval_ms",        "cycle_min_interval_ms",
     "max_rules_per_cycle", "safety_poll_interval_ms", "idle_eviction_after",
-    "admin_socket",     "trace_text",              "trace_jsonl",
+    "admin_socket",     "admin_socket_mode",       "trace_text",
+    "trace_jsonl",
     "watch",            "packages",                "plugins",
 };
 
 static const key_kind key_kinds[KEY_COUNT] = {
     K_NODE_ID,     K_POSITIVE,      K_NON_NEGATIVE,  K_MAX_RULES,
-    K_POSITIVE,    K_DURATION,      K_PATH,          K_OPTIONAL_PATH,
-    K_OPTIONAL_PATH, K_WATCH,       K_PATH_LIST,     K_PATH_LIST,
+    K_POSITIVE,    K_DURATION,      K_PATH,          K_MODE,
+    K_OPTIONAL_PATH, K_OPTIONAL_PATH, K_WATCH,       K_PATH_LIST,
+    K_PATH_LIST,
 };
 
 typedef struct {
@@ -162,6 +166,24 @@ static int apply(clpd_kv *kv, int key, char *value, clpd_config *cfg) {
     }
     set_path(&cfg->admin_socket, value);
     return 1;
+  case K_MODE: {
+    /* 3 or 4 octal digits, a 4-digit one starting with 0; owner and group
+     * bits only, so the admin socket is never open to every local user. */
+    size_t n = strlen(value), i;
+    int ok = (n == 3 || (n == 4 && value[0] == '0'));
+    for (i = 0; ok && i < n; i++) {
+      if (value[i] < '0' || value[i] > '7') ok = 0;
+      else v = v * 8 + (value[i] - '0');
+    }
+    if (!ok || (v & 07) != 0) {
+      clpd_kv_error(kv, "admin_socket_mode: expected an octal mode such as "
+                        "0600 or 0660, with no permission bits for others, "
+                        "got '%s'", value);
+      return 0;
+    }
+    cfg->admin_socket_mode = (int)v;
+    return 1;
+  }
   case K_OPTIONAL_PATH:
     set_path(key == KEY_TRACE_TEXT ? &cfg->trace_text : &cfg->trace_jsonl,
              value);
@@ -206,6 +228,7 @@ static void set_defaults(clpd_config *cfg) {
   cfg->safety_poll_interval_ms = CLPD_DEFAULT_SAFETY_POLL_INTERVAL_MS;
   cfg->idle_eviction_after_s = CLPD_DEFAULT_IDLE_EVICTION_AFTER_S;
   cfg->admin_socket = clpd_strdup(CLPD_DEFAULT_ADMIN_SOCKET);
+  cfg->admin_socket_mode = CLPD_DEFAULT_ADMIN_SOCKET_MODE;
   cfg->watch_facts = 1;
   cfg->watch_rules = 1;
 }

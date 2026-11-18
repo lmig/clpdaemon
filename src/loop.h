@@ -11,6 +11,12 @@
 typedef struct clpd_loop clpd_loop;
 typedef void clpd_cycle_fn(void *ctx);
 typedef void clpd_hup_fn(void *ctx);
+/* Called on the loop thread when a registered fd is ready; revents is the
+ * poll result (POLLIN, POLLOUT, POLLHUP, POLLERR...). */
+typedef void clpd_fd_fn(void *ctx, int fd, short revents);
+
+/* Registered fds per loop (the admin socket uses 1 + 16). */
+#define CLPD_LOOP_FDS_MAX 32
 
 /* Blocks SIGTERM, SIGINT and SIGHUP in the calling thread and restores their
  * default disposition. A shell may start background jobs with SIGINT
@@ -32,10 +38,25 @@ clpd_loop *clpd_loop_open(int tick_ms, int min_ms, FILE *log);
 void clpd_loop_notify(clpd_loop *l);
 /* Called on SIGHUP after its message is logged (trace reopen). */
 void clpd_loop_on_hup(clpd_loop *l, clpd_hup_fn *fn, void *ctx);
+/* Registers fd, polled for events (POLLIN and/or POLLOUT) while the loop
+ * runs: when it is ready, fn(ctx, fd, revents) runs on the loop thread,
+ * after the signals are read (a pending stop still wins) and before a due
+ * cycle. Returns 0, or -1 with errno EINVAL (fd < 0 or fn NULL), EEXIST
+ * (fd already registered) or ENOSPC (CLPD_LOOP_FDS_MAX registered). The
+ * loop never closes fd. These three calls may be made from a callback: an
+ * fd added there is first polled in the next iteration, one removed there
+ * gets no further callback, also in the current iteration. */
+int clpd_loop_add_fd(clpd_loop *l, int fd, short events, clpd_fd_fn *fn,
+                     void *ctx);
+/* Replaces the polled events of a registered fd. -1 with ENOENT if it is
+ * not registered. */
+int clpd_loop_set_events(clpd_loop *l, int fd, short events);
+/* Unregisters fd. -1 with ENOENT if it is not registered. */
+int clpd_loop_remove_fd(clpd_loop *l, int fd);
 /* Runs cycles until SIGTERM or SIGINT arrives and returns that signal; a
- * pending stop signal wins over a due cycle. SIGHUP is logged and the loop
- * continues. Returns -1 with errno set on a system error, including a
- * failed read of the signal descriptor. */
+ * pending stop signal wins over a due cycle and over the registered fds.
+ * SIGHUP is logged and the loop continues. Returns -1 with errno set on a
+ * system error, including a failed read of the signal descriptor. */
 int clpd_loop_run(clpd_loop *l, clpd_cycle_fn *cycle, void *ctx);
 void clpd_loop_close(clpd_loop *l);
 

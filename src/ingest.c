@@ -105,11 +105,9 @@ size_t clpd_ingest_clear(void) {
 
 /* --- validation -------------------------------------------------------- */
 
-#define SHOWN_MAX 64 /* bytes of a name quoted in a message */
+#define SHOWN_MAX CLPD_INGEST_SHOWN_MAX
 
-/* Copies name for a message: control bytes become '?', and a name longer
- * than SHOWN_MAX bytes is cut (at a UTF-8 boundary) and ends in "...". */
-static const char *shown(const char *name, char buf[SHOWN_MAX + 4]) {
+const char *clpd_ingest_shown(const char *name, char buf[SHOWN_MAX + 4]) {
   size_t n = strlen(name), i;
   if (n > SHOWN_MAX) {
     n = SHOWN_MAX;
@@ -314,7 +312,7 @@ static int ingest(Environment *env, const clpd_packages *p, const char *json,
   for (i = 0; i < doc->u.obj.count; i++) {
     const char *key = doc->u.obj.members[i].key;
     if (strcmp(key, "template") != 0 && strcmp(key, "slots") != 0) {
-      fail(&c, "unknown key '%s'", shown(key, tname));
+      fail(&c, "unknown key '%s'", clpd_ingest_shown(key, tname));
       goto done;
     }
   }
@@ -336,7 +334,7 @@ static int ingest(Environment *env, const clpd_packages *p, const char *json,
     fail(&c, "'slots' must be an object");
     goto done;
   }
-  shown(t->u.str.s, tname);
+  clpd_ingest_shown(t->u.str.s, tname);
   tpl = ingestible(p, t->u.str.s);
   if (tpl == NULL) {
     fail(&c, "template '%s' is not ingestible", tname);
@@ -357,7 +355,7 @@ static int ingest(Environment *env, const clpd_packages *p, const char *json,
   GCBlockStart(env, &gcb);
   for (i = 0; i < slots->u.obj.count; i++) {
     const clpd_json_member *m = &slots->u.obj.members[i];
-    shown(m->key, c.slot);
+    clpd_ingest_shown(m->key, c.slot);
     if ((ts = find_slot(tpl, m->key)) == NULL) {
       fail(&c, "template '%s' has no slot '%s'", tname, c.slot);
       break;
@@ -369,8 +367,8 @@ static int ingest(Environment *env, const clpd_packages *p, const char *json,
       if (ts->noDefault && clpd_json_get(slots, ts->slotName->contents) == NULL)
         break;
     if (ts != NULL)
-      fail(&c, "slot '%s' requires a value", shown(ts->slotName->contents,
-                                                   c.slot));
+      fail(&c, "slot '%s' requires a value",
+           clpd_ingest_shown(ts->slotName->contents, c.slot));
     else if (!do_assert)
       rc = 0;
     else if (FBAssert(fb) == NULL || FBError(env) != FBE_NO_ERROR)

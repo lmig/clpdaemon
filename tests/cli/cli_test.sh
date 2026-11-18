@@ -1,15 +1,19 @@
 #!/bin/sh
 # CLI and configuration tests for clpdaemon (T2, docs/configuration.md).
-# usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>
+# usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size> <admin-client>
 # <plugin-dir> holds the example and test plugins (<build>/plugins);
-# <plugin-desc-size> prints sizeof(clpd_plugin) of this build.
+# <plugin-desc-size> prints sizeof(clpd_plugin) of this build;
+# <admin-client> talks to the admin socket (tests/admin/admin_client.c).
 set -u
 
-BIN=${1:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}
-PLUGINS=${2:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}
-DESC_SIZE=$("${3:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}") || exit 2
+U='usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size> <admin-client>'
+BIN=${1:?$U}
+PLUGINS=${2:?$U}
+DESC_SIZE=$("${3:?$U}") || exit 2
+ADMIN=${4:?$U}
 case $BIN in /*) ;; *) BIN=$PWD/$BIN ;; esac
 case $PLUGINS in /*) ;; *) PLUGINS=$PWD/$PLUGINS ;; esac
+case $ADMIN in /*) ;; *) ADMIN=$PWD/$ADMIN ;; esac
 WORK=$(mktemp -d)
 # A background child left by a case (ypid) is killed even on failure.
 trap 'if [ -s "$WORK/ypid" ]; then kill -KILL "$(cat "$WORK/ypid")" 2>/dev/null; fi; rm -rf "$WORK"' EXIT
@@ -43,6 +47,9 @@ check() {
 }
 
 conf() { printf '%s\n' "$2" >"$1"; }
+# rconf: a configuration for a running daemon, with its admin socket in the
+# work directory (the default /run/clpdaemon/admin.sock may not exist).
+rconf() { printf '%s\nadmin_socket = admin.sock\n' "$2" >"$1"; }
 
 # --- command line -----------------------------------------------------------
 conf ok.conf 'node_id = n1'
@@ -275,14 +282,14 @@ daemon() {
   fi
 }
 
-conf fast.conf 'node_id = n1
+rconf fast.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10'
 daemon "SIGTERM stops gracefully" fast.conf TERM "clpdaemon: n1: running
 clpdaemon: received SIGTERM, stopping"
 daemon "SIGINT stops gracefully" fast.conf INT "clpdaemon: n1: running
 clpdaemon: received SIGINT, stopping"
-conf fastpkg.conf 'node_id = n1
+rconf fastpkg.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 packages = pkg'
@@ -343,7 +350,7 @@ wait_grows() {
 
 # The engine is traced from Reset on (T5b): the deffacts assert, then the
 # firing of rule start and its modify as one event. Timestamps are stripped.
-conf trpkg.conf 'node_id = n1
+rconf trpkg.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 packages = pkg
@@ -385,7 +392,7 @@ files = t.clp'
 conf tick/t.clp '(deftemplate counter (slot wf-id) (slot n))
 (defrule step ?c <- (counter (wf-id ?w) (n ?n)) => (modify ?c (n (+ ?n 1))))
 (deffacts seed (counter (wf-id c1) (n 0)))'
-conf trhup.conf 'node_id = n1
+rconf trhup.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 max_rules_per_cycle = 1
@@ -424,7 +431,7 @@ conf sys/package.conf 'definition = sys
 version = 1
 files = s.clp'
 conf sys/s.clp '(defrule shell => (system "echo out-child; echo err-child >&2"))'
-conf trsys.conf 'node_id = n1
+rconf trsys.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 packages = sys
@@ -457,7 +464,7 @@ if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "
 fi
 
 # Without a trace nothing is redirected: the child writes to the console.
-conf nosys.conf 'node_id = n1
+rconf nosys.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 packages = sys'
@@ -482,7 +489,7 @@ conf yes/package.conf 'definition = yes
 version = 1
 files = y.clp'
 conf yes/y.clp '(defrule busy => (system "yes busy & echo $! > ypid"))'
-conf tryes.conf 'node_id = n1
+rconf tryes.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 packages = yes
@@ -524,7 +531,7 @@ conf errpkg/package.conf 'definition = err
 version = 1
 files = e.clp'
 conf errpkg/e.clp '(defrule warn => (printout stderr "engine-error" crlf) (printout t "engine-out" crlf))'
-conf trfull.conf 'node_id = n1
+rconf trfull.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 packages = errpkg
@@ -551,7 +558,7 @@ conf cappkg/package.conf 'definition = cap
 version = 1
 files = c.clp'
 conf cappkg/c.clp '(defrule big => (bind ?s "x") (loop-for-count 16 (bind ?s (str-cat ?s ?s))) (printout t (sub-string 1 65535 ?s) crlf) (printout t ?s "a" crlf))'
-conf trcap.conf 'node_id = n1
+rconf trcap.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 packages = cappkg
@@ -680,7 +687,7 @@ plugdaemon() {
     fail "$1" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
   fi
 }
-conf plugrun.conf "node_id = n1
+rconf plugrun.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $EX
@@ -700,7 +707,7 @@ if ! grep -q ' n1 w1 STDOUT sum 5 hello, w1$' plug.log ||
   ! grep -qF 'clpd-example-add' plug.log; then
   fail "rules call the plugin functions" "trace [$(cat plug.log)]"
 fi
-conf plugorder.conf "node_id = n1
+rconf plugorder.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_hooks_a.so, $PLUGINS/test_hooks_b.so"
@@ -733,7 +740,7 @@ files = l.clp'
 conf looppkg/l.clp '(deftemplate counter (slot wf-id) (slot n))
 (deffacts seed (counter (wf-id c1) (n 0)))
 (defrule step ?c <- (counter (wf-id ?w) (n ?n)) => (modify ?c (n (+ ?n 1))))'
-conf plugthrow.conf "node_id = n1
+rconf plugthrow.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_hooks_a.so
@@ -747,7 +754,7 @@ clpdaemon: hooks-a: cycle_begin
 clpdaemon: hooks-a: cycle_end ok=0
 clpdaemon: received SIGTERM, stopping
 clpdaemon: hooks-a: shutdown"
-conf pluglimit.conf "node_id = n1
+rconf pluglimit.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 max_rules_per_cycle = 1
@@ -763,7 +770,7 @@ clpdaemon: received SIGTERM, stopping
 clpdaemon: hooks-a: shutdown"
 # Without a rule limit the first Run never ends by itself: only SIGTERM
 # halts it (the default max_rules_per_cycle would end it first).
-conf plugterm.conf "node_id = n1
+rconf plugterm.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 max_rules_per_cycle = -1
@@ -782,7 +789,7 @@ clpdaemon: hooks-a: shutdown"
 # plugin starts in init inherits that mask, so SIGTERM still reaches the
 # signalfd and the daemon stops gracefully instead of taking the default
 # action (exit 143) on that thread.
-conf plugsleeper.conf "node_id = n1
+rconf plugsleeper.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_sleeper.so"
@@ -796,7 +803,7 @@ clpdaemon: received SIGTERM, stopping
 clpdaemon: sleeper: shutdown"
 # A SIGTERM during plugin init is held until the loop starts, which stops
 # before any cycle.
-conf plugslow.conf "node_id = n1
+rconf plugslow.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_slow.so"
@@ -838,7 +845,7 @@ conf slowpkg/package.conf 'definition = slowpkg
 version = 1
 files = s.clp'
 conf slowpkg/s.clp '(defglobal ?*z* = (system "sleep 0.6"))'
-conf plugslowpkg.conf "node_id = n1
+rconf plugslowpkg.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_hooks_a.so
@@ -881,7 +888,7 @@ files = s.clp
 ingest = order'
 conf ingpkg/s.clp '(deftemplate order (slot wf-id) (slot qty) (multislot tags))
 (defrule seen (order (wf-id ?w) (qty ?q) (tags $?t)) => (printout t "seen " ?w " " ?q " " (implode$ ?t) crlf))'
-conf ingest.conf "node_id = n1
+rconf ingest.conf "node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_poster.so
@@ -982,7 +989,7 @@ files = s.clp
 ingest = order'
 conf ingwake/s.clp '(deftemplate order (slot wf-id))
 (defrule seen (order (wf-id ?w)) => (printout t "seen " ?w crlf))'
-conf ingwake.conf "node_id = n1
+rconf ingwake.conf "node_id = n1
 tick_interval_ms = 60000
 plugins = $PLUGINS/test_late.so
 packages = ingwake"
@@ -1009,6 +1016,220 @@ clpdaemon: late: shutdown late post_fact=0'
 if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != "seen late" ] ||
   [ "$(cat err.txt)" != "$want" ]; then
   fail "a post wakes the loop" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# --- admin socket (FR-20, T7c, docs/admin-socket.md) -------------------------
+conf modebad.conf 'node_id = n1
+admin_socket_mode = 0666'
+check "admin_socket_mode with bits for others" 1 "" \
+  "clpdaemon: modebad.conf:2: admin_socket_mode: expected an octal mode such as 0600 or 0660, with no permission bits for others, got '0666'" -- --config modebad.conf --check
+# --check never creates the socket.
+conf admchk.conf 'node_id = n1
+admin_socket = chk.sock'
+check "check with an admin socket" 0 "clpdaemon: admchk.conf: configuration OK" "" -- --config admchk.conf --check
+cases=$((cases + 1))
+[ ! -e chk.sock ] || fail "check creates no admin socket" "$(ls -l chk.sock)"
+# Startup errors exit 1 after the plugins' shutdown and leave the path as
+# it was.
+printf 'keep\n' >reg.sock
+conf admreg.conf "node_id = n1
+admin_socket = reg.sock
+plugins = $PLUGINS/test_hooks_a.so"
+RUN='timeout 10' check "admin socket path is a regular file" 1 "" \
+  "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: reg.sock: not a socket
+clpdaemon: hooks-a: shutdown" -- --config admreg.conf
+cases=$((cases + 1))
+[ "$(cat reg.sock)" = keep ] || fail "regular file at the admin socket path is kept" "$(ls -l reg.sock)"
+conf admnodir.conf 'node_id = n1
+admin_socket = nodir/a.sock'
+RUN='timeout 10' check "admin socket directory missing" 1 "" \
+  "clpdaemon: nodir/a.sock: cannot bind the admin socket: No such file or directory" -- --config admnodir.conf
+cases=$((cases + 1))
+[ ! -e nodir ] || fail "missing admin socket directory is not created" "$(ls -ld nodir)"
+p108=$(printf 's%.0s' $(seq 1 108))
+conf admlong.conf "node_id = n1
+admin_socket = $p108"
+RUN='timeout 10' check "admin socket path longer than 107 bytes" 1 "" \
+  "clpdaemon: $p108: admin socket path too long (max 107 bytes)" -- --config admlong.conf
+p107=${p108#s}
+conf adm107.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+admin_socket = $p107"
+daemon "admin socket path of 107 bytes" adm107.conf TERM "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+cases=$((cases + 1))
+[ ! -e "$p107" ] || fail "107-byte admin socket removed at stop" "$(ls -l "$p107")"
+
+# acase <name> <expected-output> <admin_client args...>: one client run;
+# the output must match exactly (with its final newline).
+acase() {
+  aname=$1 awant=$2
+  shift 2
+  cases=$((cases + 1))
+  "$ADMIN" "$@" >aout.txt 2>aerr.txt
+  arc=$?
+  aout=$(cat aout.txt; printf x)
+  aout=${aout%x}
+  if [ "$arc" != 0 ] || [ "$aout" != "${awant:+$awant$NL}" ] || [ -s aerr.txt ]; then
+    failures=$((failures + 1))
+    printf 'FAIL: %s\n  exit: %s\n  reply: got [%s]\n         want [%s]\n  stderr: [%s]\n' \
+      "$aname" "$arc" "$aout" "$awant" "$(cat aerr.txt)"
+  fi
+}
+# wait_reply <socket> <command> <reply>: waits up to 5 s for that reply.
+wait_reply() {
+  n=0
+  while [ "$("$ADMIN" "$1" "$2\n" 2>/dev/null)" != "$3" ]; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && return 1
+    sleep 0.05
+  done
+}
+# start <conf> <socket>: starts the daemon in the background (pid) and waits
+# for its running line and its socket; ok=0 when either is missing.
+start() {
+  "$BIN" --config "$1" >out.txt 2>err.txt &
+  pid=$!
+  ok=1
+  wait_line err.txt "clpdaemon: n1: running" || ok=0
+  [ -S "$2" ] || ok=0
+}
+
+# The commands, on a daemon whose next tick is a minute away: an inject
+# wakes the loop at once and its rule fires (the deterministic wake case).
+conf admcmd.conf 'node_id = n1
+tick_interval_ms = 60000
+packages = ingwake
+admin_socket = adm.sock'
+cases=$((cases + 1))
+start admcmd.conf adm.sock
+[ "$(stat -c %a adm.sock 2>/dev/null)" = 600 ] || fail "admin socket default mode 0600" "$(ls -l adm.sock)"
+wait_reply adm.sock status "OK node_id=n1 cycles=1 queue=0 facts=0" || ok=0
+S0="OK node_id=n1 cycles=1 queue=0 facts=0"
+acase "admin: errors and several commands in one write" "ERR invalid JSON: offset 1: unexpected end of input
+ERR template 'nope' is not ingestible
+ERR template 'order' has no slot 'tags'
+ERR unknown command 'bogus'
+ERR unknown command 'bo?gus'
+ERR empty command
+ERR 'status' takes no arguments
+ERR 'reopen' takes no arguments
+ERR unknown command 'Status'
+ERR NUL byte not allowed
+$S0
+$S0" adm.sock 'inject {\ninject {"template":"nope","slots":{}}\ninject {"template":"order","slots":{"tags":1}}\nbogus arg\nbo\tgus\n\nstatus x\nreopen now\nStatus\nsta\0tus\nstatus\r\nstatus\n'
+acase "admin: inject" "OK queued" adm.sock 'inject {"template":"order","slots":{"wf-id":"w1"}}\n'
+n=0
+while ! grep -qxF "seen w1" out.txt 2>/dev/null; do
+  n=$((n + 1))
+  if [ "$n" -gt 40 ]; then ok=0; break; fi
+  sleep 0.05
+done
+S1="OK node_id=n1 cycles=2 queue=0 facts=1"
+acase "admin: status after the inject" "$S1" adm.sock 'status\n'
+acase "admin: command split across writes" "$S1
+OK queued" adm.sock 'sta' 'tus\ninj' 'ect {"template":"order","slots":{"wf-id":"w2"}}\n'
+wait_reply adm.sock status "OK node_id=n1 cycles=3 queue=0 facts=2" || ok=0
+S2="OK node_id=n1 cycles=3 queue=0 facts=2"
+# A client that disconnects mid-line: the partial command never runs.
+acase "admin: disconnect mid-line" "" -c adm.sock 'inject {"template":"order","slots":{"wf-id":"w9"}}'
+sleep 0.4
+acase "admin: nothing queued by a partial line" "$S2" adm.sock 'status\n'
+x64k=$(head -c 65536 /dev/zero | tr '\0' x)
+x64=$(printf 'x%.0s' $(seq 1 64))
+acase "admin: 65536-byte line" "ERR unknown command '$x64...'
+$S2" adm.sock "$x64k\\nstatus\\n"
+acase "admin: line too long closes the connection" "ERR line too long" adm.sock "${x64k}x\\nstatus\\n"
+acase "admin: too many clients" "ERR too many clients" -h 16 adm.sock 'status\n'
+wait_reply adm.sock status "$S2" || fail "admin: served again after too many clients" "[$("$ADMIN" adm.sock 'status\n' 2>&1)]"
+acase "admin: a client that does not read is disconnected" "disconnected" -f adm.sock
+acase "admin: still serving" "$S2" adm.sock 'status\n'
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != "seen w1${NL}seen w2" ] ||
+  [ "$(cat err.txt)" != "$want" ] || [ -e adm.sock ]; then
+  fail "admin socket commands" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)], socket [$(ls -l adm.sock 2>&1)]"
+fi
+
+# A full queue: no cycle runs for a minute, so the 1025th inject is refused
+# and the 1024 queued facts are dropped at stop.
+conf admfull.conf 'node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 60000
+packages = ingwake
+admin_socket = full.sock
+admin_socket_mode = 0660'
+cases=$((cases + 1))
+start admfull.conf full.sock
+[ "$(stat -c %a full.sock 2>/dev/null)" = 660 ] || fail "admin socket mode 0660" "$(ls -l full.sock)"
+wait_reply full.sock status "OK node_id=n1 cycles=1 queue=0 facts=0" || ok=0
+many='' wantmany='' i=0
+while [ "$i" -lt 1024 ]; do
+  many=$many'inject {"template":"order","slots":{"wf-id":"q"}}\n'
+  wantmany="${wantmany}OK queued$NL"
+  i=$((i + 1))
+done
+acase "admin: inject into a full queue" "${wantmany}ERR ingest queue full
+OK node_id=n1 cycles=1 queue=1024 facts=0" full.sock "${many}"'inject {"template":"order","slots":{"wf-id":"q"}}\nstatus\n'
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping
+clpdaemon: 1024 queued facts dropped at shutdown"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] || [ -e full.sock ]; then
+  fail "admin queue full" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# reopen: like SIGHUP, without its log line; a trace directory moved away
+# cannot be reopened.
+mkdir rdir
+conf admhup.conf 'node_id = n1
+tick_interval_ms = 60000
+trace_text = rdir/t.log
+admin_socket = hup.sock'
+cases=$((cases + 1))
+start admhup.conf hup.sock
+acase "admin: reopen" "OK reopened" hup.sock 'reopen\n'
+mv rdir rdir.1
+acase "admin: reopen failure" "ERR 1 trace files could not be reopened" hup.sock 'reopen\n'
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: rdir/t.log: cannot reopen: No such file or directory
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] || [ -e hup.sock ]; then
+  fail "admin reopen" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# A stale socket (its daemon was killed) is replaced; a daemon whose socket
+# another daemon replaced leaves that one in place at stop.
+conf admstale.conf 'node_id = n1
+tick_interval_ms = 60000
+admin_socket = stale.sock'
+cases=$((cases + 1))
+start admstale.conf stale.sock
+kill -KILL "$pid"
+wait "$pid" 2>/dev/null
+[ -S stale.sock ] || ok=0
+start admstale.conf stale.sock
+first=$pid
+wait_reply stale.sock status "OK node_id=n1 cycles=1 queue=0 facts=0" || ok=0
+"$BIN" --config admstale.conf >out2.txt 2>err2.txt &
+second=$!
+wait_line err2.txt "clpdaemon: n1: running" || ok=0
+kill -TERM "$first"
+wait_exit "$first"
+[ "$rc" = 0 ] || ok=0
+[ -S stale.sock ] || ok=0
+wait_reply stale.sock status "OK node_id=n1 cycles=1 queue=0 facts=0" || ok=0
+kill -TERM "$second"
+wait_exit "$second"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -e stale.sock ]; then
+  fail "admin stale and replaced sockets" "exit $rc, ok $ok, socket [$(ls -l stale.sock 2>&1)], stderr [$(cat err.txt err2.txt)]"
 fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"

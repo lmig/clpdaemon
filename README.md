@@ -58,4 +58,6 @@ build/src/clpdaemon --config <file> --check
 
 Command line, configuration keys, defaults and exact error messages: [`docs/configuration.md`](docs/configuration.md).
 
+Admin socket (inject a test fact, status, reopen the trace files): [`docs/admin-socket.md`](docs/admin-socket.md); fact ingestion: [`docs/ingest.md`](docs/ingest.md).
+
 C plugins (contract, lifecycle, building one): [`docs/plugins.md`](docs/plugins.md); the example plugin builds as `build/plugins/clpd_example.so`.

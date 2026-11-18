@@ -20,6 +20,7 @@
 
 #define CLPD_INGEST_QUEUE_MAX 1024 /* queued facts */
 #define CLPD_INGEST_MESSAGE_MAX 256 /* rejection message buffer, NUL included */
+#define CLPD_INGEST_SHOWN_MAX 64 /* bytes of a name quoted in a message */
 
 /* JSON limits of a fact document: max_bytes 65536, max_depth 4 (fact,
  * slots, multislot array, {"sym":...} inside it), max_string 8192,
@@ -50,6 +51,12 @@ void clpd_ingest_set_notify(clpd_ingest_notify_fn *fn, void *ctx);
 /* Frees every queued fact without asserting it (teardown) and returns how
  * many it dropped. Any thread. */
 size_t clpd_ingest_clear(void);
+
+/* Copies name as messages show it (docs/ingest.md): control bytes become
+ * '?', and a name longer than CLPD_INGEST_SHOWN_MAX bytes is cut at a UTF-8
+ * boundary and ends in "...". Returns buf. */
+const char *clpd_ingest_shown(const char *name,
+                              char buf[CLPD_INGEST_SHOWN_MAX + 4]);
 
 /* Validates one fact document against env and the ingest lists of p
  * without asserting it. Returns 0 when it would be asserted; otherwise -1
