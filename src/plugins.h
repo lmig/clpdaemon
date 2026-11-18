@@ -26,6 +26,12 @@ void clpd_plugins_cycle_end(clpd_plugins *p, int ok);
 /* Calls shutdown of every initialized plugin in reverse order, once; later
  * calls do nothing. Call it while the environment still exists. */
 void clpd_plugins_shutdown(clpd_plugins *p);
+/* clpd_ingest_reject_fn for the facts posted with host->post_fact: writes
+ * "clpdaemon: <plugin>: post_fact rejected: <message>" to the daemon log
+ * stream, where <plugin> is the name of the plugin whose library made the
+ * post_fact call (origin), or "?". plugins is a clpd_plugins. */
+void clpd_plugins_post_rejected(void *plugins, const void *origin,
+                                const char *message);
 /* Shuts down if still needed, unloads every library and frees p. Call it
  * after the environment is destroyed (the UDFs point into the libraries).
  * NULL is allowed. */

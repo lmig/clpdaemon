@@ -16,6 +16,7 @@
 #define CLPD_DEFAULT_SAFETY_POLL_INTERVAL_MS 5000
 #define CLPD_DEFAULT_IDLE_EVICTION_AFTER_S (30L * 60)
 #define CLPD_DEFAULT_ADMIN_SOCKET "/run/clpdaemon/admin.sock"
+#define CLPD_DEFAULT_ADMIN_SOCKET_MODE 0600
 
 typedef struct {
   char node_id[CLPD_NODE_ID_MAX + 1];
@@ -24,7 +25,8 @@ typedef struct {
   int max_rules_per_cycle; /* -1 = unlimited */
   int safety_poll_interval_ms;
   long idle_eviction_after_s;
-  char *admin_socket;
+  char *admin_socket; /* NULL: disabled (admin_socket = none) */
+  int admin_socket_mode; /* permission bits, no bits for others */
   char *trace_text;  /* NULL = disabled */
   char *trace_jsonl; /* NULL = disabled */
   int watch_facts;

@@ -64,6 +64,7 @@ static void test_defaults(void) {
   EXPECT(cfg.idle_eviction_after_s == 30 * 60);
   EXPECT(cfg.admin_socket != NULL &&
          strcmp(cfg.admin_socket, "/run/clpdaemon/admin.sock") == 0);
+  EXPECT(cfg.admin_socket_mode == 0600);
   EXPECT(cfg.trace_text == NULL);
   EXPECT(cfg.trace_jsonl == NULL);
   EXPECT(cfg.watch_facts == 1 && cfg.watch_rules == 1);
@@ -138,6 +139,50 @@ static void test_crlf_and_tabs(void) {
   clpd_config_free(&cfg);
 }
 
+/* admin_socket_mode (T7c): 3 or 4 octal digits (a 4-digit value starts
+ * with 0), owner and group bits only. */
+static void test_admin_socket_mode(void) {
+  static const char *const good[] = {"0660", "660", "0000", "0770", "0600"};
+  static const int want[] = {0660, 0660, 0, 0770, 0600};
+  static const char *const bad[] = {"0666", "0601", "0777", "1600", "06000",
+                                    "60", "0800", "600a", "0x60", "-600"};
+  clpd_config cfg;
+  char text[128], eb[512], expect[sizeof path + 256];
+  size_t i;
+  for (i = 0; i < sizeof good / sizeof good[0]; i++) {
+    snprintf(text, sizeof text, "node_id = n1\nadmin_socket_mode = %s\n", good[i]);
+    EXPECT(load("mode.conf", text, strlen(text), &cfg, eb, sizeof eb) == 0);
+    EXPECT(strcmp(eb, "") == 0);
+    EXPECT(cfg.admin_socket_mode == want[i]);
+    clpd_config_free(&cfg);
+  }
+  for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    snprintf(text, sizeof text, "node_id = n1\nadmin_socket_mode = %s\n", bad[i]);
+    EXPECT(load("mode.conf", text, strlen(text), &cfg, eb, sizeof eb) == 1);
+    snprintf(expect, sizeof expect,
+             "clpdaemon: %s:2: admin_socket_mode: expected an octal mode "
+             "such as 0600 or 0660, with no permission bits for others, "
+             "got '%s'\n", path, bad[i]);
+    EXPECT(strcmp(eb, expect) == 0);
+    EXPECT(cfg.admin_socket_mode == 0600); /* the rejected line set nothing */
+    clpd_config_free(&cfg);
+  }
+}
+
+/* admin_socket = none disables the admin socket (L71); any other value,
+ * ./none included, is a path. */
+static void test_admin_socket_none(void) {
+  clpd_config cfg;
+  char eb[512];
+  EXPECT(LOAD("none.conf", "node_id = n1\nadmin_socket = none\n", &cfg, eb) == 0);
+  EXPECT(strcmp(eb, "") == 0);
+  EXPECT(cfg.admin_socket == NULL);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("none.conf", "node_id = n1\nadmin_socket = ./none\n", &cfg, eb) == 0);
+  EXPECT(cfg.admin_socket != NULL && strcmp(cfg.admin_socket, "./none") == 0);
+  clpd_config_free(&cfg);
+}
+
 static void test_nul_byte_rejected(void) {
   clpd_config cfg;
   char eb[512], want[sizeof path + 64];
@@ -158,6 +203,8 @@ int main(void) {
   test_durations_and_empty_lists();
   test_crlf_and_tabs();
   test_nul_byte_rejected();
+  test_admin_socket_mode();
+  test_admin_socket_none();
   rmdir(dir);
   if (failures != 0) {
     fprintf(stderr, "%d config checks failed\n", failures);

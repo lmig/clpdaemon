@@ -148,6 +148,34 @@ static void test_empty_exemption_name(void) {
   clpd_manifest_free(&m);
 }
 
+/* T7b: ingest lists deftemplate names; empty by default. */
+static void test_ingest(void) {
+  clpd_manifest m;
+  char eb[1024];
+  EXPECT(load("ing", "definition = a\nversion = 1\nfiles = a.clp\n"
+                     "ingest = order, payment\n",
+              &m, eb, sizeof eb) == 0);
+  EXPECT(strcmp(eb, "") == 0);
+  EXPECT(m.ingest.count == 2 && strcmp(m.ingest.items[0], "order") == 0 &&
+         strcmp(m.ingest.items[1], "payment") == 0);
+  clpd_manifest_free(&m);
+  EXPECT(load("ing0", "definition = a\nversion = 1\nfiles = a.clp\n",
+              &m, eb, sizeof eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && m.ingest.count == 0);
+  clpd_manifest_free(&m);
+  EXPECT(load("ing2", "definition = a\nversion = 1\nfiles = a.clp\n"
+                      "ingest = order, payment, order\n",
+              &m, eb, sizeof eb) == 1);
+  EXPECT(err_is(eb, "clpdaemon: %s:4: ingest: 'order' listed more than "
+                    "once\n"));
+  clpd_manifest_free(&m);
+  EXPECT(load("ing3", "definition = a\nversion = 1\nfiles = a.clp\n"
+                      "ingest = order,,x\n",
+              &m, eb, sizeof eb) == 1);
+  EXPECT(err_is(eb, "clpdaemon: %s:4: ingest: empty list item\n"));
+  clpd_manifest_free(&m);
+}
+
 static void test_missing_manifest(void) {
   clpd_manifest m;
   char eb[1024], want[sizeof conf + 64];
@@ -169,6 +197,7 @@ int main(void) {
   test_invalid_values();
   test_file_paths();
   test_empty_exemption_name();
+  test_ingest();
   test_missing_manifest();
   rmdir(root);
   if (failures != 0) {

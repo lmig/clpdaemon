@@ -34,7 +34,7 @@ The daemon passes `init` a host structure, valid until `shutdown` returns:
 |---|---|
 | `struct_size` | `sizeof(clpd_host)` of the daemon. Later revisions only append fields. |
 | `log(plugin, fmt, ...)` | Writes `clpdaemon: <name>: <message>` to the daemon log stream (stderr; the original stderr while fds 1 and 2 are redirected to the trace). `plugin` is the plugin's own descriptor; `fmt` follows `printf`. Engine thread only. |
-| `post_fact(fact_text)` | Queues a fact written as CLIPS text, such as `(order (wf-id w1))`, for the engine thread. Callable from any thread. Not implemented yet: it always returns -1 with `errno` set to `ENOSYS` until the ingest pipeline (T7). |
+| `post_fact(fact_text)` | Queues a fact for the engine thread, written as fact JSON ([`ingest.md`](ingest.md)), such as `{"template":"order","slots":{"wf-id":"w1","qty":3}}` (NUL-terminated). Callable from any thread, also from `init`. Returns 0 when queued; -1 with `errno` `EINVAL` when the text is `NULL` or not JSON within the limits, `EAGAIN` when the queue (1024 facts) is full, `ENOMEM`. The template and slots are checked when the next cycle asserts the fact; a rejected fact is logged as `clpdaemon: <name>: post_fact rejected: <message>`. |
 | `node_id` | The `node_id` of the configuration. |
 
 ## Lifecycle

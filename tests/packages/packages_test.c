@@ -218,6 +218,57 @@ static void test_manifest_error(void) {
   done(&r);
 }
 
+/* T7b: the ingest list resolves to the package's own deftemplates; an
+ * unknown name (also an implied template) and a name another package
+ * already lists are load errors, each reported. */
+static void test_ingest(void) {
+  const char *dirs[3];
+  char want[1024];
+  run r;
+  const char *a, *b, *c;
+  a = package("ia", "definition = ia\nversion = 1\nfiles = t.clp\n"
+                    "ingest = ev, order\n");
+  write_file(a, "t.clp", "(deftemplate ev (slot wf-id))\n"
+                         "(deftemplate order (slot wf-id))\n");
+  dirs[0] = a;
+  load(&r, dirs, 1);
+  EXPECT(r.rc == 0 && strcmp(r.err, "") == 0);
+  EXPECT(r.pkgs.count == 1 && r.pkgs.items[0].ingest != NULL &&
+         r.pkgs.items[0].ingest[0] == FindDeftemplate(r.env, "ia@1::ev") &&
+         r.pkgs.items[0].ingest[1] == FindDeftemplate(r.env, "ia@1::order"));
+  EXPECT(strcmp(DefmoduleName(GetCurrentModule(r.env)), "MAIN") == 0);
+  done(&r);
+
+  b = package("ib", "definition = ib\nversion = 1\nfiles = t.clp\n"
+                    "lint_exempt = rule:r, template:flag\n"
+                    "ingest = order, nope, flag, ev\n");
+  write_file(b, "t.clp", "(deftemplate order (slot wf-id))\n"
+                         "(defrule r (flag) (order (wf-id ?w)) => )\n");
+  c = package("ic", "definition = ic\nversion = 1\nfiles = t.clp\n"
+                    "ingest = order\n");
+  write_file(c, "t.clp", "(deftemplate order (slot wf-id))\n");
+  dirs[0] = a;
+  dirs[1] = b;
+  dirs[2] = c;
+  load(&r, dirs, 3);
+  EXPECT(r.rc != 0);
+  snprintf(want, sizeof want,
+           "clpdaemon: ib@1: ingest names template 'order', already listed "
+           "by ia@1\n"
+           "clpdaemon: ib@1: ingest names unknown template 'nope'\n"
+           "clpdaemon: ib@1: ingest names unknown template 'flag'\n"
+           "clpdaemon: ib@1: ingest names template 'ev', already listed by "
+           "ia@1\n"
+           "clpdaemon: ic@1: ingest names template 'order', already listed "
+           "by ia@1\n");
+  if (strcmp(r.err, want) != 0)
+    fprintf(stderr, "  got:  [%s]\n  want: [%s]\n", r.err, want);
+  EXPECT(strcmp(r.err, want) == 0);
+  EXPECT(r.pkgs.count == 3 && r.pkgs.items[1].ingest == NULL &&
+         r.pkgs.items[2].ingest == NULL);
+  done(&r);
+}
+
 int main(void) {
   if (mkdtemp(root) == NULL) {
     perror("packages_test");
@@ -231,6 +282,7 @@ int main(void) {
   test_defmodule_rejected();
   test_duplicate_package();
   test_manifest_error();
+  test_ingest();
   if (failures != 0) {
     fprintf(stderr, "%d package checks failed (fixtures in %s)\n", failures, root);
     return 1;

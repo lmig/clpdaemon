@@ -15,8 +15,22 @@
 #include <time.h>
 #include <unistd.h>
 
+/* A registered fd. id is unique per registration, so a callback that
+ * removes an entry (and maybe registers the same fd number again) is never
+ * followed by a callback for the old registration's poll result. */
+typedef struct {
+  int fd;
+  short events;
+  clpd_fd_fn *fn;
+  void *ctx;
+  unsigned long id;
+} watch;
+
 struct clpd_loop {
   int sig_fd, timer_fd, event_fd;
+  watch w[CLPD_LOOP_FDS_MAX];
+  size_t nw;
+  unsigned long next_id;
   int tick_ms, min_ms;
   FILE *log;
   clpd_hup_fn *on_hup;
@@ -91,6 +105,71 @@ void clpd_loop_on_hup(clpd_loop *l, clpd_hup_fn *fn, void *ctx) {
   l->hup_ctx = ctx;
 }
 
+static watch *find(clpd_loop *l, int fd) {
+  size_t i;
+  for (i = 0; i < l->nw; i++)
+    if (l->w[i].fd == fd) return &l->w[i];
+  return NULL;
+}
+
+int clpd_loop_add_fd(clpd_loop *l, int fd, short events, clpd_fd_fn *fn,
+                     void *ctx) {
+  watch *w;
+  if (fd < 0 || fn == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (find(l, fd) != NULL) {
+    errno = EEXIST;
+    return -1;
+  }
+  if (l->nw == CLPD_LOOP_FDS_MAX) {
+    errno = ENOSPC;
+    return -1;
+  }
+  w = &l->w[l->nw++];
+  w->fd = fd;
+  w->events = events;
+  w->fn = fn;
+  w->ctx = ctx;
+  w->id = ++l->next_id;
+  return 0;
+}
+
+int clpd_loop_set_events(clpd_loop *l, int fd, short events) {
+  watch *w = find(l, fd);
+  if (w == NULL) {
+    errno = ENOENT;
+    return -1;
+  }
+  w->events = events;
+  return 0;
+}
+
+int clpd_loop_remove_fd(clpd_loop *l, int fd) {
+  watch *w = find(l, fd);
+  if (w == NULL) {
+    errno = ENOENT;
+    return -1;
+  }
+  *w = l->w[--l->nw];
+  return 0;
+}
+
+/* Calls the callbacks of the registered fds that poll found ready: polled
+ * holds the ids of the entries in poll order (fds[3 + i]). An entry
+ * removed by an earlier callback is skipped; one added is not in polled. */
+static void dispatch(clpd_loop *l, const struct pollfd *fds,
+                     const unsigned long *polled, size_t n) {
+  size_t i, j;
+  for (i = 0; i < n; i++) {
+    if (fds[i].revents == 0) continue;
+    for (j = 0; j < l->nw && l->w[j].id != polled[i]; j++) {
+    }
+    if (j < l->nw) l->w[j].fn(l->w[j].ctx, l->w[j].fd, fds[i].revents);
+  }
+}
+
 static int arm(clpd_loop *l, long long due_ms) {
   struct itimerspec its = {{0, 0}, {0, 0}};
   if (due_ms < 1) due_ms = 1; /* zero would disarm; a past time fires at once */
@@ -108,7 +187,8 @@ static void drain(int fd) {
 
 int clpd_loop_run(clpd_loop *l, clpd_cycle_fn *cycle, void *ctx) {
   clpd_sched s;
-  struct pollfd fds[3];
+  struct pollfd fds[3 + CLPD_LOOP_FDS_MAX];
+  unsigned long polled[CLPD_LOOP_FDS_MAX];
 
   clpd_sched_init(&s, l->tick_ms, l->min_ms, now_ms());
   fds[0].fd = l->sig_fd;
@@ -119,9 +199,16 @@ int clpd_loop_run(clpd_loop *l, clpd_cycle_fn *cycle, void *ctx) {
   for (;;) {
     struct signalfd_siginfo si;
     long long now;
+    size_t i, nw = l->nw;
 
+    for (i = 0; i < nw; i++) {
+      fds[3 + i].fd = l->w[i].fd;
+      fds[3 + i].events = l->w[i].events;
+      fds[3 + i].revents = 0;
+      polled[i] = l->w[i].id;
+    }
     if (arm(l, clpd_sched_next_due(&s)) != 0) return -1;
-    if (poll(fds, 3, -1) < 0) {
+    if (poll(fds, 3 + nw, -1) < 0) {
       if (errno == EINTR) continue;
       return -1;
     }
@@ -147,6 +234,7 @@ int clpd_loop_run(clpd_loop *l, clpd_cycle_fn *cycle, void *ctx) {
       clpd_sched_notify(&s);
     }
     if (fds[2].revents & POLLIN) drain(l->timer_fd);
+    dispatch(l, fds + 3, polled, nw);
     now = now_ms();
     if (now >= clpd_sched_next_due(&s)) {
       clpd_sched_cycle_started(&s, now);
@@ -160,3 +248,4 @@ void clpd_loop_close(clpd_loop *l) {
   close_fds(l);
   free(l);
 }
+

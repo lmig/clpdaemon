@@ -5,6 +5,8 @@
 #include "engine.h"
 #include "loop.h"
 
+#include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -196,12 +198,219 @@ static void test_external_stop_halts_unlimited_run(void) {
   clpd_loop_close(loop);
 }
 
+/* --- registered fds (T7c) ------------------------------------------------ */
+
+typedef struct {
+  clpd_loop *loop;
+  char order[16]; /* one letter per callback, in call order */
+  size_t n;
+  short revents;
+  int cycles;
+  int a, b, w; /* fds */
+} fdprobe;
+
+static void note(fdprobe *p, char c, short revents) {
+  if (p->n < sizeof p->order - 1) p->order[p->n++] = c;
+  p->revents = revents;
+  if (p->n >= sizeof p->order - 1) raise(SIGTERM); /* cap: no hang */
+}
+
+static void fd_cycle(void *ctx) {
+  fdprobe *p = ctx;
+  p->cycles++;
+  if (p->cycles == MAX_CYCLES) raise(SIGTERM);
+}
+
+static void eat(int fd) {
+  char c;
+  if (read(fd, &c, 1) < 0) {
+  }
+}
+
+static void cb_stop(void *ctx, int fd, short revents) {
+  fdprobe *p = ctx;
+  eat(fd);
+  note(p, 'S', revents);
+  raise(SIGTERM);
+}
+
+static void cb_never(void *ctx, int fd, short revents) {
+  fdprobe *p = ctx;
+  (void)fd;
+  note(p, 'X', revents);
+}
+
+static void cb_b2(void *ctx, int fd, short revents) {
+  fdprobe *p = ctx;
+  eat(fd);
+  note(p, 'C', revents);
+  raise(SIGTERM);
+}
+
+/* Removes b and registers its fd again with cb_b2: neither the old nor the
+ * new registration runs in this iteration; cb_b2 runs in the next one. */
+static void cb_a(void *ctx, int fd, short revents) {
+  fdprobe *p = ctx;
+  eat(fd);
+  note(p, 'A', revents);
+  EXPECT(clpd_loop_remove_fd(p->loop, p->b) == 0);
+  EXPECT(clpd_loop_add_fd(p->loop, p->b, POLLIN, cb_b2, p) == 0);
+}
+
+static void cb_write(void *ctx, int fd, short revents) {
+  fdprobe *p = ctx;
+  (void)fd;
+  note(p, 'W', revents);
+  raise(SIGTERM);
+}
+
+/* Arms the write end for POLLOUT from the first cycle. */
+static void arm_write_cycle(void *ctx) {
+  fdprobe *p = ctx;
+  fd_cycle(ctx);
+  if (p->cycles == 1) EXPECT(clpd_loop_set_events(p->loop, p->w, POLLOUT) == 0);
+}
+
+/* Runs the loop under a 5 s alarm: a lost wake-up kills the test with
+ * SIGALRM instead of waiting for a one-minute tick. */
+static int run_guarded(clpd_loop *loop, clpd_cycle_fn *cycle, void *ctx) {
+  int sig;
+  alarm(5);
+  sig = clpd_loop_run(loop, cycle, ctx);
+  alarm(0);
+  return sig;
+}
+
+static void dummy(void *ctx, int fd, short revents) {
+  (void)ctx; (void)fd; (void)revents;
+}
+
+static void test_fd_registration_errors(void) {
+  clpd_loop *loop = clpd_loop_open(1000, 10, stderr);
+  int i, fds[2];
+  EXPECT(loop != NULL && pipe(fds) == 0);
+  if (loop == NULL) return;
+  errno = 0;
+  EXPECT(clpd_loop_add_fd(loop, -1, POLLIN, dummy, NULL) == -1 && errno == EINVAL);
+  errno = 0;
+  EXPECT(clpd_loop_add_fd(loop, fds[0], POLLIN, NULL, NULL) == -1 && errno == EINVAL);
+  EXPECT(clpd_loop_add_fd(loop, fds[0], POLLIN, dummy, NULL) == 0);
+  errno = 0;
+  EXPECT(clpd_loop_add_fd(loop, fds[0], POLLIN, dummy, NULL) == -1 && errno == EEXIST);
+  errno = 0;
+  EXPECT(clpd_loop_set_events(loop, fds[1], POLLOUT) == -1 && errno == ENOENT);
+  errno = 0;
+  EXPECT(clpd_loop_remove_fd(loop, fds[1]) == -1 && errno == ENOENT);
+  /* The bound: CLPD_LOOP_FDS_MAX registrations (numbers need not be open). */
+  for (i = 1; i < CLPD_LOOP_FDS_MAX; i++)
+    EXPECT(clpd_loop_add_fd(loop, 1000 + i, POLLIN, dummy, NULL) == 0);
+  errno = 0;
+  EXPECT(clpd_loop_add_fd(loop, 2000, POLLIN, dummy, NULL) == -1 && errno == ENOSPC);
+  EXPECT(clpd_loop_remove_fd(loop, 1001) == 0);
+  EXPECT(clpd_loop_add_fd(loop, 2000, POLLIN, dummy, NULL) == 0);
+  EXPECT(clpd_loop_remove_fd(loop, fds[0]) == 0);
+  errno = 0;
+  EXPECT(clpd_loop_remove_fd(loop, fds[0]) == -1 && errno == ENOENT);
+  clpd_loop_close(loop);
+  close(fds[0]);
+  close(fds[1]);
+}
+
+/* A readable fd wakes a loop whose next tick is a minute away. */
+static void test_fd_readable_callback(void) {
+  fdprobe p;
+  int fds[2];
+  long long t0;
+  clpd_loop *loop = clpd_loop_open(60000, 10, stderr);
+  EXPECT(loop != NULL && pipe(fds) == 0);
+  if (loop == NULL) return;
+  memset(&p, 0, sizeof p);
+  p.loop = loop;
+  EXPECT(clpd_loop_add_fd(loop, fds[0], POLLIN, cb_stop, &p) == 0);
+  EXPECT(write(fds[1], "x", 1) == 1);
+  t0 = now_ms();
+  EXPECT(run_guarded(loop, fd_cycle, &p) == SIGTERM);
+  EXPECT(now_ms() - t0 < 2000);
+  EXPECT(strcmp(p.order, "S") == 0);
+  EXPECT(p.revents & POLLIN);
+  EXPECT(p.cycles == 1); /* the start cycle only */
+  clpd_loop_close(loop);
+  close(fds[0]);
+  close(fds[1]);
+}
+
+/* Events 0 polls nothing but errors; set_events turns POLLOUT on. */
+static void test_fd_set_events(void) {
+  fdprobe p;
+  int fds[2];
+  clpd_loop *loop = clpd_loop_open(60000, 10, stderr);
+  EXPECT(loop != NULL && pipe(fds) == 0);
+  if (loop == NULL) return;
+  memset(&p, 0, sizeof p);
+  p.loop = loop;
+  p.w = fds[1];
+  EXPECT(clpd_loop_add_fd(loop, fds[1], 0, cb_write, &p) == 0);
+  EXPECT(run_guarded(loop, arm_write_cycle, &p) == SIGTERM);
+  EXPECT(strcmp(p.order, "W") == 0);
+  EXPECT(p.revents & POLLOUT);
+  EXPECT(p.cycles == 1);
+  clpd_loop_close(loop);
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void test_fd_remove_and_add_in_callback(void) {
+  fdprobe p;
+  int a[2], b[2];
+  clpd_loop *loop = clpd_loop_open(60000, 10, stderr);
+  EXPECT(loop != NULL && pipe(a) == 0 && pipe(b) == 0);
+  if (loop == NULL) return;
+  memset(&p, 0, sizeof p);
+  p.loop = loop;
+  p.a = a[0];
+  p.b = b[0];
+  EXPECT(clpd_loop_add_fd(loop, a[0], POLLIN, cb_a, &p) == 0);
+  EXPECT(clpd_loop_add_fd(loop, b[0], POLLIN, cb_never, &p) == 0);
+  EXPECT(write(a[1], "x", 1) == 1 && write(b[1], "x", 1) == 1);
+  EXPECT(run_guarded(loop, fd_cycle, &p) == SIGTERM);
+  EXPECT(strcmp(p.order, "AC") == 0);
+  clpd_loop_close(loop);
+  close(a[0]);
+  close(a[1]);
+  close(b[0]);
+  close(b[1]);
+}
+
+/* A pending stop signal wins over a readable fd. */
+static void test_fd_stop_wins(void) {
+  fdprobe p;
+  int fds[2];
+  clpd_loop *loop = clpd_loop_open(60000, 10, stderr);
+  EXPECT(loop != NULL && pipe(fds) == 0);
+  if (loop == NULL) return;
+  memset(&p, 0, sizeof p);
+  p.loop = loop;
+  EXPECT(clpd_loop_add_fd(loop, fds[0], POLLIN, cb_never, &p) == 0);
+  EXPECT(write(fds[1], "x", 1) == 1);
+  raise(SIGTERM);
+  EXPECT(run_guarded(loop, fd_cycle, &p) == SIGTERM);
+  EXPECT(p.n == 0 && p.cycles == 0);
+  clpd_loop_close(loop);
+  close(fds[0]);
+  close(fds[1]);
+}
+
 int main(void) {
   test_schedule_and_stop();
   test_sighup_continues_and_sigint_stops();
   test_pending_stop_before_run();
   test_overrun_no_burst();
   test_external_stop_halts_unlimited_run();
+  test_fd_registration_errors();
+  test_fd_readable_callback();
+  test_fd_set_events();
+  test_fd_remove_and_add_in_callback();
+  test_fd_stop_wins();
   if (failures != 0) {
     fprintf(stderr, "%d loop checks failed\n", failures);
     return 1;

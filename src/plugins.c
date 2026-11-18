@@ -1,9 +1,10 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE /* dladdr */
 
 #include "plugins.h"
 
 #include "clpd_plugin.h"
 #include "config.h"
+#include "ingest.h"
 #include "log.h"
 
 #include <dlfcn.h>
@@ -20,6 +21,7 @@ typedef struct {
   const clpd_plugin *desc;    /* NULL until the descriptor checks pass;
                                * set in every entry once clpd_plugins_load
                                * returned with active still 1 */
+  const void *base;           /* load address of the library (dladdr) */
   void *state;                /* what init stored */
   int initialized;            /* init returned 0 */
 } entry;
@@ -48,11 +50,24 @@ static void host_log(const clpd_plugin *plugin, const char *fmt, ...) {
   funlockfile(log);
 }
 
-/* The ingest pipeline arrives in T7 (docs/plugins.md). */
+/* Any thread (docs/ingest.md). post_fact has no context argument, so the
+ * origin of a fact is the load address of the library its caller's code
+ * is in: clpd_plugins_post_rejected maps it back to the plugin name. That
+ * is the return address, so a tail or sibling call (`return
+ * host->post_fact(...)` compiled as a jump) is attributed to the code its
+ * caller returns to, and a call from a helper library to that library:
+ * either shows `?` (outside every plugin) or the plugin that code is in.
+ * The queue itself is process-wide (src/ingest.h). */
 static int host_post_fact(const char *fact_text) {
-  (void)fact_text;
-  errno = ENOSYS;
-  return -1;
+  Dl_info info;
+  const void *origin = NULL;
+  if (dladdr(__builtin_return_address(0), &info) != 0)
+    origin = info.dli_fbase;
+  if (fact_text == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  return clpd_ingest_post(origin, fact_text, strlen(fact_text));
 }
 
 /* Opens, checks and initializes the last entry of p. On failure writes one
@@ -94,6 +109,10 @@ static int load_one(Environment *env, clpd_plugins *p, FILE *err) {
   /* POSIX dlsym returns object and function addresses alike; the copy
    * avoids the ISO C object-to-function pointer conversion. */
   memcpy(&get, &sym, sizeof get);
+  {
+    Dl_info info;
+    if (dladdr(sym, &info) != 0) e->base = info.dli_fbase;
+  }
   d = get();
   if (d == NULL) {
     fprintf(err, "clpdaemon: %s: clpd_plugin_get returned NULL\n", e->path);
@@ -198,6 +217,21 @@ void clpd_plugins_shutdown(clpd_plugins *p) {
     if (e->initialized && e->desc->shutdown != NULL) e->desc->shutdown(e->state);
     e->initialized = 0;
   }
+}
+
+void clpd_plugins_post_rejected(void *plugins, const void *origin,
+                                const char *message) {
+  clpd_plugins *p = plugins;
+  const char *name = "?";
+  FILE *log = clpd_log();
+  size_t i;
+  for (i = 0; p != NULL && origin != NULL && i < p->count; i++)
+    if (p->items[i].base == origin && p->items[i].desc != NULL)
+      name = p->items[i].desc->name;
+  flockfile(log);
+  fprintf(log, "clpdaemon: %s: post_fact rejected: %s\n", name, message);
+  fflush(log);
+  funlockfile(log);
 }
 
 void clpd_plugins_close(clpd_plugins *p) {

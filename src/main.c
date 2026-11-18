@@ -1,9 +1,11 @@
 /* clpdaemon entry point: command line, configuration (T2), plugins (T6)
  * and the event loop running engine cycles (T3). */
+#include "admin.h"
 #include "clips_trace.h"
 #include "config.h"
 #include "engine.h"
 #include "fdcapture.h"
+#include "ingest.h"
 #include "log.h"
 #include "loop.h"
 #include "packages.h"
@@ -32,10 +34,15 @@ typedef struct {
   const clpd_packages *packages;
   clpd_plugins *plugins;
   clpd_clips_trace *ct;
+  clpd_admin *admin;
   int max_rules;
+  unsigned long cycles; /* run so far (admin `status`) */
 } cycle_ctx;
 
-/* One cycle: the plugins' cycle_begin, focus every package module, Run with
+/* One cycle: assert the facts queued so far (docs/ingest.md; a rejected one
+ * is logged under the plugin or admin socket that posted it), the plugins'
+ * cycle_begin,
+ * focus every package module, Run with
  * the rule limit, the plugins' cycle_end, then write the partial output
  * lines the cycle left. Run stops on an evaluation error and leaves
  * HaltExecution set (it clears the error flags when the next Run starts),
@@ -45,23 +52,29 @@ typedef struct {
 static void run_cycle(void *ctx) {
   cycle_ctx *c = ctx;
   Environment *env = clpd_engine_env(c->engine);
+  clpd_ingest_drain(env, c->packages, clpd_admin_post_rejected, c->plugins);
   clpd_plugins_cycle_begin(c->plugins);
   clpd_packages_focus(env, c->packages);
   clpd_engine_run_cycle(c->engine, c->max_rules);
   clpd_plugins_cycle_end(c->plugins, !GetHaltExecution(env));
   clpd_clips_trace_flush(c->ct);
+  clpd_admin_resume(c->admin);
+  c->cycles++;
 }
 
 static void reopen_trace(void *ctx) { clpd_trace_reopen(ctx, clpd_log()); }
+
+static void wake_loop(void *loop) { clpd_loop_notify(loop); }
 
 /* Runs engine cycles until a stop signal. Daemon messages go to the daemon
  * log stream (src/log.h; the original stderr during a capture). Returns the
  * exit code. */
 static int serve(const clpd_config *cfg, clpd_engine *engine,
                  const clpd_packages *packages, clpd_plugins *plugins,
-                 clpd_trace *trace, clpd_clips_trace *ct) {
+                 clpd_trace *trace, clpd_clips_trace *ct, clpd_admin *admin) {
   FILE *log = clpd_log();
   cycle_ctx ctx;
+  clpd_admin_state as;
   clpd_loop *loop;
   int sig;
 
@@ -73,10 +86,25 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
     return 1;
   }
   clpd_loop_on_hup(loop, reopen_trace, trace);
+  ctx.cycles = 0;
+  as.env = clpd_engine_env(engine);
+  as.packages = packages;
+  as.node_id = cfg->node_id;
+  as.cycles = &ctx.cycles;
+  as.trace = trace;
+  if (admin != NULL && clpd_admin_attach(admin, loop, &as, log) != 0) {
+    clpd_loop_close(loop);
+    return 1;
+  }
+  /* Facts posted before the loop existed (for example from a plugin's
+   * init) are already queued: setting the notify function wakes the loop
+   * for them, and every later post wakes it too. */
+  clpd_ingest_set_notify(wake_loop, loop);
   ctx.engine = engine;
   ctx.packages = packages;
   ctx.plugins = plugins;
   ctx.ct = ct;
+  ctx.admin = admin;
   ctx.max_rules = cfg->max_rules_per_cycle;
   fprintf(log, "clpdaemon: %s: running\n", cfg->node_id);
   sig = clpd_loop_run(loop, run_cycle, &ctx);
@@ -85,13 +113,17 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   else
     fprintf(log, "clpdaemon: received %s, stopping\n",
             sig == SIGINT ? "SIGINT" : "SIGTERM");
+  clpd_ingest_set_notify(NULL, NULL);
+  clpd_admin_detach(admin);
   clpd_loop_close(loop);
   return sig < 0 ? 1 : 0;
 }
 
 /* Startup after the configuration (FR-2): trace files, environment,
  * plugins (load and init), rule packages, then either the --check report or
- * the trace hooks, the plugins' after_load, Reset once and the event loop.
+ * the admin socket (FR-20, unless admin_socket = none), the trace hooks, the plugins' after_load, Reset
+ * once and the event loop; the socket file is removed on every path after
+ * it was created.
  * --check opens the trace files too, so it reports paths the daemon could
  * not write. The trace hooks come after loading, so package load
  * diagnostics keep going to stderr, and before Reset, so the facts Reset
@@ -104,6 +136,7 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_packages packages = {NULL, 0};
   clpd_plugins *plugins = NULL;
   clpd_clips_trace *ct = NULL;
+  clpd_admin *admin = NULL;
   clpd_engine *engine;
   clpd_trace *trace;
   int rc;
@@ -136,6 +169,11 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     rc = 1;
   } else if (check) {
     printf("clpdaemon: %s: configuration OK\n", config_path);
+  } else if (cfg->admin_socket != NULL &&
+             (admin = clpd_admin_bind(cfg->admin_socket,
+                                      cfg->admin_socket_mode,
+                                      clpd_log())) == NULL) {
+    rc = 1;
   } else if (clpd_clips_trace_attach(clpd_engine_env(engine), trace,
                                      cfg->watch_facts, cfg->watch_rules,
                                      &ct) != 0) {
@@ -150,7 +188,7 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     } else {
       clpd_plugins_after_load(plugins);
       Reset(clpd_engine_env(engine));
-      rc = serve(cfg, engine, &packages, plugins, trace, ct);
+      rc = serve(cfg, engine, &packages, plugins, trace, ct, admin);
       /* Shut down before the capture stops, so what the plugins print in
        * shutdown still reaches the trace; the call after this block is
        * then a no-op (it covers the paths that never got here). */
@@ -159,6 +197,16 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     }
   }
   clpd_plugins_shutdown(plugins);
+  /* After shutdown, which stops the plugins' threads: facts still queued
+   * (posted after the last cycle, under --check, or before a startup
+   * failure) are dropped, and the daemon log stream says how many. */
+  {
+    size_t dropped = clpd_ingest_clear();
+    if (dropped > 0)
+      fprintf(clpd_log(), "clpdaemon: %zu queued fact%s dropped at shutdown\n",
+              dropped, dropped == 1 ? "" : "s");
+  }
+  clpd_admin_close(admin);
   clpd_clips_trace_detach(ct);
   clpd_packages_free(&packages);
   clpd_engine_destroy(engine);

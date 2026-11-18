@@ -3,14 +3,18 @@
  * several times with a different HOOKS_NAME and these variants:
  * HOOKS_FAIL_INIT (init registers a CLIPS function and then fails),
  * HOOKS_BIG (the descriptor is larger than sizeof(clpd_plugin), as from a
- * later contract revision), HOOKS_THREAD (init also calls post_fact from
- * another thread) and HOOKS_MARKERS (shutdown, the CLIPS environment
- * cleanup and the library destructor append a line each to the file named
+ * later contract revision), HOOKS_THREAD (init also posts a fact JSON from
+ * another thread), HOOKS_POST (init also posts a valid order fact and one
+ * with an unknown slot, see docs/ingest.md), HOOKS_MARKERS (shutdown, the
+ * CLIPS environment cleanup and the library destructor append a line each to the file named
  * by CLPD_TEST_MARKERS), HOOKS_SLEEPER (init starts a thread that lives
- * until shutdown) and HOOKS_SLOW (init sleeps 300 ms after its log line).
+ * until shutdown), HOOKS_SLOW (init sleeps 300 ms after its log line) and
+ * HOOKS_LATE (init starts a thread that posts a valid order fact 200 ms
+ * later; shutdown joins it and logs "shutdown late post_fact=<rc>").
  * Every variant registers <name>-answer, which returns 42; every variant
  * except HOOKS_FAIL_INIT also registers <name>-throw, which calls
- * UDFThrowError. */
+ * UDFThrowError. Every variant first posts "(x)", which is not JSON, and
+ * logs post_fact's result (T7b). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "clpd_plugin.h"
@@ -19,10 +23,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(HOOKS_THREAD) || defined(HOOKS_SLEEPER)
+#if defined(HOOKS_THREAD) || defined(HOOKS_SLEEPER) || defined(HOOKS_LATE)
 #include <pthread.h>
 #endif
-#ifdef HOOKS_SLOW
+#if defined(HOOKS_SLOW) || defined(HOOKS_LATE)
 #include <time.h>
 #endif
 
@@ -39,7 +43,28 @@ typedef struct {
   pthread_cond_t wake;
   int stop;
 #endif
+#ifdef HOOKS_LATE
+  pthread_t poster;
+  int rc, err;
+#endif
 } hooks_state;
+
+#ifdef HOOKS_LATE
+/* Posts one order fact 200 ms after init, from its own thread; shutdown
+ * joins it and logs post_fact's result (only post_fact may be called from
+ * another thread). */
+static void *post_late(void *arg) {
+  hooks_state *s = arg;
+  struct timespec pause = {0, 200000000L};
+  while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+  }
+  errno = 0;
+  s->rc = s->host->post_fact(
+      "{\"template\":\"order\",\"slots\":{\"wf-id\":\"late\"}}");
+  s->err = errno;
+  return NULL;
+}
+#endif
 
 #ifdef HOOKS_SLEEPER
 /* Waits until shutdown; it never touches its signal mask, so it keeps the
@@ -92,11 +117,15 @@ typedef struct {
 static void *post_from_thread(void *arg) {
   post_result *r = arg;
   errno = 0;
-  r->rc = r->host->post_fact("(x)");
+  r->rc = r->host->post_fact("{\"template\":\"x\",\"slots\":{}}");
   r->err = errno;
   return NULL;
 }
 #endif
+
+static const char *errno_name(int e) {
+  return e == EINVAL ? " EINVAL" : e == EAGAIN ? " EAGAIN" : "";
+}
 
 static void answer(Environment *env, UDFContext *udf, UDFValue *out) {
   (void)udf;
@@ -116,7 +145,18 @@ static int hooks_init(const clpd_host *host, Environment *env, void **state) {
   errno = 0;
   rc = host->post_fact("(x)");
   host->log(SELF, "init node_id=%s post_fact=%d%s", host->node_id, rc,
-            errno == ENOSYS ? " ENOSYS" : "");
+            rc != 0 ? errno_name(errno) : "");
+#ifdef HOOKS_POST
+  {
+    int rc_valid = host->post_fact(
+        "{\"template\":\"order\",\"slots\":{\"wf-id\":\"w1\",\"qty\":3,"
+        "\"tags\":[\"a\",{\"sym\":\"b\"}]}}");
+    int rc_unknown_slot = host->post_fact(
+        "{\"template\":\"order\",\"slots\":{\"bogus\":1}}");
+    host->log(SELF, "posted %d %d%s", rc_valid, rc_unknown_slot,
+              rc_unknown_slot != 0 ? errno_name(errno) : "");
+  }
+#endif
 #ifdef HOOKS_SLOW
   {
     struct timespec pause = {0, 300000000L};
@@ -133,7 +173,7 @@ static int hooks_init(const clpd_host *host, Environment *env, void **state) {
         pthread_join(t, NULL) != 0)
       return -1;
     host->log(SELF, "thread post_fact=%d%s", r.rc,
-              r.err == ENOSYS ? " ENOSYS" : "");
+              r.rc != 0 ? errno_name(r.err) : "");
   }
 #endif
 #ifdef HOOKS_FAIL_INIT
@@ -162,6 +202,12 @@ static int hooks_init(const clpd_host *host, Environment *env, void **state) {
       return -1;
     }
 #endif
+#ifdef HOOKS_LATE
+    if (pthread_create(&s->poster, NULL, post_late, s) != 0) {
+      free(s);
+      return -1;
+    }
+#endif
     *state = s;
     return 0;
   }
@@ -185,7 +231,13 @@ static void hooks_cycle_end(void *state, int ok) {
 
 static void hooks_shutdown(void *state) {
   hooks_state *s = state;
+#ifdef HOOKS_LATE
+  pthread_join(s->poster, NULL);
+  s->host->log(SELF, "shutdown late post_fact=%d%s", s->rc,
+               s->rc != 0 ? errno_name(s->err) : "");
+#else
   s->host->log(SELF, "shutdown");
+#endif
 #ifdef HOOKS_SLEEPER
   pthread_mutex_lock(&s->lock);
   s->stop = 1;
