@@ -30,4 +30,12 @@ Directories are created by the task that introduces them.
 
 ## Build
 
-C99 + CMake. Build instructions arrive with T1.
+Prerequisites: CMake >= 3.20 and a C99 compiler (GCC). On the reference development machine the tools come from a user-level Homebrew installation (`/home/linuxbrew/.linuxbrew/bin`).
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+CLIPS is vendored unmodified under `vendor/clips/` (see its README).
