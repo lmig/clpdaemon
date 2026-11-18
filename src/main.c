@@ -3,6 +3,7 @@
 #include "clips_trace.h"
 #include "config.h"
 #include "engine.h"
+#include "fdcapture.h"
 #include "loop.h"
 #include "packages.h"
 #include "trace.h"
@@ -40,34 +41,46 @@ static void run_cycle(void *ctx) {
   clpd_clips_trace_flush(c->ct);
 }
 
-static void reopen_trace(void *trace) { clpd_trace_reopen(trace, stderr); }
+typedef struct {
+  clpd_trace *trace;
+  FILE *log;
+} reopen_ctx;
 
-/* Runs engine cycles until a stop signal. Returns the exit code. */
+static void reopen_trace(void *ctx) {
+  reopen_ctx *r = ctx;
+  clpd_trace_reopen(r->trace, r->log);
+}
+
+/* Runs engine cycles until a stop signal. Daemon messages go to log (the
+ * original stderr). Returns the exit code. */
 static int serve(const clpd_config *cfg, clpd_engine *engine,
                  const clpd_packages *packages, clpd_trace *trace,
-                 clpd_clips_trace *ct) {
+                 clpd_clips_trace *ct, FILE *log) {
   cycle_ctx ctx;
+  reopen_ctx rctx;
   clpd_loop *loop;
   int sig;
 
   loop = clpd_loop_open(cfg->tick_interval_ms, cfg->cycle_min_interval_ms,
-                        stderr);
+                        log);
   if (loop == NULL) {
-    fprintf(stderr, "clpdaemon: cannot start the event loop: %s\n",
+    fprintf(log, "clpdaemon: cannot start the event loop: %s\n",
             strerror(errno));
     return 1;
   }
-  clpd_loop_on_hup(loop, reopen_trace, trace);
+  rctx.trace = trace;
+  rctx.log = log;
+  clpd_loop_on_hup(loop, reopen_trace, &rctx);
   ctx.engine = engine;
   ctx.packages = packages;
   ctx.ct = ct;
   ctx.max_rules = cfg->max_rules_per_cycle;
-  fprintf(stderr, "clpdaemon: %s: running\n", cfg->node_id);
+  fprintf(log, "clpdaemon: %s: running\n", cfg->node_id);
   sig = clpd_loop_run(loop, run_cycle, &ctx);
   if (sig < 0)
-    fprintf(stderr, "clpdaemon: event loop failed: %s\n", strerror(errno));
+    fprintf(log, "clpdaemon: event loop failed: %s\n", strerror(errno));
   else
-    fprintf(stderr, "clpdaemon: received %s, stopping\n",
+    fprintf(log, "clpdaemon: received %s, stopping\n",
             sig == SIGINT ? "SIGINT" : "SIGTERM");
   clpd_loop_close(loop);
   return sig < 0 ? 1 : 0;
@@ -78,7 +91,9 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
  * and the event loop. --check opens the trace files too, so it reports paths
  * the daemon could not write. The hooks come after loading, so package load
  * diagnostics keep going to stderr, and before Reset, so the facts Reset
- * asserts are traced. */
+ * asserts are traced. With a trace, fds 1 and 2 are captured into it from
+ * Reset until the loop ends (FR-16); daemon messages then go to the
+ * capture's log stream, the original stderr. */
 static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_packages packages;
   clpd_clips_trace *ct = NULL;
@@ -108,8 +123,19 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
           stderr);
     rc = 1;
   } else {
-    Reset(clpd_engine_env(engine));
-    rc = serve(cfg, engine, &packages, trace, ct);
+    clpd_fdcapture *cap = NULL;
+    FILE *log = stderr;
+    if (clpd_trace_active(trace)) {
+      cap = clpd_fdcapture_start(trace, stderr);
+      if (cap != NULL) log = clpd_fdcapture_log(cap);
+    }
+    if (clpd_trace_active(trace) && cap == NULL) {
+      rc = 1;
+    } else {
+      Reset(clpd_engine_env(engine));
+      rc = serve(cfg, engine, &packages, trace, ct, log);
+    }
+    clpd_fdcapture_stop(cap);
   }
   clpd_clips_trace_detach(ct);
   clpd_packages_free(&packages);

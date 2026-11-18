@@ -1,6 +1,7 @@
-add_library(clpd_core STATIC kvfile.c config.c manifest.c packages.c scheduler.c engine.c loop.c lint.c trace.c clips_trace.c)
+add_library(clpd_core STATIC kvfile.c config.c manifest.c packages.c scheduler.c engine.c loop.c lint.c trace.c clips_trace.c fdcapture.c)
 target_include_directories(clpd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(clpd_core PUBLIC clips::clips)
+find_package(Threads REQUIRED)
+target_link_libraries(clpd_core PUBLIC clips::clips Threads::Threads)
 target_compile_options(clpd_core PRIVATE ${CLPD_WARNINGS})
 
 add_executable(clpdaemon main.c)

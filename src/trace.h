@@ -1,6 +1,8 @@
 /* Trace sink (FR-13, FR-15, FR-5): text and JSON Lines files, one line per
  * event, each carrying node_id and, when known, wf_id. Formats are
- * documented in docs/trace.md. */
+ * documented in docs/trace.md. Every function except open and close may be
+ * called from several threads at once: events, reopen and the setters are
+ * serialized by a lock inside the sink. */
 #ifndef CLPD_TRACE_H
 #define CLPD_TRACE_H
 
@@ -26,6 +28,10 @@ typedef enum {
 clpd_trace *clpd_trace_open(const char *text_path, const char *jsonl_path,
                             const char *node_id, FILE *err);
 void clpd_trace_set_clock(clpd_trace *t, clpd_trace_clock *clock);
+/* Replaces the stream that receives write-failure messages (initially the
+ * open() err stream). It must not lead back into the trace (for example a
+ * captured fd 2), or a failing write would block on its own report. */
+void clpd_trace_set_err(clpd_trace *t, FILE *err);
 /* 1 when at least one file is configured. */
 int clpd_trace_active(const clpd_trace *t);
 /* Reopens every file by path (log rotation). A file that cannot be reopened
@@ -35,8 +41,8 @@ int clpd_trace_reopen(clpd_trace *t, FILE *err);
 
 /* wf_id may be NULL (unknown). String arguments are NUL-terminated; only
  * the output text takes an explicit length and may contain NUL bytes. A
- * failed write is reported on the open() err stream, once per file until a
- * reopen succeeds. */
+ * failed write is reported on the current err stream (see
+ * clpd_trace_set_err), once per file until a reopen succeeds. */
 void clpd_trace_fact(clpd_trace *t, clpd_trace_fact_kind kind,
                      const char *wf_id, long long index, const char *tmpl,
                      const char *text);

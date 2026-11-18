@@ -14,14 +14,17 @@ target_compile_options(config_test PRIVATE ${CLPD_WARNINGS})
 
 add_test(NAME clpdaemon_config COMMAND config_test)
 
-foreach(t scheduler engine loop lint manifest packages trace clips_trace)
+foreach(t scheduler engine loop lint manifest packages trace clips_trace fdcapture)
   add_executable(${t}_test ${t}/${t}_test.c)
   target_link_libraries(${t}_test PRIVATE clpd_core)
   target_compile_options(${t}_test PRIVATE ${CLPD_WARNINGS})
   add_test(NAME clpdaemon_${t} COMMAND ${t}_test)
 endforeach()
 
+# Link seam for the reader-failure case: the test wraps poll.
+target_link_options(fdcapture_test PRIVATE -Wl,--wrap=poll)
+
 # A lost stop signal must fail a test, not hang it until the default timeout.
 set_tests_properties(clpdaemon_scheduler clpdaemon_engine clpdaemon_loop
-  clpdaemon_lint clpdaemon_manifest clpdaemon_packages clpdaemon_trace clpdaemon_clips_trace clpdaemon_config PROPERTIES TIMEOUT 30)
+  clpdaemon_lint clpdaemon_manifest clpdaemon_packages clpdaemon_trace clpdaemon_clips_trace clpdaemon_fdcapture clpdaemon_config PROPERTIES TIMEOUT 30)
 set_tests_properties(clpdaemon_cli PROPERTIES TIMEOUT 120)

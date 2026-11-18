@@ -6,7 +6,8 @@ set -u
 BIN=${1:?usage: cli_test.sh <path-to-clpdaemon>}
 case $BIN in /*) ;; *) BIN=$PWD/$BIN ;; esac
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# A background child left by a case (ypid) is killed even on failure.
+trap 'if [ -s "$WORK/ypid" ]; then kill -KILL "$(cat "$WORK/ypid")" 2>/dev/null; fi; rm -rf "$WORK"' EXIT
 cd "$WORK" || exit 2
 
 USAGE='usage: clpdaemon --config <file> [--foreground] [--check]'
@@ -406,6 +407,107 @@ if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "
   [ -e jdir ]; then
   fail "SIGHUP reopens the trace files" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)], files [$(ls -l rot jdir.1)]"
 fi
+
+# With a trace, fds 1 and 2 go to pipes whose lines become stdout/stderr
+# output events (FR-16, L48): a child started by CLIPS system writes to
+# them, while the daemon messages stay on the original stderr.
+mkdir sys
+conf sys/package.conf 'definition = sys
+version = 1
+files = s.clp'
+conf sys/s.clp '(defrule shell => (system "echo out-child; echo err-child >&2"))'
+conf trsys.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = sys
+trace_text = sys.log
+trace_jsonl = sys.jsonl'
+cases=$((cases + 1))
+"$BIN" --config trsys.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has sys.log 'stdout out-child' || ok=0
+wait_has sys.log 'stderr err-child' || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+got_text=$(cut -d' ' -f2- sys.log | LC_ALL=C sort)
+got_jsonl=$(sed 's/"ts":"[^"]*",//' sys.jsonl | LC_ALL=C sort)
+want_text='n1 - FIRE sys@1::shell
+n1 - stderr err-child
+n1 - stdout out-child'
+want_jsonl='{"node_id":"n1","event":"fire","module":"sys@1","rule":"shell","facts":[]}
+{"node_id":"n1","event":"output","stream":"stderr","text":"err-child"}
+{"node_id":"n1","event":"output","stream":"stdout","text":"out-child"}'
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  [ "$got_text" != "$want_text" ] || [ "$got_jsonl" != "$want_jsonl" ]; then
+  fail "process stdout and stderr go to the trace" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]
+  text [$got_text]
+  jsonl [$got_jsonl]"
+fi
+
+# Without a trace nothing is redirected: the child writes to the console.
+conf nosys.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = sys'
+cases=$((cases + 1))
+"$BIN" --config nosys.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_line err.txt "err-child" || ok=0
+wait_line out.txt "out-child" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != out-child ] ||
+  [ "$(grep -cv '^clpdaemon: ' err.txt)" != 1 ]; then
+  fail "no trace: process output on the console" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# S5/T5c D2: a busy background child (it inherits the blocked SIGTERM)
+# must not hang stop; once the daemon is gone it gets SIGPIPE or EPIPE.
+mkdir yes
+conf yes/package.conf 'definition = yes
+version = 1
+files = y.clp'
+conf yes/y.clp '(defrule busy => (system "yes busy & echo $! > ypid"))'
+conf tryes.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = yes
+trace_text = yes.log'
+cases=$((cases + 1))
+"$BIN" --config tryes.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has yes.log 'stdout busy' || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+# The child must end by itself shortly after the daemon (no reader left).
+child=gone
+if [ -s ypid ]; then
+  n=0
+  while kill -0 "$(cat ypid)" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 100 ]; then child=running; break; fi
+    sleep 0.05
+  done
+  kill -KILL "$(cat ypid)" 2>/dev/null
+fi
+before=$(size yes.log)
+sleep 0.2
+after=$(size yes.log)
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  [ "$child" != gone ] || [ "$before" != "$after" ]; then
+  fail "busy background child does not hang stop" "exit $rc, lines seen $ok, child $child, trace $before -> $after bytes, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+: >ypid
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

@@ -1,6 +1,8 @@
 /* Event loop (FR-3, FR-5): poll over signalfd (SIGTERM, SIGINT, SIGHUP),
  * a monotonic timerfd armed at the next cycle and an eventfd for wake-up
- * notifications. Single-threaded. */
+ * notifications. The loop runs on the main thread; with a trace, the fd
+ * capture reader thread (fdcapture.h) blocks every signal, so the signals
+ * blocked here reach only the signalfd. */
 #ifndef CLPD_LOOP_H
 #define CLPD_LOOP_H
 

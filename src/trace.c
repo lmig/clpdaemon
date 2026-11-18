@@ -3,6 +3,7 @@
 #include "trace.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -18,6 +19,9 @@ struct clpd_trace {
   char *node_id;
   clpd_trace_clock *clock;
   FILE *err; /* daemon messages (write failures) */
+  /* Serializes every event, reopen and setter: the main thread (CLIPS
+   * events, SIGHUP) and the fd capture reader thread share the sink. */
+  pthread_mutex_t lock;
 };
 
 /* Growable line buffer. On allocation failure it is marked broken and the
@@ -186,11 +190,13 @@ clpd_trace *clpd_trace_open(const char *text_path, const char *jsonl_path,
     fprintf(err, "clpdaemon: cannot open the trace: %s\n", strerror(errno));
     return NULL;
   }
+  pthread_mutex_init(&t->lock, NULL);
   t->clock = real_clock;
   t->err = err;
   t->node_id = strdup(node_id);
   if (t->node_id == NULL) {
     fprintf(err, "clpdaemon: cannot open the trace: %s\n", strerror(errno));
+    pthread_mutex_destroy(&t->lock);
     free(t);
     return NULL;
   }
@@ -222,7 +228,15 @@ clpd_trace *clpd_trace_open(const char *text_path, const char *jsonl_path,
 }
 
 void clpd_trace_set_clock(clpd_trace *t, clpd_trace_clock *clock) {
+  pthread_mutex_lock(&t->lock);
   t->clock = clock;
+  pthread_mutex_unlock(&t->lock);
+}
+
+void clpd_trace_set_err(clpd_trace *t, FILE *err) {
+  pthread_mutex_lock(&t->lock);
+  t->err = err;
+  pthread_mutex_unlock(&t->lock);
 }
 
 int clpd_trace_active(const clpd_trace *t) {
@@ -233,6 +247,7 @@ int clpd_trace_reopen(clpd_trace *t, FILE *err) {
   sink *sinks[2];
   int i, failed = 0;
 
+  pthread_mutex_lock(&t->lock);
   sinks[0] = &t->text;
   sinks[1] = &t->jsonl;
   for (i = 0; i < 2; i++) {
@@ -249,6 +264,7 @@ int clpd_trace_reopen(clpd_trace *t, FILE *err) {
     sinks[i]->f = f;
     sinks[i]->write_failed = 0;
   }
+  pthread_mutex_unlock(&t->lock);
   return failed;
 }
 
@@ -265,6 +281,7 @@ void clpd_trace_fact(clpd_trace *t, clpd_trace_fact_kind kind,
                      const char *text) {
   char ts[32];
   if (!clpd_trace_active(t)) return;
+  pthread_mutex_lock(&t->lock);
   timestamp(t, ts);
   if (t->text.f != NULL) {
     line b = {0};
@@ -285,6 +302,7 @@ void clpd_trace_fact(clpd_trace *t, clpd_trace_fact_kind kind,
     puts_(&b, "}");
     emit(t, &t->jsonl, &b);
   }
+  pthread_mutex_unlock(&t->lock);
 }
 
 void clpd_trace_fire(clpd_trace *t, const char *wf_id, const char *module,
@@ -292,6 +310,7 @@ void clpd_trace_fire(clpd_trace *t, const char *wf_id, const char *module,
   char ts[32];
   size_t i;
   if (!clpd_trace_active(t)) return;
+  pthread_mutex_lock(&t->lock);
   timestamp(t, ts);
   if (t->text.f != NULL) {
     line b = {0};
@@ -315,12 +334,14 @@ void clpd_trace_fire(clpd_trace *t, const char *wf_id, const char *module,
     puts_(&b, "]}");
     emit(t, &t->jsonl, &b);
   }
+  pthread_mutex_unlock(&t->lock);
 }
 
 void clpd_trace_output(clpd_trace *t, const char *wf_id, const char *stream,
                        const char *text, size_t len) {
   char ts[32];
   if (!clpd_trace_active(t)) return;
+  pthread_mutex_lock(&t->lock);
   timestamp(t, ts);
   if (t->text.f != NULL) {
     line b = {0};
@@ -340,6 +361,7 @@ void clpd_trace_output(clpd_trace *t, const char *wf_id, const char *stream,
     puts_(&b, "}");
     emit(t, &t->jsonl, &b);
   }
+  pthread_mutex_unlock(&t->lock);
 }
 
 void clpd_trace_close(clpd_trace *t) {
@@ -349,5 +371,6 @@ void clpd_trace_close(clpd_trace *t) {
   free(t->text.path);
   free(t->jsonl.path);
   free(t->node_id);
+  pthread_mutex_destroy(&t->lock);
   free(t);
 }

@@ -183,6 +183,20 @@ static void test_write_error(void) {
                 "clpdaemon: /dev/full: cannot write: No space left on device\n") == 0);
 }
 
+/* After clpd_trace_set_err, write failures go to the new stream only. */
+static void test_set_err(void) {
+  FILE *first = tmpfile(), *second = tmpfile();
+  clpd_trace *t = clpd_trace_open("/dev/full", NULL, "n1", first);
+  EXPECT(t != NULL);
+  if (t == NULL) return;
+  clpd_trace_set_err(t, second);
+  clpd_trace_output(t, NULL, "STDOUT", "a", 1);
+  clpd_trace_close(t);
+  EXPECT(strcmp(err_text(first), "") == 0);
+  EXPECT(strcmp(err_text(second),
+                "clpdaemon: /dev/full: cannot write: No space left on device\n") == 0);
+}
+
 /* The largest fact index is written in full, not cut or over-read. */
 static void test_large_index(void) {
   clpd_trace *t = clpd_trace_open(NULL, jsonl_path, "n1", stderr);
@@ -211,6 +225,7 @@ int main(void) {
   test_open_errors();
   test_reopen();
   test_write_error();
+  test_set_err();
   unlink(jsonl_path);
   test_large_index();
   unlink(text_path);
