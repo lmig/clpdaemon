@@ -112,6 +112,20 @@ conf twice.conf 'node_id = n1
 packages = pkg, ./pkg'
 check "same package twice" 1 "" \
   "clpdaemon: ./pkg: package fibre-installation@v3 is already loaded from pkg" -- --config twice.conf --check
+mkdir lint
+conf lint/package.conf 'definition = lint
+version = 1
+files = l.clp
+lint_exempt = template:catalog'
+conf lint/l.clp '(deftemplate catalog (slot code))
+(deftemplate order (slot wf-id) (slot code))
+(deftemplate item (slot owner))
+(defrule r (order (wf-id ?w) (code ?c)) (catalog (code ?c)) (item (owner ?w)) =>)'
+conf lint.conf 'node_id = n1
+packages = lint'
+check "wf-id lint errors" 1 "" \
+  "clpdaemon: lint@1: lint: template 'item' has no wf-id slot
+clpdaemon: lint@1: lint: rule 'r': pattern 3 (item) does not bind wf-id to a variable" -- --config lint.conf --check
 # A failing package does not stop the next one from being checked.
 conf both.conf 'node_id = n1
 packages = gone, dm'

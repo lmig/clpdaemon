@@ -35,6 +35,21 @@ Every package is checked even when an earlier one failed, so one run reports all
 
 Before each cycle the daemon replaces the focus stack with MAIN under every package module, the first package on top, so one `Run` fires the rules of all packages (a rule of a non-MAIN module only fires with focus).
 
+## wf-id lint
+
+Every deftemplate of a package must have a `wf-id` slot, and every rule must bind the `wf-id` slot of all its patterns to one shared variable, so a rule only joins facts of the same workflow instance (FR-7):
+
+```clips
+(defrule start ?o <- (order (wf-id ?w) (status new)) (crm-ack (wf-id ?w)) => ...)
+```
+
+- Patterns are numbered from 1 in textual order, including those inside `not`, `exists`, `and`, `or`, `forall` and `logical`; `test` and `declare` are not patterns.
+- A slot value counts as a variable when it starts with a single-field `?name`; constraints may follow (`?w&:(neq ?w x)`, `?w|?v`). A constant, `$?w`, `?` or a missing slot does not.
+- The first checked pattern of a rule sets the expected variable.
+- `lint_exempt` names templates (for example reference data shared by all instances) and rules to skip; patterns on an exempt template are not checked. Naming a construct the package does not define is an error.
+
+Lint errors make the package fail like load errors.
+
 ## Messages
 
 Manifest errors go to stderr; every error in the file is reported, one per line, in file order, followed by the missing keys.
@@ -54,3 +69,9 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Package file failed to load | `clpdaemon: <file>: load failed`, after the CLIPS lines |
 | `defmodule` in a package file | `clpdaemon: <file>: defmodule is not allowed in package files` |
 | Same `definition@version` twice | `clpdaemon: <dir>: package <definition@version> is already loaded from <first dir>` |
+| Exemption names an unknown construct | `clpdaemon: <pkg>: lint: lint_exempt names unknown template '<t>'` (or `unknown rule '<r>'`) |
+| Template without `wf-id` | `clpdaemon: <pkg>: lint: template '<t>' has no wf-id slot` |
+| Pattern without a `wf-id` variable | `clpdaemon: <pkg>: lint: rule '<r>': pattern <n> (<template>) does not bind wf-id to a variable` |
+| Different `wf-id` variables | `clpdaemon: <pkg>: lint: rule '<r>': pattern <n> (<template>) binds wf-id to ?<x>, expected ?<w> from pattern <m>` |
+
+Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order.
