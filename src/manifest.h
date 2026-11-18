@@ -16,6 +16,7 @@ typedef struct {
   clpd_list files;  /* paths joined to the package directory, in order */
   clpd_list exempt_templates;
   clpd_list exempt_rules;
+  clpd_list ingest; /* deftemplate names, unique within the list */
 } clpd_manifest;
 
 /* Loads and validates <dir>/package.conf. Every error is written to err,

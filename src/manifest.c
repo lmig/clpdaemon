@@ -5,10 +5,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { KEY_DEFINITION, KEY_VERSION, KEY_FILES, KEY_LINT_EXEMPT, KEY_COUNT };
+enum {
+  KEY_DEFINITION,
+  KEY_VERSION,
+  KEY_FILES,
+  KEY_LINT_EXEMPT,
+  KEY_INGEST,
+  KEY_COUNT
+};
 
-static const char *const key_names[KEY_COUNT] = {"definition", "version",
-                                                 "files", "lint_exempt"};
+static const char *const key_names[KEY_COUNT] = {
+    "definition", "version", "files", "lint_exempt", "ingest"};
 
 typedef struct {
   clpd_manifest *m;
@@ -66,6 +73,30 @@ static int exempt_item(clpd_kv *kv, const char *key, const char *item,
   return 1;
 }
 
+/* Rejects a name already in the list being built (ctx). */
+static int ingest_item(clpd_kv *kv, const char *key, const char *item,
+                       void *ctx) {
+  clpd_list *seen = ctx;
+  size_t i;
+  for (i = 0; i < seen->count; i++) {
+    if (strcmp(seen->items[i], item) == 0) {
+      clpd_kv_error(kv, "%s: '%s' listed more than once", key, item);
+      return 0;
+    }
+  }
+  /* Only the address of the item is kept: the list owns the strings. */
+  {
+    char **grown = realloc(seen->items, (seen->count + 1) * sizeof *grown);
+    if (grown == NULL) {
+      perror("clpdaemon");
+      exit(1);
+    }
+    seen->items = grown;
+    seen->items[seen->count++] = (char *)item;
+  }
+  return 1;
+}
+
 static void set_name(clpd_kv *kv, const char *key, const char *value,
                      char **slot) {
   if (!clpd_valid_name(value, CLPD_PACKAGE_NAME_MAX)) {
@@ -117,6 +148,15 @@ static void on_pair(clpd_kv *kv, char *key, char *value, void *ctx) {
     }
     clpd_list_free(&list);
     break;
+  case KEY_INGEST: {
+    clpd_list seen = {NULL, 0};
+    int ok = clpd_kv_list(kv, key, value, &list, ingest_item, &seen);
+    free(seen.items);
+    if (!ok) break;
+    clpd_list_free(&m->ingest);
+    m->ingest = list;
+    break;
+  }
   default: break;
   }
 }
@@ -165,5 +205,6 @@ void clpd_manifest_free(clpd_manifest *m) {
   clpd_list_free(&m->files);
   clpd_list_free(&m->exempt_templates);
   clpd_list_free(&m->exempt_rules);
+  clpd_list_free(&m->ingest);
   memset(m, 0, sizeof *m);
 }

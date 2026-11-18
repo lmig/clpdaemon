@@ -81,7 +81,7 @@ watch                    = rules
 packages                 = pkg
 plugins                  = '"$PLUGINS/clpd_example.so, $PLUGINS/test_hooks_a.so"
 check "full valid file" 0 "clpdaemon: full.conf: configuration OK" "clpdaemon: example: init
-clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: hooks-a: shutdown
 clpdaemon: example: shutdown" -- --config full.conf --check
 conf equal.conf 'node_id = n1
@@ -635,9 +635,9 @@ clpdaemon: $PLUGINS/./clpd_example.so: plugin example is already loaded from $EX
 clpdaemon: example: shutdown"
 plugerr "failing init shuts down the others in reverse order" \
   "$PLUGINS/test_hooks_a.so, $PLUGINS/test_hooks_b.so, $PLUGINS/test_fail_init.so, $EX" \
-  "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
-clpdaemon: hooks-b: init node_id=n1 post_fact=-1 ENOSYS
-clpdaemon: fail-init: init node_id=n1 post_fact=-1 ENOSYS
+  "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: hooks-b: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: fail-init: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: $PLUGINS/test_fail_init.so: init failed
 clpdaemon: hooks-b: shutdown
 clpdaemon: hooks-a: shutdown"
@@ -652,7 +652,7 @@ conf plugmark.conf "node_id = n1
 plugins = $PLUGINS/test_markers.so"
 export CLPD_TEST_MARKERS="$WORK/markers.txt"
 RUN='timeout 10' check "check unloads after the environment" 0 \
-  "clpdaemon: plugmark.conf: configuration OK" "clpdaemon: markers: init node_id=n1 post_fact=-1 ENOSYS
+  "clpdaemon: plugmark.conf: configuration OK" "clpdaemon: markers: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: markers: shutdown" -- --config plugmark.conf --check
 unset CLPD_TEST_MARKERS
 cases=$((cases + 1))
@@ -705,8 +705,8 @@ tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_hooks_a.so, $PLUGINS/test_hooks_b.so"
 plugdaemon "hooks in configured order, shutdown in reverse" plugorder.conf \
-  "clpdaemon: hooks-b: cycle_end ok=1" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
-clpdaemon: hooks-b: init node_id=n1 post_fact=-1 ENOSYS
+  "clpdaemon: hooks-b: cycle_end ok=1" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: hooks-b: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: hooks-a: after_load
 clpdaemon: hooks-b: after_load
 clpdaemon: n1: running
@@ -739,7 +739,7 @@ cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_hooks_a.so
 packages = throwpkg"
 plugdaemon "cycle_end ok=0 after UDFThrowError" plugthrow.conf \
-  "clpdaemon: hooks-a: cycle_end ok=0" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+  "clpdaemon: hooks-a: cycle_end ok=0" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: hooks-a: after_load
 clpdaemon: n1: running
 clpdaemon: hooks-a: cycle_begin
@@ -754,7 +754,7 @@ max_rules_per_cycle = 1
 plugins = $PLUGINS/test_hooks_a.so
 packages = looppkg"
 plugdaemon "cycle_end ok=1 for a Run cut by max_rules_per_cycle" pluglimit.conf \
-  "clpdaemon: hooks-a: cycle_end ok=1" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+  "clpdaemon: hooks-a: cycle_end ok=1" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: hooks-a: after_load
 clpdaemon: n1: running
 clpdaemon: hooks-a: cycle_begin
@@ -770,7 +770,7 @@ max_rules_per_cycle = -1
 plugins = $PLUGINS/test_hooks_a.so
 packages = looppkg"
 plugdaemon "cycle_end ok=1 for a Run halted by SIGTERM" plugterm.conf \
-  "clpdaemon: hooks-a: cycle_begin" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+  "clpdaemon: hooks-a: cycle_begin" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: hooks-a: after_load
 clpdaemon: n1: running
 clpdaemon: hooks-a: cycle_begin
@@ -787,7 +787,7 @@ tick_interval_ms = 20
 cycle_min_interval_ms = 10
 plugins = $PLUGINS/test_sleeper.so"
 plugdaemon "SIGTERM with a plugin thread stops gracefully" plugsleeper.conf \
-  "clpdaemon: sleeper: cycle_end ok=1" "clpdaemon: sleeper: init node_id=n1 post_fact=-1 ENOSYS
+  "clpdaemon: sleeper: cycle_end ok=1" "clpdaemon: sleeper: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: sleeper: after_load
 clpdaemon: n1: running
 clpdaemon: sleeper: cycle_begin
@@ -804,10 +804,10 @@ cases=$((cases + 1))
 "$BIN" --config plugslow.conf >out.txt 2>err.txt &
 pid=$!
 ok=1
-wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 EINVAL" || ok=0
 kill -TERM "$pid"
 wait_exit "$pid"
-want="clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS
+want="clpdaemon: slow: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: slow: after_load
 clpdaemon: n1: running
 clpdaemon: received SIGTERM, stopping
@@ -821,7 +821,7 @@ cases=$((cases + 1))
 "$BIN" --config plugslow.conf >out.txt 2>err.txt &
 pid=$!
 ok=1
-wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 EINVAL" || ok=0
 kill -HUP "$pid"
 wait_line err.txt "clpdaemon: received SIGHUP, reopening trace files" || ok=0
 wait_line err.txt "clpdaemon: slow: cycle_end ok=1" || ok=0
@@ -847,10 +847,10 @@ cases=$((cases + 1))
 "$BIN" --config plugslowpkg.conf >out.txt 2>err.txt &
 pid=$!
 ok=1
-wait_line err.txt "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+wait_line err.txt "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL" || ok=0
 kill -TERM "$pid"
 wait_exit "$pid"
-want="clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+want="clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
 clpdaemon: hooks-a: after_load
 clpdaemon: n1: running
 clpdaemon: received SIGTERM, stopping
@@ -863,12 +863,65 @@ cases=$((cases + 1))
 "$BIN" --config plugslow.conf --check >out.txt 2>err.txt &
 pid=$!
 ok=1
-wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 EINVAL" || ok=0
 kill -TERM "$pid"
 wait_exit "$pid"
 if [ "$ok" != 1 ] || [ "$rc" != 143 ]; then
   fail "--check keeps the default SIGTERM action" "exit $rc, lines seen $ok, stderr [$(cat err.txt)]"
 fi
+
+# --- ingest (T7b, docs/ingest.md) ---------------------------------------------
+# A plugin posts two facts in init, before the event loop exists: the first
+# cycle drains them before cycle_begin; the valid one fires a package rule,
+# the other is rejected under the plugin's name.
+mkdir ingpkg
+conf ingpkg/package.conf 'definition = shop
+version = 1
+files = s.clp
+ingest = order'
+conf ingpkg/s.clp '(deftemplate order (slot wf-id) (slot qty) (multislot tags))
+(defrule seen (order (wf-id ?w) (qty ?q) (tags $?t)) => (printout t "seen " ?w " " ?q " " (implode$ ?t) crlf))'
+conf ingest.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_poster.so
+packages = ingpkg"
+cases=$((cases + 1))
+"$BIN" --config ingest.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: poster: cycle_end ok=1" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want='clpdaemon: poster: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: poster: posted 0 0
+clpdaemon: poster: after_load
+clpdaemon: n1: running
+clpdaemon: poster: post_fact rejected: template '"'order'"' has no slot '"'bogus'"'
+clpdaemon: poster: cycle_begin
+clpdaemon: poster: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: poster: shutdown'
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != 'seen w1 3 "a" b' ] ||
+  [ "$(cat err.txt)" != "$want" ]; then
+  fail "facts posted in init are asserted in the first cycle" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+# An ingest name that is not a deftemplate of the package fails --check.
+mkdir ingbad
+conf ingbad/package.conf 'definition = bad
+version = 1
+files = s.clp
+ingest = order, nope'
+conf ingbad/s.clp '(deftemplate order (slot wf-id))'
+conf ingbad.conf 'node_id = n1
+packages = ingbad'
+RUN='timeout 10' check "ingest names an unknown template" 1 "" \
+  "clpdaemon: bad@1: ingest names unknown template 'nope'" -- --config ingbad.conf --check
+conf ingdup.conf 'node_id = n1
+packages = ingpkg, ingbad'
+RUN='timeout 10' check "ingest template listed by two packages" 1 "" \
+  "clpdaemon: bad@1: ingest names template 'order', already listed by shop@1
+clpdaemon: bad@1: ingest names unknown template 'nope'" -- --config ingdup.conf --check
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

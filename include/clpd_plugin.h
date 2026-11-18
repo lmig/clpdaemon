@@ -44,10 +44,14 @@ typedef struct clpd_host {
    * descriptor; fmt and the arguments follow printf. Engine thread only. */
   void (*log)(const struct clpd_plugin *plugin, const char *fmt, ...)
       CLPD_PLUGIN_PRINTF(2, 3);
-  /* Queues one fact, written as CLIPS text such as "(order (wf-id w1))",
-   * for the engine thread. Callable from any thread. Returns 0 when the fact
-   * was queued. Not implemented in contract version 1 yet: it always
-   * returns -1 and sets errno to ENOSYS (the ingest pipeline comes in T7). */
+  /* Queues one fact for the engine thread, written as fact JSON
+   * (docs/ingest.md), such as
+   * {"template":"order","slots":{"wf-id":"w1","qty":3}}. Callable from any
+   * thread, init included. Returns 0 when queued; otherwise -1 with errno
+   * EINVAL (NULL or not JSON within the limits), EAGAIN (queue full) or
+   * ENOMEM. The template and slots are checked when the next engine cycle
+   * asserts the fact; a rejected fact is logged on the daemon log stream as
+   * "clpdaemon: <plugin name>: post_fact rejected: <message>". */
   int (*post_fact)(const char *fact_text);
   /* The node_id of the daemon configuration. */
   const char *node_id;

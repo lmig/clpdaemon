@@ -26,7 +26,9 @@ int clpd_loop_block_signals(void);
  * Messages go to log. Returns NULL with errno set on failure. */
 clpd_loop *clpd_loop_open(int tick_ms, int min_ms, FILE *log);
 /* Requests a cycle (subject to the minimum interval). Safe to call from a
- * cycle callback. */
+ * cycle callback, and from any thread while the loop is open: it only
+ * writes to the loop's eventfd, which is thread-safe (the ingest queue
+ * calls it from the posting thread, src/ingest.h). */
 void clpd_loop_notify(clpd_loop *l);
 /* Called on SIGHUP after its message is logged (trace reopen). */
 void clpd_loop_on_hup(clpd_loop *l, clpd_hup_fn *fn, void *ctx);

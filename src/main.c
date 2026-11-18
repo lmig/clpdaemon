@@ -4,6 +4,7 @@
 #include "config.h"
 #include "engine.h"
 #include "fdcapture.h"
+#include "ingest.h"
 #include "log.h"
 #include "loop.h"
 #include "packages.h"
@@ -35,7 +36,9 @@ typedef struct {
   int max_rules;
 } cycle_ctx;
 
-/* One cycle: the plugins' cycle_begin, focus every package module, Run with
+/* One cycle: assert the facts queued so far (docs/ingest.md; a rejected one
+ * is logged under the plugin that posted it), the plugins' cycle_begin,
+ * focus every package module, Run with
  * the rule limit, the plugins' cycle_end, then write the partial output
  * lines the cycle left. Run stops on an evaluation error and leaves
  * HaltExecution set (it clears the error flags when the next Run starts),
@@ -45,6 +48,7 @@ typedef struct {
 static void run_cycle(void *ctx) {
   cycle_ctx *c = ctx;
   Environment *env = clpd_engine_env(c->engine);
+  clpd_ingest_drain(env, c->packages, clpd_plugins_post_rejected, c->plugins);
   clpd_plugins_cycle_begin(c->plugins);
   clpd_packages_focus(env, c->packages);
   clpd_engine_run_cycle(c->engine, c->max_rules);
@@ -53,6 +57,8 @@ static void run_cycle(void *ctx) {
 }
 
 static void reopen_trace(void *ctx) { clpd_trace_reopen(ctx, clpd_log()); }
+
+static void wake_loop(void *loop) { clpd_loop_notify(loop); }
 
 /* Runs engine cycles until a stop signal. Daemon messages go to the daemon
  * log stream (src/log.h; the original stderr during a capture). Returns the
@@ -73,6 +79,10 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
     return 1;
   }
   clpd_loop_on_hup(loop, reopen_trace, trace);
+  /* Facts posted before the loop existed (for example from a plugin's
+   * init) are already queued: setting the notify function wakes the loop
+   * for them, and every later post wakes it too. */
+  clpd_ingest_set_notify(wake_loop, loop);
   ctx.engine = engine;
   ctx.packages = packages;
   ctx.plugins = plugins;
@@ -85,6 +95,7 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   else
     fprintf(log, "clpdaemon: received %s, stopping\n",
             sig == SIGINT ? "SIGINT" : "SIGTERM");
+  clpd_ingest_set_notify(NULL, NULL);
   clpd_loop_close(loop);
   return sig < 0 ? 1 : 0;
 }
@@ -159,6 +170,9 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     }
   }
   clpd_plugins_shutdown(plugins);
+  /* After shutdown, which stops the plugins' threads: facts still queued
+   * (posted after the last cycle, or under --check) are dropped. */
+  clpd_ingest_clear();
   clpd_clips_trace_detach(ct);
   clpd_packages_free(&packages);
   clpd_engine_destroy(engine);

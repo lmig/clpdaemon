@@ -112,12 +112,61 @@ static int load_file(Environment *env, clpd_package *pkg, const char *file,
   return 0;
 }
 
+/* The non-implied deftemplate `name` of the current module, or NULL. */
+static Deftemplate *own_template(Environment *env, const char *name) {
+  Deftemplate *t;
+  for (t = GetNextDeftemplate(env, NULL); t != NULL;
+       t = GetNextDeftemplate(env, t))
+    if (!t->implied && strcmp(DeftemplateName(t), name) == 0) return t;
+  return NULL;
+}
+
+/* Resolves the ingest list of the last package of out to its own
+ * deftemplates (T7b, docs/ingest.md): a name an earlier package lists, or
+ * that is not a deftemplate of this package, is an error. Sets pkg->ingest
+ * only when every name resolved. Returns the error count. */
+static int check_ingest(Environment *env, clpd_packages *out, FILE *err) {
+  clpd_package *pkg = &out->items[out->count - 1];
+  const clpd_list *names = &pkg->manifest.ingest;
+  Deftemplate **found = calloc(names->count + 1, sizeof *found);
+  size_t i, j, k;
+  int errors = 0;
+
+  if (found == NULL) clpd_log_die_errno();
+  SetCurrentModule(env, pkg->module);
+  for (i = 0; i < names->count; i++) {
+    const char *other = NULL;
+    for (j = 0; j + 1 < out->count && other == NULL; j++)
+      for (k = 0; k < out->items[j].manifest.ingest.count; k++)
+        if (strcmp(out->items[j].manifest.ingest.items[k], names->items[i]) ==
+            0) {
+          other = out->items[j].manifest.name;
+          break;
+        }
+    if (other != NULL) {
+      fprintf(err, "clpdaemon: %s: ingest names template '%s', already "
+                   "listed by %s\n", pkg->manifest.name, names->items[i], other);
+      errors++;
+    } else if ((found[i] = own_template(env, names->items[i])) == NULL) {
+      fprintf(err, "clpdaemon: %s: ingest names unknown template '%s'\n",
+              pkg->manifest.name, names->items[i]);
+      errors++;
+    }
+  }
+  if (errors == 0)
+    pkg->ingest = found;
+  else
+    free(found);
+  return errors;
+}
+
 /* Loads one package already appended to out; returns its error count. */
 static int load_package(Environment *env, clpd_packages *out, FILE *err) {
   clpd_package *pkg = &out->items[out->count - 1];
   char build[CLPD_PACKAGE_NAME_MAX * 2 + 16];
   clpd_lint_exempt exempt;
   size_t i;
+  int errors;
 
   for (i = 0; i + 1 < out->count; i++) {
     if (strcmp(out->items[i].manifest.name, pkg->manifest.name) == 0) {
@@ -141,7 +190,8 @@ static int load_package(Environment *env, clpd_packages *out, FILE *err) {
   exempt.template_count = pkg->manifest.exempt_templates.count;
   exempt.rules = (const char *const *)pkg->manifest.exempt_rules.items;
   exempt.rule_count = pkg->manifest.exempt_rules.count;
-  return clpd_lint_package(env, pkg->module, pkg->manifest.name, &exempt, err);
+  errors = clpd_lint_package(env, pkg->module, pkg->manifest.name, &exempt, err);
+  return errors + check_ingest(env, out, err);
 }
 
 int clpd_packages_load(Environment *env, const clpd_list *dirs,
@@ -168,6 +218,7 @@ int clpd_packages_load(Environment *env, const clpd_list *dirs,
     out->items[out->count].dir = clpd_strdup(dirs->items[i]);
     out->items[out->count].manifest = m;
     out->items[out->count].module = NULL;
+    out->items[out->count].ingest = NULL;
     out->count++;
     errors += load_package(env, out, err);
     SetCurrentModule(env, main_module);
@@ -187,6 +238,7 @@ void clpd_packages_free(clpd_packages *p) {
   size_t i;
   for (i = 0; i < p->count; i++) {
     free(p->items[i].dir);
+    free(p->items[i].ingest);
     clpd_manifest_free(&p->items[i].manifest);
   }
   free(p->items);

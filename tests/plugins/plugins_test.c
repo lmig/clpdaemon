@@ -5,6 +5,7 @@
 #include "plugins.h"
 
 #include "clpd_plugin.h"
+#include "ingest.h"
 #include "log.h"
 
 #include <stdio.h>
@@ -147,8 +148,8 @@ static void test_order(void) {
   clpd_plugins_cycle_end(r.p, 0);
   done(&r);
   EXPECT(strcmp(take_log(),
-                "clpdaemon: hooks-a: init node_id=n7 post_fact=-1 ENOSYS\n"
-                "clpdaemon: hooks-b: init node_id=n7 post_fact=-1 ENOSYS\n"
+                "clpdaemon: hooks-a: init node_id=n7 post_fact=-1 EINVAL\n"
+                "clpdaemon: hooks-b: init node_id=n7 post_fact=-1 EINVAL\n"
                 "clpdaemon: hooks-a: after_load\n"
                 "clpdaemon: hooks-b: after_load\n"
                 "clpdaemon: hooks-a: cycle_begin\n"
@@ -171,7 +172,7 @@ static void expect_failure(const char *bad, const char *want,
   load(&r, paths, 2);
   snprintf(full, sizeof full, "clpdaemon: %s: %s\n", bad, want);
   snprintf(log_want, sizeof log_want,
-           "clpdaemon: hooks-a: init node_id=n7 post_fact=-1 ENOSYS\n%s"
+           "clpdaemon: hooks-a: init node_id=n7 post_fact=-1 EINVAL\n%s"
            "clpdaemon: hooks-a: shutdown\n",
            want_log);
   EXPECT(r.rc != 0);
@@ -206,7 +207,7 @@ static void test_errors(void) {
                  "");
   expect_failure(plugin("test_bad_noinit"), "descriptor has no init", "");
   expect_failure(plugin("test_fail_init"), "init failed",
-                 "clpdaemon: fail-init: init node_id=n7 post_fact=-1 ENOSYS\n");
+                 "clpdaemon: fail-init: init node_id=n7 post_fact=-1 EINVAL\n");
   /* The same path twice, and the same library under another path. */
   expect_failure(plugin("test_hooks_a"), "plugin path listed more than once", "");
   snprintf(abs_dup, sizeof abs_dup, "%s/./test_hooks_a.so", dir);
@@ -246,7 +247,7 @@ static void expect_loads(const char *name, const char *plugin_name) {
   EXPECT(strcmp(r.err, "") == 0);
   done(&r);
   snprintf(want, sizeof want,
-           "clpdaemon: %s: init node_id=n7 post_fact=-1 ENOSYS\n"
+           "clpdaemon: %s: init node_id=n7 post_fact=-1 EINVAL\n"
            "clpdaemon: %s: shutdown\n",
            plugin_name, plugin_name);
   if (strcmp(take_log(), want) != 0) {
@@ -286,18 +287,56 @@ static void test_undefined_symbols(void) {
   expect_failure(p, want, "");
 }
 
-/* T6b: post_fact from a thread other than the engine thread. */
+/* T6b, T7b: post_fact from a thread other than the engine thread queues
+ * the JSON; text that is not JSON (init's "(x)") is EINVAL and not queued.
+ * A fact rejected at drain is logged under the name of the plugin that
+ * posted it. */
 static void test_post_fact_thread(void) {
   const char *paths[1];
+  clpd_packages none = {NULL, 0};
   run r;
   paths[0] = plugin("test_thread");
   load(&r, paths, 1);
   EXPECT(r.rc == 0);
+  EXPECT(clpd_ingest_queue_length() == 1);
+  EXPECT(clpd_ingest_drain(r.env, &none, clpd_plugins_post_rejected, r.p) ==
+         0);
+  EXPECT(clpd_ingest_queue_length() == 0);
   done(&r);
   EXPECT(strcmp(take_log(),
-                "clpdaemon: thread: init node_id=n7 post_fact=-1 ENOSYS\n"
-                "clpdaemon: thread: thread post_fact=-1 ENOSYS\n"
+                "clpdaemon: thread: init node_id=n7 post_fact=-1 EINVAL\n"
+                "clpdaemon: thread: thread post_fact=0\n"
+                "clpdaemon: thread: post_fact rejected: template 'x' is not "
+                "ingestible\n"
                 "clpdaemon: thread: shutdown\n") == 0);
+}
+
+/* T7b: a full queue makes post_fact fail with EAGAIN, and leaves it full;
+ * a rejection names the posting plugin even with others loaded, and an
+ * origin outside every plugin is shown as '?'. */
+static void test_post_fact_full(void) {
+  const char *paths[2];
+  clpd_packages none = {NULL, 0};
+  size_t i;
+  run r;
+  for (i = 0; i < CLPD_INGEST_QUEUE_MAX - 1; i++)
+    if (clpd_ingest_post(NULL, "{}", 2) != 0) failures++;
+  paths[0] = plugin("test_hooks_a");
+  paths[1] = plugin("test_poster");
+  load(&r, paths, 2);
+  EXPECT(r.rc == 0);
+  EXPECT(clpd_ingest_queue_length() == CLPD_INGEST_QUEUE_MAX);
+  EXPECT(strcmp(take_log(),
+                "clpdaemon: hooks-a: init node_id=n7 post_fact=-1 EINVAL\n"
+                "clpdaemon: poster: init node_id=n7 post_fact=-1 EINVAL\n"
+                "clpdaemon: poster: posted 0 -1 EAGAIN\n") == 0);
+  clpd_ingest_clear();
+  clpd_ingest_post(NULL, "{}", 2);
+  clpd_ingest_drain(r.env, &none, clpd_plugins_post_rejected, r.p);
+  EXPECT(strcmp(take_log(), "clpdaemon: ?: post_fact rejected: missing key "
+                            "'template'\n") == 0);
+  done(&r);
+  take_log();
 }
 
 /* T6b: shutdown runs while the environment exists, the environment cleanup
@@ -328,7 +367,7 @@ static void test_unload_order(void) {
     fprintf(stderr, "FAIL unload order: [%s]\n", markers);
   }
   EXPECT(strcmp(take_log(),
-                "clpdaemon: markers: init node_id=n7 post_fact=-1 ENOSYS\n"
+                "clpdaemon: markers: init node_id=n7 post_fact=-1 EINVAL\n"
                 "clpdaemon: markers: shutdown\n") == 0);
 }
 
@@ -349,6 +388,7 @@ int main(void) {
   test_boundaries();
   test_undefined_symbols();
   test_post_fact_thread();
+  test_post_fact_full();
   test_unload_order();
   clpd_log_set(NULL);
   fclose(log_stream);

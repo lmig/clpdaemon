@@ -12,6 +12,7 @@ definition  = fibre-installation
 version     = v3
 files       = templates.clp, rules.clp, functions.clp
 lint_exempt = template:catalog, rule:load-catalog
+ingest      = order, payment
 ```
 
 | Key | Type | Default |
@@ -20,6 +21,7 @@ lint_exempt = template:catalog, rule:load-catalog
 | `version` | 1-64 characters from `[A-Za-z0-9._-]` | required |
 | `files` | non-empty list of paths relative to the package directory, loaded in order | required |
 | `lint_exempt` | list of `template:<name>` and `rule:<name>` excluded from the `wf-id` lint | empty |
+| `ingest` | list of deftemplate names of the package that facts from outside may assert ([`ingest.md`](ingest.md)) | empty |
 
 The package is identified as `definition@version` (for example `fibre-installation@v3`).
 
@@ -30,6 +32,7 @@ At startup (FR-2), after the configuration and the CLIPS environment, the daemon
 1. It reads the manifest and creates the module `(defmodule definition@version)`; package files must not declare a `defmodule` of their own.
 2. It loads `files` in order into that module. Loading a package stops at its first failed file.
 3. It runs the `wf-id` lint on the package (FR-7, see below).
+4. It checks the `ingest` list: every name must be a deftemplate of the package (not an implied one), and not listed by an earlier package.
 
 Every package is checked even when an earlier one failed, so one run reports all errors; any error makes the daemon exit 1. With `--check`, the daemon stops after loading and linting. Otherwise it calls `Reset` once and enters the event loop.
 
@@ -63,6 +66,7 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Empty `files` | `clpdaemon: <file>:<line>: files: expected at least one file` |
 | Absolute path in `files` | `clpdaemon: <file>:<line>: files: '<path>' must be relative to the package directory` |
 | Empty list item | `clpdaemon: <file>:<line>: <key>: empty list item` |
+| Name repeated in `ingest` | `clpdaemon: <file>:<line>: ingest: '<name>' listed more than once` |
 | Bad exemption | `clpdaemon: <file>:<line>: lint_exempt: expected template:<name> or rule:<name>, got '<item>'` |
 | Required key absent | `clpdaemon: <file>: missing required key '<key>'` |
 | Package file cannot be opened, or is a directory | `clpdaemon: <file>: cannot open: <system error>` (`Is a directory` for a directory) |
@@ -76,4 +80,7 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Rule without pretty-print form | `clpdaemon: <pkg>: lint: rule '<r>': cannot be checked without its pretty-print form` |
 | Different `wf-id` variables | `clpdaemon: <pkg>: lint: rule '<r>': pattern <n> (<template>) binds wf-id to ?<x>, expected ?<w> from pattern <m>` |
 
-Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order.
+| `ingest` names no deftemplate of the package | `clpdaemon: <pkg>: ingest names unknown template '<t>'` |
+| `ingest` names a template an earlier package lists | `clpdaemon: <pkg>: ingest names template '<t>', already listed by <first pkg>` |
+
+Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come last, in list order.

@@ -3,14 +3,16 @@
  * several times with a different HOOKS_NAME and these variants:
  * HOOKS_FAIL_INIT (init registers a CLIPS function and then fails),
  * HOOKS_BIG (the descriptor is larger than sizeof(clpd_plugin), as from a
- * later contract revision), HOOKS_THREAD (init also calls post_fact from
- * another thread) and HOOKS_MARKERS (shutdown, the CLIPS environment
+ * later contract revision), HOOKS_THREAD (init also posts a fact JSON from
+ * another thread), HOOKS_POST (init also posts a valid order fact and one
+ * with an unknown slot, see docs/ingest.md) and HOOKS_MARKERS (shutdown, the CLIPS environment
  * cleanup and the library destructor append a line each to the file named
  * by CLPD_TEST_MARKERS), HOOKS_SLEEPER (init starts a thread that lives
  * until shutdown) and HOOKS_SLOW (init sleeps 300 ms after its log line).
  * Every variant registers <name>-answer, which returns 42; every variant
  * except HOOKS_FAIL_INIT also registers <name>-throw, which calls
- * UDFThrowError. */
+ * UDFThrowError. Every variant first posts "(x)", which is not JSON, and
+ * logs post_fact's result (T7b). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "clpd_plugin.h"
@@ -92,11 +94,15 @@ typedef struct {
 static void *post_from_thread(void *arg) {
   post_result *r = arg;
   errno = 0;
-  r->rc = r->host->post_fact("(x)");
+  r->rc = r->host->post_fact("{\"template\":\"x\",\"slots\":{}}");
   r->err = errno;
   return NULL;
 }
 #endif
+
+static const char *errno_name(int e) {
+  return e == EINVAL ? " EINVAL" : e == EAGAIN ? " EAGAIN" : "";
+}
 
 static void answer(Environment *env, UDFContext *udf, UDFValue *out) {
   (void)udf;
@@ -116,7 +122,17 @@ static int hooks_init(const clpd_host *host, Environment *env, void **state) {
   errno = 0;
   rc = host->post_fact("(x)");
   host->log(SELF, "init node_id=%s post_fact=%d%s", host->node_id, rc,
-            errno == ENOSYS ? " ENOSYS" : "");
+            rc != 0 ? errno_name(errno) : "");
+#ifdef HOOKS_POST
+  {
+    int ok = host->post_fact(
+        "{\"template\":\"order\",\"slots\":{\"wf-id\":\"w1\",\"qty\":3,"
+        "\"tags\":[\"a\",{\"sym\":\"b\"}]}}");
+    int bad = host->post_fact(
+        "{\"template\":\"order\",\"slots\":{\"bogus\":1}}");
+    host->log(SELF, "posted %d %d%s", ok, bad, bad != 0 ? errno_name(errno) : "");
+  }
+#endif
 #ifdef HOOKS_SLOW
   {
     struct timespec pause = {0, 300000000L};
@@ -133,7 +149,7 @@ static int hooks_init(const clpd_host *host, Environment *env, void **state) {
         pthread_join(t, NULL) != 0)
       return -1;
     host->log(SELF, "thread post_fact=%d%s", r.rc,
-              r.err == ENOSYS ? " ENOSYS" : "");
+              r.rc != 0 ? errno_name(r.err) : "");
   }
 #endif
 #ifdef HOOKS_FAIL_INIT

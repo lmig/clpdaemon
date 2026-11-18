@@ -12,6 +12,9 @@ typedef struct {
   char *dir;
   clpd_manifest manifest;
   Defmodule *module; /* definition@version */
+  /* The deftemplates named by manifest.ingest, in the same order; NULL
+   * until the package loaded and its ingest list was checked. */
+  Deftemplate **ingest;
 } clpd_package;
 
 typedef struct {
@@ -20,7 +23,7 @@ typedef struct {
 } clpd_packages;
 
 /* Loads each package directory in order: manifest, generated defmodule,
- * files, wf-id lint. Errors are written to err, one line each; loading
+ * files, wf-id lint, ingest list. Errors are written to err, one line each; loading
  * continues with the next package so every error is reported. Leaves MAIN
  * as the current module. Returns 0 when every package loaded cleanly. */
 int clpd_packages_load(Environment *env, const clpd_list *dirs,
