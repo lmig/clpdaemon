@@ -57,3 +57,5 @@ build/src/clpdaemon --config <file> --check
 ```
 
 Command line, configuration keys, defaults and exact error messages: [`docs/configuration.md`](docs/configuration.md).
+
+C plugins (contract, lifecycle, building one): [`docs/plugins.md`](docs/plugins.md); the example plugin builds as `build/plugins/clpd_example.so`.

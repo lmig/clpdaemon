@@ -1,10 +1,15 @@
 #!/bin/sh
 # CLI and configuration tests for clpdaemon (T2, docs/configuration.md).
-# usage: cli_test.sh <path-to-clpdaemon>
+# usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>
+# <plugin-dir> holds the example and test plugins (<build>/plugins);
+# <plugin-desc-size> prints sizeof(clpd_plugin) of this build.
 set -u
 
-BIN=${1:?usage: cli_test.sh <path-to-clpdaemon>}
+BIN=${1:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}
+PLUGINS=${2:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}
+DESC_SIZE=$("${3:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}") || exit 2
 case $BIN in /*) ;; *) BIN=$PWD/$BIN ;; esac
+case $PLUGINS in /*) ;; *) PLUGINS=$PWD/$PLUGINS ;; esac
 WORK=$(mktemp -d)
 # A background child left by a case (ypid) is killed even on failure.
 trap 'if [ -s "$WORK/ypid" ]; then kill -KILL "$(cat "$WORK/ypid")" 2>/dev/null; fi; rm -rf "$WORK"' EXIT
@@ -74,8 +79,11 @@ trace_text               = full-trace.log
 trace_jsonl              =
 watch                    = rules
 packages                 = pkg
-plugins                  = /usr/lib/clpdaemon/clpd-orm.so, /usr/lib/clpdaemon/clpd-zmq.so'
-check "full valid file" 0 "clpdaemon: full.conf: configuration OK" "" -- --config full.conf --check
+plugins                  = '"$PLUGINS/clpd_example.so, $PLUGINS/test_hooks_a.so"
+check "full valid file" 0 "clpdaemon: full.conf: configuration OK" "clpdaemon: example: init
+clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: shutdown
+clpdaemon: example: shutdown" -- --config full.conf --check
 conf equal.conf 'node_id = n1
 tick_interval_ms = 1000
 cycle_min_interval_ms = 1000
@@ -563,6 +571,303 @@ clpdaemon: received SIGTERM, stopping"
 if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
   [ "$got" != "65535,65536,1" ] || [ "$last" != a ]; then
   fail "router line cap" "exit $rc, lines seen $ok, lengths [$got], last [$last], stderr [$(cat err.txt)]"
+fi
+
+# --- plugins (FR-17, FR-18, FR-19, L59) --------------------------------------
+# RUN bounds every case: a regression must not leave a daemon running.
+EX=$PLUGINS/clpd_example.so
+mkdir udfpkg
+conf udfpkg/package.conf 'definition = udf
+version = 1
+files = u.clp'
+conf udfpkg/u.clp '(deftemplate job (slot wf-id) (slot n))
+(deffacts jobs (job (wf-id w1) (n 2)) (job (wf-id w2) (n x)))
+(defrule add (job (wf-id ?w) (n ?n&:(integerp ?n))) => (printout t "sum " (clpd-example-add ?n 3) " " (clpd-example-greet ?w) crlf))
+(defrule bad ?j <- (job (wf-id ?w) (n ?n&:(symbolp ?n))) => (retract ?j) (bind ?x (clpd-example-add ?n 3)))'
+conf plugcheck.conf "node_id = n1
+plugins = $EX
+packages = udfpkg"
+RUN='timeout 10' check "check with a plugin and a package calling its functions" 0 \
+  "clpdaemon: plugcheck.conf: configuration OK" "clpdaemon: example: init
+clpdaemon: example: shutdown" -- --config plugcheck.conf --check
+conf nopluguse.conf 'node_id = n1
+packages = udfpkg'
+cases=$((cases + 1))
+timeout 10 "$BIN" --config nopluguse.conf --check >out.txt 2>err.txt
+rc=$?
+if [ "$rc" != 1 ] || [ -s out.txt ] || ! grep -qF 'clpdaemon: udf@1: clips: ' err.txt ||
+  ! grep -qF 'clpd-example-add' err.txt; then
+  fail "package calling a plugin function without the plugin" "exit $rc, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# plugerr <name> <plugins-value> <expected-stderr>: --check fails with exit 1.
+plugerr() {
+  conf plugerr.conf "node_id = n1
+plugins = $2"
+  RUN='timeout 10' check "$1" 1 "" "$3" -- --config plugerr.conf --check
+}
+plugerr "plugin path without a slash" "clpd_example.so" \
+  "clpdaemon: clpd_example.so: plugin path must contain a '/'"
+plugerr "plugin cannot be loaded" "./nope.so" \
+  "clpdaemon: ./nope.so: cannot load: ./nope.so: cannot open shared object file: No such file or directory"
+plugerr "plugin without clpd_plugin_get" "$PLUGINS/test_bad_nosym.so" \
+  "clpdaemon: $PLUGINS/test_bad_nosym.so: missing clpd_plugin_get"
+plugerr "clpd_plugin_get returns NULL" "$PLUGINS/test_bad_null.so" \
+  "clpdaemon: $PLUGINS/test_bad_null.so: clpd_plugin_get returned NULL"
+plugerr "plugin ABI mismatch" "$PLUGINS/test_bad_abi.so" \
+  "clpdaemon: $PLUGINS/test_bad_abi.so: ABI version 2, expected 1"
+plugerr "plugin descriptor too small" "$PLUGINS/test_bad_size.so" \
+  "clpdaemon: $PLUGINS/test_bad_size.so: descriptor size 8, expected at least $DESC_SIZE"
+# The daemon exports the CLIPS API only, not its clpd_* internals (T6b).
+plugerr "plugin using a daemon internal" "$PLUGINS/test_bad_internal.so" \
+  "clpdaemon: $PLUGINS/test_bad_internal.so: cannot load: $PLUGINS/test_bad_internal.so: undefined symbol: clpd_log"
+plugerr "invalid plugin name" "$PLUGINS/test_bad_name.so" \
+  "clpdaemon: $PLUGINS/test_bad_name.so: plugin name: expected 1-64 characters from [A-Za-z0-9._-], got 'bad name'"
+plugerr "plugin without init" "$PLUGINS/test_bad_noinit.so" \
+  "clpdaemon: $PLUGINS/test_bad_noinit.so: descriptor has no init"
+plugerr "same plugin path twice" "$EX, $EX" \
+  "clpdaemon: example: init
+clpdaemon: $EX: plugin path listed more than once
+clpdaemon: example: shutdown"
+plugerr "same plugin under another path" "$EX, $PLUGINS/./clpd_example.so" \
+  "clpdaemon: example: init
+clpdaemon: $PLUGINS/./clpd_example.so: plugin example is already loaded from $EX
+clpdaemon: example: shutdown"
+plugerr "failing init shuts down the others in reverse order" \
+  "$PLUGINS/test_hooks_a.so, $PLUGINS/test_hooks_b.so, $PLUGINS/test_fail_init.so, $EX" \
+  "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-b: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: fail-init: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: $PLUGINS/test_fail_init.so: init failed
+clpdaemon: hooks-b: shutdown
+clpdaemon: hooks-a: shutdown"
+conf plugpkg.conf "node_id = n1
+plugins = $EX
+packages = nopkg"
+RUN='timeout 10' check "package error after plugins shuts them down" 1 "" "clpdaemon: example: init
+clpdaemon: nopkg/package.conf: cannot open: No such file or directory
+clpdaemon: example: shutdown" -- --config plugpkg.conf
+# Teardown order (T6b): shutdown, the CLIPS environment, then dlclose.
+conf plugmark.conf "node_id = n1
+plugins = $PLUGINS/test_markers.so"
+export CLPD_TEST_MARKERS="$WORK/markers.txt"
+RUN='timeout 10' check "check unloads after the environment" 0 \
+  "clpdaemon: plugmark.conf: configuration OK" "clpdaemon: markers: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: markers: shutdown" -- --config plugmark.conf --check
+unset CLPD_TEST_MARKERS
+cases=$((cases + 1))
+if [ "$(cat markers.txt 2>/dev/null)" != "shutdown${NL}env-cleanup${NL}destructor" ]; then
+  fail "unload order shutdown, env cleanup, destructor" "markers [$(cat markers.txt 2>/dev/null)]"
+fi
+conf plugabi.conf "node_id = n1
+plugins = $PLUGINS/test_bad_abi.so"
+RUN='timeout 10' check "plugin error aborts a run too" 1 "" \
+  "clpdaemon: $PLUGINS/test_bad_abi.so: ABI version 2, expected 1" -- --config plugabi.conf
+
+# plugdaemon <name> <conf> <line> <expected-stderr>: starts the daemon, waits
+# for "running" and then for <line> on stderr, stops it with SIGTERM and
+# expects exit 0, empty stdout and the exact stderr.
+plugdaemon() {
+  cases=$((cases + 1))
+  "$BIN" --config "$2" >out.txt 2>err.txt &
+  pid=$!
+  ok=1
+  wait_line err.txt "clpdaemon: n1: running" || ok=0
+  wait_line err.txt "$3" || ok=0
+  kill -TERM "$pid"
+  wait_exit "$pid"
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$4" ]; then
+    fail "$1" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+}
+conf plugrun.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $EX
+packages = udfpkg
+trace_text = plug.log"
+plugdaemon "running daemon calls the plugin hooks" plugrun.conf \
+  "clpdaemon: example: cycle_end 2 ok=1" "clpdaemon: example: init
+clpdaemon: example: after_load
+clpdaemon: n1: running
+clpdaemon: example: cycle_begin 1
+clpdaemon: example: cycle_end 1 ok=0
+clpdaemon: example: cycle_end 2 ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: example: shutdown"
+cases=$((cases + 1))
+if ! grep -q ' n1 w1 STDOUT sum 5 hello, w1$' plug.log ||
+  ! grep -qF 'clpd-example-add' plug.log; then
+  fail "rules call the plugin functions" "trace [$(cat plug.log)]"
+fi
+conf plugorder.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_hooks_a.so, $PLUGINS/test_hooks_b.so"
+plugdaemon "hooks in configured order, shutdown in reverse" plugorder.conf \
+  "clpdaemon: hooks-b: cycle_end ok=1" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-b: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: hooks-b: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+clpdaemon: hooks-b: cycle_begin
+clpdaemon: hooks-a: cycle_end ok=1
+clpdaemon: hooks-b: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-b: shutdown
+clpdaemon: hooks-a: shutdown"
+
+# cycle_end ok (T6b, L59): 0 only when Run stopped on a CLIPS evaluation
+# error; a Run cut by max_rules_per_cycle or halted by SIGTERM is ok.
+mkdir throwpkg looppkg
+conf throwpkg/package.conf 'definition = throw
+version = 1
+files = t.clp'
+conf throwpkg/t.clp '(deftemplate job (slot wf-id))
+(deffacts jobs (job (wf-id w1)))
+(defrule boom (job (wf-id ?w)) => (hooks-a-throw))'
+conf looppkg/package.conf 'definition = loop
+version = 1
+files = l.clp'
+conf looppkg/l.clp '(deftemplate counter (slot wf-id) (slot n))
+(deffacts seed (counter (wf-id c1) (n 0)))
+(defrule step ?c <- (counter (wf-id ?w) (n ?n)) => (modify ?c (n (+ ?n 1))))'
+conf plugthrow.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_hooks_a.so
+packages = throwpkg"
+plugdaemon "cycle_end ok=0 after UDFThrowError" plugthrow.conf \
+  "clpdaemon: hooks-a: cycle_end ok=0" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+[PRCCODE4] Execution halted during the actions of defrule 'boom'.
+clpdaemon: hooks-a: cycle_end ok=0
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+conf pluglimit.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+max_rules_per_cycle = 1
+plugins = $PLUGINS/test_hooks_a.so
+packages = looppkg"
+plugdaemon "cycle_end ok=1 for a Run cut by max_rules_per_cycle" pluglimit.conf \
+  "clpdaemon: hooks-a: cycle_end ok=1" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+clpdaemon: hooks-a: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+# Without a rule limit the first Run never ends by itself: only SIGTERM
+# halts it (the default max_rules_per_cycle would end it first).
+conf plugterm.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+max_rules_per_cycle = -1
+plugins = $PLUGINS/test_hooks_a.so
+packages = looppkg"
+plugdaemon "cycle_end ok=1 for a Run halted by SIGTERM" plugterm.conf \
+  "clpdaemon: hooks-a: cycle_begin" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+clpdaemon: hooks-a: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+
+# T6c: the stop signals are blocked before the plugins load. A thread a
+# plugin starts in init inherits that mask, so SIGTERM still reaches the
+# signalfd and the daemon stops gracefully instead of taking the default
+# action (exit 143) on that thread.
+conf plugsleeper.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_sleeper.so"
+plugdaemon "SIGTERM with a plugin thread stops gracefully" plugsleeper.conf \
+  "clpdaemon: sleeper: cycle_end ok=1" "clpdaemon: sleeper: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: sleeper: after_load
+clpdaemon: n1: running
+clpdaemon: sleeper: cycle_begin
+clpdaemon: sleeper: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: sleeper: shutdown"
+# A SIGTERM during plugin init is held until the loop starts, which stops
+# before any cycle.
+conf plugslow.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_slow.so"
+cases=$((cases + 1))
+"$BIN" --config plugslow.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: slow: after_load
+clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping
+clpdaemon: slow: shutdown"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "SIGTERM during plugin init stops gracefully after startup" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+# A SIGHUP during plugin init is handled once the loop starts, which keeps
+# running; a later SIGINT stops it.
+cases=$((cases + 1))
+"$BIN" --config plugslow.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+kill -HUP "$pid"
+wait_line err.txt "clpdaemon: received SIGHUP, reopening trace files" || ok=0
+wait_line err.txt "clpdaemon: slow: cycle_end ok=1" || ok=0
+kill -INT "$pid"
+wait_exit "$pid"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] ||
+  ! grep -qxF "clpdaemon: received SIGINT, stopping" err.txt ||
+  [ "$(tail -n 1 err.txt)" != "clpdaemon: slow: shutdown" ]; then
+  fail "SIGHUP during plugin init reopens and keeps running" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+# A SIGTERM during package loading is held as well.
+mkdir slowpkg
+conf slowpkg/package.conf 'definition = slowpkg
+version = 1
+files = s.clp'
+conf slowpkg/s.clp '(defglobal ?*z* = (system "sleep 0.6"))'
+conf plugslowpkg.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_hooks_a.so
+packages = slowpkg"
+cases=$((cases + 1))
+"$BIN" --config plugslowpkg.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "SIGTERM during package loading stops gracefully after startup" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+# --check never runs the loop and keeps the default SIGTERM action.
+cases=$((cases + 1))
+"$BIN" --config plugslow.conf --check >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: slow: init node_id=n1 post_fact=-1 ENOSYS" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+if [ "$ok" != 1 ] || [ "$rc" != 143 ]; then
+  fail "--check keeps the default SIGTERM action" "exit $rc, lines seen $ok, stderr [$(cat err.txt)]"
 fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
