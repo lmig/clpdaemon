@@ -77,9 +77,12 @@ static void test_schedule_and_stop(void) {
   EXPECT(clpd_loop_run(loop, on_cycle, &p) == SIGTERM);
   EXPECT(p.cycles == 4);
   EXPECT(p.at[0] - t0 < 300);
-  EXPECT(p.at[1] - p.at[0] >= 15 && p.at[1] - p.at[0] < 300);
-  EXPECT(p.at[2] - p.at[1] >= 400 && p.at[2] - p.at[1] < 1000);
-  EXPECT(p.at[3] - p.at[2] >= 400 && p.at[3] - p.at[2] < 1000);
+  /* Lower bounds allow 1 ms: the loop truncates its cycle start to whole
+   * milliseconds before the callback takes its own (possibly later)
+   * timestamp, so a correct interval can measure 1 ms short here. */
+  EXPECT(p.at[1] - p.at[0] >= 15 - 1 && p.at[1] - p.at[0] < 300);
+  EXPECT(p.at[2] - p.at[1] >= 400 - 1 && p.at[2] - p.at[1] < 1000);
+  EXPECT(p.at[3] - p.at[2] >= 400 - 1 && p.at[3] - p.at[2] < 1000);
   clpd_loop_close(loop);
 }
 
@@ -134,7 +137,7 @@ static void test_overrun_no_burst(void) {
   EXPECT(clpd_loop_run(loop, on_cycle, &p) == SIGTERM);
   EXPECT(p.cycles == 4);
   EXPECT(p.at[2] - p.at[1] >= 400 && p.at[2] - p.at[1] < 550);
-  EXPECT(p.at[3] - p.at[2] >= 300);
+  EXPECT(p.at[3] - p.at[2] >= 300 - 1); /* 1 ms skew, see above */
   clpd_loop_close(loop);
 }
 
