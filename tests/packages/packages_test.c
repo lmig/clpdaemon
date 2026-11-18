@@ -75,7 +75,8 @@ static void test_two_packages_focus(void) {
   write_file(a, "r.clp", "(deftemplate seen (slot wf-id))\n"
                          "(defrule ra (ev (wf-id ?w)) => (assert (seen (wf-id ?w))))\n");
   b = package("b", "definition = beta\nversion = v2\nfiles = all.clp\n");
-  write_file(b, "all.clp", tmpl);
+  write_file(b, "all.clp", "(deftemplate ev (slot wf-id))\n"
+                           "(defrule rb (ev (wf-id ?w)) => (assert (ev (wf-id done))))\n");
   dirs[0] = a;
   dirs[1] = b;
   load(&r, dirs, 2);
@@ -90,10 +91,14 @@ static void test_two_packages_focus(void) {
   SetCurrentModule(r.env, FindDefmodule(r.env, "alpha@v1"));
   EXPECT(AssertString(r.env, "(ev (wf-id w1))") != NULL);
   SetCurrentModule(r.env, FindDefmodule(r.env, "MAIN"));
+  SetCurrentModule(r.env, FindDefmodule(r.env, "beta@v2"));
+  EXPECT(AssertString(r.env, "(ev (wf-id w2))") != NULL);
+  SetCurrentModule(r.env, FindDefmodule(r.env, "MAIN"));
   EXPECT(Run(r.env, -1) == 0); /* MAIN has no rules: nothing fires */
   clpd_packages_focus(r.env, &r.pkgs);
   EXPECT(GetFocus(r.env) == FindDefmodule(r.env, "alpha@v1"));
-  EXPECT(Run(r.env, -1) == 1);
+  /* One Run fires ra (alpha), then rb twice (beta: w2, then done). */
+  EXPECT(Run(r.env, -1) == 3);
   clpd_packages_focus(r.env, &r.pkgs); /* repeated focus does not pile up */
   EXPECT(Run(r.env, -1) == 0);
   EXPECT(GetFocus(r.env) == NULL || GetFocus(r.env) == FindDefmodule(r.env, "MAIN"));
@@ -145,6 +150,22 @@ static void test_clips_error_is_forwarded(void) {
          strcmp(r.err + strlen(r.err) - strlen(tail), tail) == 0);
   EXPECT(strstr(r.err, "\nclpdaemon: syn@1: clips: \n") == NULL); /* no blank lines */
   EXPECT(strstr(r.err, "never.clp") == NULL);
+  done(&r);
+}
+
+/* A directory named in files is not a loadable file. */
+static void test_directory_in_files(void) {
+  const char *dirs[1];
+  char want[512], sub[300];
+  run r;
+  const char *a = package("dirf", "definition = dirf\nversion = 1\nfiles = sub\n");
+  snprintf(sub, sizeof sub, "%s/sub", a);
+  mkdir(sub, 0700);
+  dirs[0] = a;
+  load(&r, dirs, 1);
+  snprintf(want, sizeof want, "clpdaemon: %s/sub: cannot open: Is a directory\n", a);
+  EXPECT(r.rc != 0);
+  EXPECT(strcmp(r.err, want) == 0);
   done(&r);
 }
 
@@ -206,6 +227,7 @@ int main(void) {
   test_no_packages();
   test_missing_file_and_next_package();
   test_clips_error_is_forwarded();
+  test_directory_in_files();
   test_defmodule_rejected();
   test_duplicate_package();
   test_manifest_error();

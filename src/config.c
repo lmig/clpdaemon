@@ -32,6 +32,8 @@ enum {
   KEY_COUNT
 };
 
+/* key_names and key_kinds are indexed by the KEY_* enum above: keep the
+ * three in the same order. */
 static const char *const key_names[KEY_COUNT] = {
     "node_id",          "tick_interval_ms",        "cycle_min_interval_ms",
     "max_rules_per_cycle", "safety_poll_interval_ms", "idle_eviction_after",

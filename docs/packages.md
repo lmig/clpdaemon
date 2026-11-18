@@ -49,7 +49,7 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Empty list item | `clpdaemon: <file>:<line>: <key>: empty list item` |
 | Bad exemption | `clpdaemon: <file>:<line>: lint_exempt: expected template:<name> or rule:<name>, got '<item>'` |
 | Required key absent | `clpdaemon: <file>: missing required key '<key>'` |
-| Package file cannot be opened | `clpdaemon: <file>: cannot open: <system error>` |
+| Package file cannot be opened, or is a directory | `clpdaemon: <file>: cannot open: <system error>` (`Is a directory` for a directory) |
 | CLIPS error or warning while loading | `clpdaemon: <definition@version>: clips: <CLIPS message line>`, one line per non-blank line CLIPS writes (CLIPS names the file and line) |
 | Package file failed to load | `clpdaemon: <file>: load failed`, after the CLIPS lines |
 | `defmodule` in a package file | `clpdaemon: <file>: defmodule is not allowed in package files` |

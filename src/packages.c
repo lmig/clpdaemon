@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define CAPTURE_ROUTER "clpd-load-capture"
 
@@ -73,10 +74,18 @@ static int load_file(Environment *env, clpd_package *pkg, const char *file,
   capture cap = {NULL, 0, 0};
   size_t modules = module_count(env);
   LoadError rc;
+  struct stat st;
   FILE *probe = fopen(file, "r");
 
+  /* Load reports nothing for a file it cannot open, and fopen succeeds on a
+   * directory, which Load would then read as an empty file. */
   if (probe == NULL) {
     fprintf(err, "clpdaemon: %s: cannot open: %s\n", file, strerror(errno));
+    return 1;
+  }
+  if (fstat(fileno(probe), &st) == 0 && S_ISDIR(st.st_mode)) {
+    fclose(probe);
+    fprintf(err, "clpdaemon: %s: cannot open: %s\n", file, strerror(EISDIR));
     return 1;
   }
   fclose(probe);
@@ -93,6 +102,8 @@ static int load_file(Environment *env, clpd_package *pkg, const char *file,
     fprintf(err, "clpdaemon: %s: load failed\n", file);
     return 1;
   }
+  /* Building a defmodule makes it the current module; a file that defines
+   * one and switches back would still grow the module count. */
   if (GetCurrentModule(env) != pkg->module || module_count(env) != modules) {
     fprintf(err, "clpdaemon: %s: defmodule is not allowed in package files\n",
             file);
