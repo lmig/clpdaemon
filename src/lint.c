@@ -97,7 +97,9 @@ static int name_in(const char *name, size_t len, const char *const *names,
 }
 
 /* Length of the single-field variable name at the start of atom `t`
- * ("?name", optionally followed by '&', '|' constraints), 0 if none. */
+ * ("?name", optionally followed by '&' constraints), 0 if none. An
+ * or-constraint ('|') is rejected by the caller: it also matches the other
+ * alternative, which may belong to another workflow instance. */
 static size_t variable_name_len(token t) {
   size_t n = 1;
   if (t.kind != TOK_ATOM || t.len < 2 || t.text[0] != '?') return 0;
@@ -108,16 +110,35 @@ static size_t variable_name_len(token t) {
   return n - 1;
 }
 
+static int has_or(token t) {
+  return t.kind == TOK_ATOM && memchr(t.text, '|', t.len) != NULL;
+}
+
+/* Consumes the rest of a slot (its opening parenthesis and name consumed)
+ * and returns 1 when an atom at the slot's own level contains '|'. */
+static int skip_slot_rest(reader *r) {
+  int depth = 1, or_seen = 0;
+  while (depth > 0) {
+    token t = next_token(r);
+    if (t.kind == TOK_END) break;
+    if (t.kind == TOK_OPEN) depth++;
+    if (t.kind == TOK_CLOSE) depth--;
+    if (depth == 1 && has_or(t)) or_seen = 1;
+  }
+  return or_seen;
+}
+
 /* Reads the rest of a pattern whose head atom is `head` (the opening
  * parenthesis and the head are consumed) and checks its wf-id slot. */
 static void check_pattern(reader *r, rule_ctx *c, token head) {
   const char *name = head.text;
   size_t name_len = head.len;
   const char *q;
-  int found = 0;
+  int found = 0, or_seen = 0;
   token value;
   size_t var_len = 0;
 
+  /* Defensive: CLIPS rejects module-qualified pattern heads today. */
   for (q = head.text; q + 1 < head.text + head.len; q++)
     if (q[0] == ':' && q[1] == ':') {
       name = q + 2;
@@ -132,11 +153,15 @@ static void check_pattern(reader *r, rule_ctx *c, token head) {
     if (t.kind == TOK_END || t.kind == TOK_CLOSE) break;
     if (t.kind != TOK_OPEN) continue;
     t = next_token(r);
-    if (!found && atom_is(t, "wf-id")) {
+    if (!found && atom_is(t, "wf-id")) { /* only the first wf-id slot */
       found = 1;
       value = next_token(r);
       if (value.kind == TOK_CLOSE) continue;
-      skip_list(r, value.kind == TOK_OPEN ? 2 : 1);
+      if (value.kind == TOK_OPEN) {
+        skip_list(r, 2);
+      } else {
+        or_seen = has_or(value) | skip_slot_rest(r);
+      }
     } else if (t.kind == TOK_OPEN) {
       skip_list(r, 2);
     } else if (t.kind != TOK_CLOSE && t.kind != TOK_END) {
@@ -147,7 +172,7 @@ static void check_pattern(reader *r, rule_ctx *c, token head) {
   if (c->exempt != NULL && name_in(name, name_len, c->exempt->templates,
                                    c->exempt->template_count))
     return;
-  if (found) var_len = variable_name_len(value);
+  if (found && !or_seen) var_len = variable_name_len(value);
   if (var_len == 0) {
     fprintf(c->err,
             LINT_PREFIX
@@ -249,6 +274,9 @@ int clpd_lint_package(Environment *env, Defmodule *module, const char *pkg_name,
   int errors = 0;
   size_t i;
 
+  /* The current module scopes GetNextDeftemplate and GetNextDefrule (also in
+   * template_exists and rule_exists) to the package: constructs of other
+   * modules are neither linted nor valid exemptions. */
   SetCurrentModule(env, module);
 
   if (exempt != NULL) {
@@ -286,7 +314,13 @@ int clpd_lint_package(Environment *env, Defmodule *module, const char *pkg_name,
     if (exempt != NULL &&
         name_in(name, strlen(name), exempt->rules, exempt->rule_count))
       continue;
-    if (pp != NULL) errors += lint_rule(pkg_name, name, pp, exempt, err);
+    if (pp == NULL) { /* for example conserve-mem: fail closed */
+      fprintf(err, LINT_PREFIX "rule '%s': cannot be checked without its "
+                               "pretty-print form\n", pkg_name, name);
+      errors++;
+      continue;
+    }
+    errors += lint_rule(pkg_name, name, pp, exempt, err);
   }
 
   SetCurrentModule(env, saved);

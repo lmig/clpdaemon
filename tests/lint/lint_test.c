@@ -21,6 +21,9 @@ static const char *const base_templates[] = {
  * the package module with the base templates and `constructs`, makes MAIN
  * current, lints the package and checks the full error text, the return
  * value and that MAIN is still the current module. */
+/* When set, constructs are built with conserve-mem on (no pretty-print). */
+static int conserve_memory;
+
 static void check(const char *name, const char *const *constructs,
                   const clpd_lint_exempt *exempt, int want_count,
                   const char *want_err) {
@@ -40,6 +43,7 @@ static void check(const char *name, const char *const *constructs,
   EXPECT(Build(env, "(defmodule " PKG ")") == BE_NO_ERROR);
   for (i = 0; base_templates[i] != NULL; i++)
     EXPECT(Build(env, base_templates[i]) == BE_NO_ERROR);
+  if (conserve_memory) SetConserveMemory(env, true);
   for (i = 0; constructs[i] != NULL; i++) {
     BuildError be = Build(env, constructs[i]);
     if (be != BE_NO_ERROR)
@@ -165,9 +169,29 @@ static void test_expected_from_first_checked_pattern(void) {
 static void test_constraints_after_variable(void) {
   static const char *const c[] = {
       "(defrule r (order (wf-id ?w&:(neq ?w x))) (item (wf-id ?w&~y)) "
-      "(order (wf-id ?w|z) (id \"a\\\"(b\")) =>)",
+      "(order (wf-id ?w&~z) (id \"a\\\"(b\")) =>)",
       NULL};
   check("constraints", c, &no_exempt, 0, "");
+}
+
+/* An or-constraint also matches the other alternative, which may be another
+ * workflow instance, so it does not bind wf-id (FR-7). */
+static void test_or_constraint_is_not_a_join(void) {
+  static const char *const c[] = {
+      "(defrule r (order (wf-id ?w)) (item (wf-id ?w|z)) (item (wf-id ?w&:(neq ?w q)|z)) =>)",
+      NULL};
+  check("or-constraint", c, &no_exempt, 2,
+        PFX "rule 'r': pattern 2 (item) does not bind wf-id to a variable\n"
+        PFX "rule 'r': pattern 3 (item) does not bind wf-id to a variable\n");
+}
+
+/* Without its pretty-print form a rule cannot be checked: fail closed. */
+static void test_rule_without_pp_form(void) {
+  static const char *const c[] = {"(defrule r (order (wf-id 1)) =>)", NULL};
+  conserve_memory = 1;
+  check("no-ppform", c, &no_exempt, 1,
+        PFX "rule 'r': cannot be checked without its pretty-print form\n");
+  conserve_memory = 0;
 }
 
 static void test_nesting_and_numbering(void) {
@@ -263,6 +287,8 @@ int main(void) {
   test_mismatched_variables();
   test_expected_from_first_checked_pattern();
   test_constraints_after_variable();
+  test_or_constraint_is_not_a_join();
+  test_rule_without_pp_form();
   test_nesting_and_numbering();
   test_test_and_declare_skipped();
   test_exempt_rule();

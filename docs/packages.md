@@ -44,7 +44,8 @@ Every deftemplate of a package must have a `wf-id` slot, and every rule must bin
 ```
 
 - Patterns are numbered from 1 in textual order, including those inside `not`, `exists`, `and`, `or`, `forall` and `logical`; `test` and `declare` are not patterns.
-- A slot value counts as a variable when it starts with a single-field `?name`; constraints may follow (`?w&:(neq ?w x)`, `?w|?v`). A constant, `$?w`, `?` or a missing slot does not.
+- A slot value counts as a variable when it starts with a single-field `?name`; `&` constraints may follow (`?w&:(neq ?w x)`, `?w&~closed`). A constant, `$?w`, `?`, a missing slot, or any or-constraint (`?w|z`: it also matches the other alternative, which may be another instance) does not. Only the first `wf-id` slot of a pattern is checked.
+- A rule without its pretty-print form (for example with `conserve-mem` on) cannot be checked and is an error.
 - The first checked pattern of a rule sets the expected variable.
 - `lint_exempt` names templates (for example reference data shared by all instances) and rules to skip; patterns on an exempt template are not checked. Naming a construct the package does not define is an error.
 
@@ -72,6 +73,7 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Exemption names an unknown construct | `clpdaemon: <pkg>: lint: lint_exempt names unknown template '<t>'` (or `unknown rule '<r>'`) |
 | Template without `wf-id` | `clpdaemon: <pkg>: lint: template '<t>' has no wf-id slot` |
 | Pattern without a `wf-id` variable | `clpdaemon: <pkg>: lint: rule '<r>': pattern <n> (<template>) does not bind wf-id to a variable` |
+| Rule without pretty-print form | `clpdaemon: <pkg>: lint: rule '<r>': cannot be checked without its pretty-print form` |
 | Different `wf-id` variables | `clpdaemon: <pkg>: lint: rule '<r>': pattern <n> (<template>) binds wf-id to ?<x>, expected ?<w> from pattern <m>` |
 
 Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order.
