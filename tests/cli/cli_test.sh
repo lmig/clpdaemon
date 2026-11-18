@@ -309,30 +309,102 @@ cases=$((cases + 1))
 [ -f tr.log ] && [ ! -s tr.log ] && [ -f tr.jsonl ] && [ ! -s tr.jsonl ] ||
   fail "check creates empty trace files" "$(ls -l tr.log tr.jsonl 2>&1)"
 
-# SIGHUP after rotation: the moved text file is recreated; the JSONL file,
-# whose directory is gone, keeps its old stream and the failure is reported.
-mkdir rot gone
+# wait_has <file> <text>: waits up to 5 s for <text> anywhere in <file>.
+wait_has() {
+  n=0
+  while ! grep -qF "$2" "$1" 2>/dev/null; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && return 1
+    sleep 0.05
+  done
+}
+
+# size <file>: byte size, 0 when missing.
+size() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
+
+# wait_grows <file> <bytes>: waits up to 5 s for <file> to exceed <bytes>.
+wait_grows() {
+  n=0
+  while [ "$(size "$1")" -le "$2" ]; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && return 1
+    sleep 0.05
+  done
+}
+
+# The engine is traced from Reset on (T5b): the deffacts assert, then the
+# firing of rule start and its modify as one event. Timestamps are stripped.
+conf trpkg.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = pkg
+trace_text = run.log
+trace_jsonl = run.jsonl'
+cases=$((cases + 1))
+"$BIN" --config trpkg.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has run.jsonl '"event":"modify"' || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want_text="n1 w1 FACT+ f-1 (order (wf-id w1) (status new))
+n1 w1 FIRE fibre-installation@v3::start f-1
+n1 w1 FACT~ f-1 (order (wf-id w1) (status started))"
+want_jsonl='{"node_id":"n1","wf_id":"w1","event":"assert","fact":1,"template":"order","text":"(order (wf-id w1) (status new))"}
+{"node_id":"n1","wf_id":"w1","event":"fire","module":"fibre-installation@v3","rule":"start","facts":[1]}
+{"node_id":"n1","wf_id":"w1","event":"modify","fact":1,"template":"order","text":"(order (wf-id w1) (status started))"}'
+got_text=$(cut -d' ' -f2- run.log)
+got_jsonl=$(sed 's/"ts":"[^"]*",//' run.jsonl)
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  [ "$got_text" != "$want_text" ] || [ "$got_jsonl" != "$want_jsonl" ]; then
+  fail "trace of Reset and a rule firing" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]
+  text [$got_text]
+  jsonl [$got_jsonl]"
+fi
+
+# SIGHUP after rotation: the moved text file is recreated and receives the
+# next lines; the JSONL file, whose directory was moved away, cannot be
+# reopened, so its old stream (now jdir.1/t.jsonl) keeps receiving lines and
+# the failure is reported. A rule firing once per cycle keeps both busy.
+mkdir rot jdir tick
+conf tick/package.conf 'definition = tick
+version = 1
+files = t.clp'
+conf tick/t.clp '(deftemplate counter (slot wf-id) (slot n))
+(defrule step ?c <- (counter (wf-id ?w) (n ?n)) => (modify ?c (n (+ ?n 1))))
+(deffacts seed (counter (wf-id c1) (n 0)))'
 conf trhup.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
+max_rules_per_cycle = 1
+packages = tick
 trace_text = rot/t.log
-trace_jsonl = gone/t.jsonl'
+trace_jsonl = jdir/t.jsonl'
 cases=$((cases + 1))
 "$BIN" --config trhup.conf >out.txt 2>err.txt &
 pid=$!
 ok=1
 wait_line err.txt "clpdaemon: n1: running" || ok=0
-mv rot/t.log rot/t.log.1 && rm -r gone
+wait_has rot/t.log 'FACT~' || ok=0
+mv rot/t.log rot/t.log.1 && mv jdir jdir.1
 kill -HUP "$pid"
-wait_line err.txt "clpdaemon: gone/t.jsonl: cannot reopen: No such file or directory" || ok=0
+wait_line err.txt "clpdaemon: jdir/t.jsonl: cannot reopen: No such file or directory" || ok=0
+before=$(size jdir.1/t.jsonl)
+wait_grows rot/t.log 0 || ok=0
+wait_grows jdir.1/t.jsonl "$before" || ok=0
 kill -TERM "$pid"
 wait_exit "$pid"
 want="clpdaemon: n1: running
 clpdaemon: received SIGHUP, reopening trace files
-clpdaemon: gone/t.jsonl: cannot reopen: No such file or directory
+clpdaemon: jdir/t.jsonl: cannot reopen: No such file or directory
 clpdaemon: received SIGTERM, stopping"
-if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat err.txt)" != "$want" ] || [ ! -f rot/t.log ]; then
-  fail "SIGHUP reopens the trace files" "exit $rc, lines seen $ok, stderr [$(cat err.txt)], files [$(ls rot)]"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  ! grep -q 'FIRE tick@1::step f-1' rot/t.log || ! grep -q 'FIRE tick@1::step f-1' rot/t.log.1 ||
+  [ -e jdir ]; then
+  fail "SIGHUP reopens the trace files" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)], files [$(ls -l rot jdir.1)]"
 fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"

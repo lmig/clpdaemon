@@ -1,5 +1,6 @@
 /* clpdaemon entry point: command line, configuration (T2) and the event
  * loop running engine cycles (T3). */
+#include "clips_trace.h"
 #include "config.h"
 #include "engine.h"
 #include "loop.h"
@@ -25,22 +26,26 @@ static int usage_error(const char *fmt, const char *arg) {
 typedef struct {
   clpd_engine *engine;
   const clpd_packages *packages;
+  clpd_clips_trace *ct;
   int max_rules;
 } cycle_ctx;
 
-/* One cycle: focus every package module, then Run with the rule limit. A
- * halt on a stop signal is left to the loop, which reads the signal next. */
+/* One cycle: focus every package module, then Run with the rule limit and
+ * write the partial output lines the cycle left. A halt on a stop signal is
+ * left to the loop, which reads the signal next. */
 static void run_cycle(void *ctx) {
   cycle_ctx *c = ctx;
   clpd_packages_focus(clpd_engine_env(c->engine), c->packages);
   clpd_engine_run_cycle(c->engine, c->max_rules);
+  clpd_clips_trace_flush(c->ct);
 }
 
 static void reopen_trace(void *trace) { clpd_trace_reopen(trace, stderr); }
 
 /* Runs engine cycles until a stop signal. Returns the exit code. */
 static int serve(const clpd_config *cfg, clpd_engine *engine,
-                 const clpd_packages *packages, clpd_trace *trace) {
+                 const clpd_packages *packages, clpd_trace *trace,
+                 clpd_clips_trace *ct) {
   cycle_ctx ctx;
   clpd_loop *loop;
   int sig;
@@ -55,6 +60,7 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   clpd_loop_on_hup(loop, reopen_trace, trace);
   ctx.engine = engine;
   ctx.packages = packages;
+  ctx.ct = ct;
   ctx.max_rules = cfg->max_rules_per_cycle;
   fprintf(stderr, "clpdaemon: %s: running\n", cfg->node_id);
   sig = clpd_loop_run(loop, run_cycle, &ctx);
@@ -68,11 +74,14 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
 }
 
 /* Startup after the configuration (FR-2): trace files, environment, rule
- * packages, then either the --check report or Reset once and the event
- * loop. --check opens the trace files too, so it reports paths the daemon
- * could not write. */
+ * packages, then either the --check report or the trace hooks, Reset once
+ * and the event loop. --check opens the trace files too, so it reports paths
+ * the daemon could not write. The hooks come after loading, so package load
+ * diagnostics keep going to stderr, and before Reset, so the facts Reset
+ * asserts are traced. */
 static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_packages packages;
+  clpd_clips_trace *ct = NULL;
   clpd_engine *engine;
   clpd_trace *trace;
   int rc;
@@ -92,10 +101,17 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     rc = 1;
   } else if (check) {
     printf("clpdaemon: %s: configuration OK\n", config_path);
+  } else if (clpd_clips_trace_attach(clpd_engine_env(engine), trace,
+                                     cfg->watch_facts, cfg->watch_rules,
+                                     &ct) != 0) {
+    fputs("clpdaemon: cannot attach the trace to the CLIPS environment\n",
+          stderr);
+    rc = 1;
   } else {
     Reset(clpd_engine_env(engine));
-    rc = serve(cfg, engine, &packages, trace);
+    rc = serve(cfg, engine, &packages, trace, ct);
   }
+  clpd_clips_trace_detach(ct);
   clpd_packages_free(&packages);
   clpd_engine_destroy(engine);
   clpd_trace_close(trace);

@@ -43,7 +43,7 @@ One `key = value` per line; lines may end in LF or CRLF, and spaces and tabs cou
 | `admin_socket` | path | `/run/clpdaemon/admin.sock` |
 | `trace_text` | path, empty = disabled ([`trace.md`](trace.md)) | empty |
 | `trace_jsonl` | path, empty = disabled ([`trace.md`](trace.md)) | empty |
-| `watch` | list of `facts`, `rules` (may be empty) | `facts,rules` |
+| `watch` | list of `facts`, `rules` (may be empty): trace events written ([`trace.md`](trace.md#event-sources)) | `facts,rules` |
 | `packages` | list of paths | empty |
 | `plugins` | list of paths | empty |
 
