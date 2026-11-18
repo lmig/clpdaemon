@@ -3,6 +3,7 @@
 #include "config.h"
 #include "engine.h"
 #include "loop.h"
+#include "packages.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -22,16 +23,21 @@ static int usage_error(const char *fmt, const char *arg) {
 
 typedef struct {
   clpd_engine *engine;
+  const clpd_packages *packages;
   int max_rules;
 } cycle_ctx;
 
+/* One cycle: focus every package module, then Run with the rule limit. A
+ * halt on a stop signal is left to the loop, which reads the signal next. */
 static void run_cycle(void *ctx) {
   cycle_ctx *c = ctx;
+  clpd_packages_focus(clpd_engine_env(c->engine), c->packages);
   clpd_engine_run_cycle(c->engine, c->max_rules);
 }
 
 /* Runs engine cycles until a stop signal. Returns the exit code. */
-static int serve(const clpd_config *cfg) {
+static int serve(const clpd_config *cfg, clpd_engine *engine,
+                 const clpd_packages *packages) {
   cycle_ctx ctx;
   clpd_loop *loop;
   int sig;
@@ -43,13 +49,9 @@ static int serve(const clpd_config *cfg) {
             strerror(errno));
     return 1;
   }
-  ctx.engine = clpd_engine_create();
+  ctx.engine = engine;
+  ctx.packages = packages;
   ctx.max_rules = cfg->max_rules_per_cycle;
-  if (ctx.engine == NULL) {
-    fputs("clpdaemon: cannot create the CLIPS environment\n", stderr);
-    clpd_loop_close(loop);
-    return 1;
-  }
   fprintf(stderr, "clpdaemon: %s: running\n", cfg->node_id);
   sig = clpd_loop_run(loop, run_cycle, &ctx);
   if (sig < 0)
@@ -57,9 +59,34 @@ static int serve(const clpd_config *cfg) {
   else
     fprintf(stderr, "clpdaemon: received %s, stopping\n",
             sig == SIGINT ? "SIGINT" : "SIGTERM");
-  clpd_engine_destroy(ctx.engine);
   clpd_loop_close(loop);
   return sig < 0 ? 1 : 0;
+}
+
+/* Startup after the configuration (FR-2): environment, rule packages, then
+ * either the --check report or Reset once and the event loop. */
+static int start(const char *config_path, const clpd_config *cfg, int check) {
+  clpd_packages packages;
+  clpd_engine *engine = clpd_engine_create();
+  int rc;
+
+  if (engine == NULL) {
+    fputs("clpdaemon: cannot create the CLIPS environment\n", stderr);
+    return 1;
+  }
+  rc = clpd_packages_load(clpd_engine_env(engine), &cfg->packages, &packages,
+                          stderr);
+  if (rc != 0) {
+    rc = 1;
+  } else if (check) {
+    printf("clpdaemon: %s: configuration OK\n", config_path);
+  } else {
+    Reset(clpd_engine_env(engine));
+    rc = serve(cfg, engine, &packages);
+  }
+  clpd_packages_free(&packages);
+  clpd_engine_destroy(engine);
+  return rc;
 }
 
 int main(int argc, char **argv) {
@@ -88,13 +115,7 @@ int main(int argc, char **argv) {
     return usage_error("missing required option --config%s", "");
 
   rc = clpd_config_load(config_path, &cfg, stderr);
-  if (rc != 0) {
-    rc = 1;
-  } else if (check) {
-    printf("clpdaemon: %s: configuration OK\n", config_path);
-  } else {
-    rc = serve(&cfg);
-  }
+  rc = rc != 0 ? 1 : start(config_path, &cfg, check);
   clpd_config_free(&cfg);
   return rc;
 }

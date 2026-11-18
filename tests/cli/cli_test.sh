@@ -50,6 +50,14 @@ check "cannot read (directory)" 1 "" "clpdaemon: confdir: cannot read: Is a dire
 check "repeated --config" 2 "" "clpdaemon: option --config given more than once$NL$USAGE" -- --config ok.conf --config ok.conf --check
 
 # --- full valid file (requirements section 7) ---------------------------------
+# A minimal lint-clean rule package used by the cases below.
+mkdir pkg
+conf pkg/package.conf 'definition = fibre-installation
+version = v3
+files = rules.clp'
+conf pkg/rules.clp '(deftemplate order (slot wf-id) (slot status))
+(defrule start ?o <- (order (wf-id ?w) (status new)) => (modify ?o (status started)))
+(deffacts seed (order (wf-id w1) (status new)))'
 conf full.conf '# sample
 node_id                  = n1
 tick_interval_ms         = 5000
@@ -62,7 +70,7 @@ admin_socket             = /run/clpdaemon/admin.sock
 trace_text               = /var/log/clpdaemon/trace.log
 trace_jsonl              =
 watch                    = rules
-packages                 = /etc/clpdaemon/packages/fibre-installation@v3
+packages                 = pkg
 plugins                  = /usr/lib/clpdaemon/clpd-orm.so, /usr/lib/clpdaemon/clpd-zmq.so'
 check "full valid file" 0 "clpdaemon: full.conf: configuration OK" "" -- --config full.conf --check
 conf equal.conf 'node_id = n1
@@ -77,6 +85,39 @@ cycle_min_interval_ms = 0
 watch =
 packages ='
 check "zero min interval and empty lists" 0 "clpdaemon: zero.conf: configuration OK" "" -- --config zero.conf --check
+
+# --- rule packages (docs/packages.md) -------------------------------------------
+conf nopkg.conf 'node_id = n1
+packages = pkg, missing'
+check "package directory without manifest" 1 "" \
+  "clpdaemon: missing/package.conf: cannot open: No such file or directory" -- --config nopkg.conf --check
+mkdir gone
+conf gone/package.conf 'definition = gone
+version = 1
+files = a.clp'
+conf gone.conf 'node_id = n1
+packages = gone'
+check "package file missing" 1 "" \
+  "clpdaemon: gone/a.clp: cannot open: No such file or directory" -- --config gone.conf --check
+mkdir dm
+conf dm/package.conf 'definition = dm
+version = 1
+files = m.clp'
+conf dm/m.clp '(defmodule other)'
+conf dm.conf 'node_id = n1
+packages = dm'
+check "defmodule in a package file" 1 "" \
+  "clpdaemon: dm/m.clp: defmodule is not allowed in package files" -- --config dm.conf --check
+conf twice.conf 'node_id = n1
+packages = pkg, ./pkg'
+check "same package twice" 1 "" \
+  "clpdaemon: ./pkg: package fibre-installation@v3 is already loaded from pkg" -- --config twice.conf --check
+# A failing package does not stop the next one from being checked.
+conf both.conf 'node_id = n1
+packages = gone, dm'
+check "errors of every package" 1 "" \
+  "clpdaemon: gone/a.clp: cannot open: No such file or directory
+clpdaemon: dm/m.clp: defmodule is not allowed in package files" -- --config both.conf --check
 
 # --- syntax -------------------------------------------------------------------
 conf syntax.conf 'node_id = n1
@@ -216,6 +257,12 @@ daemon "SIGTERM stops gracefully" fast.conf TERM "clpdaemon: n1: running
 clpdaemon: received SIGTERM, stopping"
 daemon "SIGINT stops gracefully" fast.conf INT "clpdaemon: n1: running
 clpdaemon: received SIGINT, stopping"
+conf fastpkg.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = pkg'
+daemon "running with a package" fastpkg.conf TERM "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
 daemon "SIGINT with SIGINT inherited as ignored" fast.conf INT "clpdaemon: n1: running
 clpdaemon: received SIGINT, stopping" ignore-int
 daemon "SIGHUP keeps running" fast.conf "HUP TERM" "clpdaemon: n1: running
