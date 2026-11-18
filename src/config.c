@@ -164,6 +164,8 @@ static int apply(clpd_kv *kv, int key, char *value, clpd_config *cfg) {
       clpd_kv_error(kv, "%s: expected a path", name);
       return 0;
     }
+    /* none disables the admin socket (L71); ./none names a file. */
+    if (strcmp(value, "none") == 0) value = "";
     set_path(&cfg->admin_socket, value);
     return 1;
   case K_MODE: {

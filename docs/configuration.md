@@ -40,7 +40,7 @@ One `key = value` per line; lines may end in LF or CRLF, and spaces and tabs cou
 | `max_rules_per_cycle` | `-1` (unlimited) or a positive integer | `10000` |
 | `safety_poll_interval_ms` | positive integer | `5000` |
 | `idle_eviction_after` | duration: positive integer followed by `s`, `m` or `h` | `30m` |
-| `admin_socket` | path of the admin socket ([`admin-socket.md`](admin-socket.md)); its directory must exist | `/run/clpdaemon/admin.sock` |
+| `admin_socket` | path of the admin socket ([`admin-socket.md`](admin-socket.md)); its directory must exist; `none` disables the socket (use `./none` for a file named `none`) | `/run/clpdaemon/admin.sock` |
 | `admin_socket_mode` | permission bits of the admin socket: 3 or 4 octal digits (a 4-digit value starts with `0`), no bits for others, e.g. `0600`, `0660` | `0600` |
 | `trace_text` | path, empty = disabled ([`trace.md`](trace.md)) | empty |
 | `trace_jsonl` | path, empty = disabled ([`trace.md`](trace.md)) | empty |

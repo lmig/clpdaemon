@@ -25,7 +25,7 @@ typedef struct {
   int max_rules_per_cycle; /* -1 = unlimited */
   int safety_poll_interval_ms;
   long idle_eviction_after_s;
-  char *admin_socket;
+  char *admin_socket; /* NULL: disabled (admin_socket = none) */
   int admin_socket_mode; /* permission bits, no bits for others */
   char *trace_text;  /* NULL = disabled */
   char *trace_jsonl; /* NULL = disabled */

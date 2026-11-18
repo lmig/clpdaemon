@@ -169,6 +169,20 @@ static void test_admin_socket_mode(void) {
   }
 }
 
+/* admin_socket = none disables the admin socket (L71); any other value,
+ * ./none included, is a path. */
+static void test_admin_socket_none(void) {
+  clpd_config cfg;
+  char eb[512];
+  EXPECT(LOAD("none.conf", "node_id = n1\nadmin_socket = none\n", &cfg, eb) == 0);
+  EXPECT(strcmp(eb, "") == 0);
+  EXPECT(cfg.admin_socket == NULL);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("none.conf", "node_id = n1\nadmin_socket = ./none\n", &cfg, eb) == 0);
+  EXPECT(cfg.admin_socket != NULL && strcmp(cfg.admin_socket, "./none") == 0);
+  clpd_config_free(&cfg);
+}
+
 static void test_nul_byte_rejected(void) {
   clpd_config cfg;
   char eb[512], want[sizeof path + 64];
@@ -190,6 +204,7 @@ int main(void) {
   test_crlf_and_tabs();
   test_nul_byte_rejected();
   test_admin_socket_mode();
+  test_admin_socket_none();
   rmdir(dir);
   if (failures != 0) {
     fprintf(stderr, "%d config checks failed\n", failures);

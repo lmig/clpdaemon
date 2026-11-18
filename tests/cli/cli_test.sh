@@ -1061,6 +1061,18 @@ daemon "admin socket path of 107 bytes" adm107.conf TERM "clpdaemon: n1: running
 clpdaemon: received SIGTERM, stopping"
 cases=$((cases + 1))
 [ ! -e "$p107" ] || fail "107-byte admin socket removed at stop" "$(ls -l "$p107")"
+# admin_socket = none disables the socket (L71): the daemon runs without it
+# and leaves a file named none alone.
+printf 'keep\n' >none
+conf admnone.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+admin_socket = none'
+daemon "admin socket disabled with none" admnone.conf TERM "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+cases=$((cases + 1))
+[ "$(cat none)" = keep ] || fail "admin_socket = none touches no file" "$(ls -l none)"
+check "check with the admin socket disabled" 0 "clpdaemon: admnone.conf: configuration OK" "" -- --config admnone.conf --check
 
 # acase <name> <expected-output> <admin_client args...>: one client run;
 # the output must match exactly (with its final newline).

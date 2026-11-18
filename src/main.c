@@ -90,7 +90,7 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   as.node_id = cfg->node_id;
   as.cycles = &ctx.cycles;
   as.trace = trace;
-  if (clpd_admin_attach(admin, loop, &as, log) != 0) {
+  if (admin != NULL && clpd_admin_attach(admin, loop, &as, log) != 0) {
     clpd_loop_close(loop);
     return 1;
   }
@@ -118,7 +118,7 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
 
 /* Startup after the configuration (FR-2): trace files, environment,
  * plugins (load and init), rule packages, then either the --check report or
- * the admin socket (FR-20), the trace hooks, the plugins' after_load, Reset
+ * the admin socket (FR-20, unless admin_socket = none), the trace hooks, the plugins' after_load, Reset
  * once and the event loop; the socket file is removed on every path after
  * it was created.
  * --check opens the trace files too, so it reports paths the daemon could
@@ -166,7 +166,8 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     rc = 1;
   } else if (check) {
     printf("clpdaemon: %s: configuration OK\n", config_path);
-  } else if ((admin = clpd_admin_bind(cfg->admin_socket,
+  } else if (cfg->admin_socket != NULL &&
+             (admin = clpd_admin_bind(cfg->admin_socket,
                                       cfg->admin_socket_mode,
                                       clpd_log())) == NULL) {
     rc = 1;
