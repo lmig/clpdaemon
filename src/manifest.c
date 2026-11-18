@@ -44,6 +44,7 @@ static int relative_path(clpd_kv *kv, const char *key, const char *item,
 static const char *exempt_name(const char *item, int *is_rule) {
   static const char tpl[] = "template:", rule[] = "rule:";
   const char *name = NULL;
+  *is_rule = 0;
   if (strncmp(item, tpl, sizeof tpl - 1) == 0) {
     name = item + sizeof tpl - 1;
     *is_rule = 0;
