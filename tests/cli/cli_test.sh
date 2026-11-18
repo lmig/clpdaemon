@@ -44,7 +44,6 @@ check "--config without value" 2 "" "clpdaemon: option --config requires a file$
 check "unknown option" 2 "" "clpdaemon: unknown option '--bogus'$NL$USAGE" -- --config ok.conf --bogus
 check "check ok" 0 "clpdaemon: ok.conf: configuration OK" "" -- --config ok.conf --check
 check "foreground accepted" 0 "clpdaemon: ok.conf: configuration OK" "" -- --foreground --check --config ok.conf
-check "run without --check exits 0 until T3" 0 "" "" -- --config ok.conf
 check "cannot open" 1 "" "clpdaemon: nope.conf: cannot open: No such file or directory" -- --config nope.conf --check
 mkdir confdir
 check "cannot read (directory)" 1 "" "clpdaemon: confdir: cannot read: Is a directory" -- --config confdir --check
@@ -147,6 +146,81 @@ check "min interval above default tick" 1 "" \
 
 # Errors are reported even when a run is requested without --check.
 check "run validates" 1 "" "clpdaemon: missing.conf: missing required key 'node_id'" -- --config missing.conf
+
+# --- running daemon and signals (FR-5, L25) ---------------------------------
+# wait_line <file> <line>: waits up to 5 s for an exact line in <file>.
+wait_line() {
+  n=0
+  while ! grep -qxF "$2" "$1" 2>/dev/null; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && return 1
+    sleep 0.05
+  done
+}
+
+# wait_exit <pid>: waits up to 5 s for the process to exit and sets rc to its
+# exit status; a process still running is killed and rc is set to "hung".
+wait_exit() {
+  n=0
+  while kill -0 "$1" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 100 ]; then
+      kill -KILL "$1" 2>/dev/null
+      wait "$1" 2>/dev/null
+      rc=hung
+      return
+    fi
+    sleep 0.05
+  done
+  wait "$1"
+  rc=$?
+}
+
+# daemon <name> <conf> <signals> <expected-stderr> [ignore-int]: starts the
+# daemon (node_id must be n1), waits until it is running, sends each signal of
+# the space-separated list (waiting after SIGHUP for its line), and expects
+# exit 0, empty stdout and the exact stderr. With ignore-int the daemon is
+# started with SIGINT ignored, as a non-interactive shell does for background
+# jobs.
+daemon() {
+  name=$1 dconf=$2 sigs=$3 want_err=$4 mode=${5:-}
+  cases=$((cases + 1))
+  if [ "$mode" = ignore-int ]; then
+    sh -c 'trap "" INT; exec "$0" --config "$1"' "$BIN" "$dconf" >out.txt 2>err.txt &
+  else
+    "$BIN" --config "$dconf" >out.txt 2>err.txt &
+  fi
+  pid=$!
+  ok=1
+  wait_line err.txt "clpdaemon: n1: running" || ok=0
+  for s in $sigs; do
+    kill -"$s" "$pid" 2>/dev/null
+    if [ "$s" = HUP ]; then
+      wait_line err.txt "clpdaemon: received SIGHUP, reopening trace files" || ok=0
+    fi
+  done
+  wait_exit "$pid"
+  out=$(cat out.txt; printf x) err=$(cat err.txt; printf x)
+  out=${out%x} err=${err%x}
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$out" != "" ] || [ "$err" != "$want_err$NL" ]; then
+    failures=$((failures + 1))
+    printf 'FAIL: %s\n  exit: got %s, want 0 (lines seen: %s)\n  stdout: got [%s]\n  stderr: got [%s]\n          want [%s]\n' \
+      "$name" "$rc" "$ok" "$out" "$err" "$want_err"
+  fi
+}
+
+conf fast.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10'
+daemon "SIGTERM stops gracefully" fast.conf TERM "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+daemon "SIGINT stops gracefully" fast.conf INT "clpdaemon: n1: running
+clpdaemon: received SIGINT, stopping"
+daemon "SIGINT with SIGINT inherited as ignored" fast.conf INT "clpdaemon: n1: running
+clpdaemon: received SIGINT, stopping" ignore-int
+daemon "SIGHUP keeps running" fast.conf "HUP TERM" "clpdaemon: n1: running
+clpdaemon: received SIGHUP, reopening trace files
+clpdaemon: received SIGTERM, stopping"
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

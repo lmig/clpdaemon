@@ -13,3 +13,15 @@ target_link_libraries(config_test PRIVATE clpd_core)
 target_compile_options(config_test PRIVATE ${CLPD_WARNINGS})
 
 add_test(NAME clpdaemon_config COMMAND config_test)
+
+foreach(t scheduler engine loop)
+  add_executable(${t}_test ${t}/${t}_test.c)
+  target_link_libraries(${t}_test PRIVATE clpd_core)
+  target_compile_options(${t}_test PRIVATE ${CLPD_WARNINGS})
+  add_test(NAME clpdaemon_${t} COMMAND ${t}_test)
+endforeach()
+
+# A lost stop signal must fail a test, not hang it until the default timeout.
+set_tests_properties(clpdaemon_scheduler clpdaemon_engine clpdaemon_loop
+  clpdaemon_config PROPERTIES TIMEOUT 30)
+set_tests_properties(clpdaemon_cli PROPERTIES TIMEOUT 120)

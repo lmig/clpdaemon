@@ -15,7 +15,18 @@ usage: clpdaemon --config <file> [--foreground] [--check]
 
 Exit codes: `0` success, `1` invalid configuration, `2` command-line error.
 
-Until the event loop lands (T3), a run without `--check` validates the configuration and exits 0.
+Without `--check`, the daemon validates the configuration and then runs until it receives `SIGTERM` or `SIGINT`. It always stays in the foreground, with or without `--foreground`; there is no detached mode (systemd supervises it, T17).
+
+## Running
+
+A cycle runs `Run` with the `max_rules_per_cycle` limit. The first cycle runs at start; then a cycle is due `tick_interval_ms` after the start of the previous cycle (fixed rate), or `cycle_min_interval_ms` after it when a notification arrived in between. When a cycle takes longer than the interval, the next one starts at once; missed ticks are not replayed.
+
+| Signal | Effect |
+|---|---|
+| `SIGTERM`, `SIGINT` | Graceful stop: a running cycle halts after the current rule firing, then the daemon exits 0. |
+| `SIGHUP` | Reopens the trace files (T5); the daemon keeps running. |
+
+Runtime messages (stderr): `clpdaemon: <node_id>: running` once the daemon accepts signals; `clpdaemon: received <SIGTERM|SIGINT>, stopping`; `clpdaemon: received SIGHUP, reopening trace files`. A startup failure prints `clpdaemon: cannot start the event loop: <system error>` or `clpdaemon: cannot create the CLIPS environment` and exits 1. A system error while running prints `clpdaemon: event loop failed: <system error>` and exits 1.
 
 ## File format
 
