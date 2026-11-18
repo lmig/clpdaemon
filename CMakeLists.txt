@@ -20,4 +20,5 @@ enable_testing()
 
 add_subdirectory(vendor/clips)
 add_subdirectory(src)
+add_subdirectory(examples/plugins)
 add_subdirectory(tests)

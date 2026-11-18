@@ -1,0 +1,12 @@
+# Test-only plugins, built next to the example in <build>/plugins.
+clpd_plugin_module(test_hooks_a hooks.c)
+target_compile_definitions(test_hooks_a PRIVATE HOOKS_NAME="hooks-a")
+clpd_plugin_module(test_hooks_b hooks.c)
+target_compile_definitions(test_hooks_b PRIVATE HOOKS_NAME="hooks-b")
+clpd_plugin_module(test_fail_init hooks.c)
+target_compile_definitions(test_fail_init PRIVATE HOOKS_NAME="fail-init" HOOKS_FAIL_INIT)
+foreach(defect nosym abi size null name noinit)
+  string(TOUPPER ${defect} upper)
+  clpd_plugin_module(test_bad_${defect} bad.c)
+  target_compile_definitions(test_bad_${defect} PRIVATE BAD_${upper})
+endforeach()
