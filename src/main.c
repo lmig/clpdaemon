@@ -34,6 +34,7 @@ typedef struct {
   const clpd_packages *packages;
   clpd_plugins *plugins;
   clpd_clips_trace *ct;
+  clpd_admin *admin;
   int max_rules;
   unsigned long cycles; /* run so far (admin `status`) */
 } cycle_ctx;
@@ -57,6 +58,7 @@ static void run_cycle(void *ctx) {
   clpd_engine_run_cycle(c->engine, c->max_rules);
   clpd_plugins_cycle_end(c->plugins, !GetHaltExecution(env));
   clpd_clips_trace_flush(c->ct);
+  clpd_admin_resume(c->admin);
   c->cycles++;
 }
 
@@ -102,6 +104,7 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   ctx.packages = packages;
   ctx.plugins = plugins;
   ctx.ct = ct;
+  ctx.admin = admin;
   ctx.max_rules = cfg->max_rules_per_cycle;
   fprintf(log, "clpdaemon: %s: running\n", cfg->node_id);
   sig = clpd_loop_run(loop, run_cycle, &ctx);

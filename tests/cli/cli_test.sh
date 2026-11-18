@@ -1244,5 +1244,77 @@ if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -e stale.sock ]; then
   fail "admin stale and replaced sockets" "exit $rc, ok $ok, socket [$(ls -l stale.sock 2>&1)], stderr [$(cat err.txt err2.txt)]"
 fi
 
+# --check leaves a stale socket in place (same inode).
+conf admchk2.conf 'node_id = n1
+admin_socket = stale.sock'
+start admstale.conf stale.sock
+kill -KILL "$pid"
+wait "$pid" 2>/dev/null
+i1=$(stat -c %i stale.sock 2>&1)
+check "check keeps a stale admin socket" 0 "clpdaemon: admchk2.conf: configuration OK" "" -- --config admchk2.conf --check
+cases=$((cases + 1))
+[ -S stale.sock ] && [ "$(stat -c %i stale.sock)" = "$i1" ] ||
+  fail "check leaves the stale admin socket alone" "before $i1, now [$(ls -li stale.sock 2>&1)]"
+rm -f stale.sock
+
+# A directory, a FIFO or a symlink at the path is not a socket and is left
+# untouched.
+for k in dir fifo link; do
+  case $k in
+  dir) mkdir k$k.sock ;;
+  fifo) mkfifo k$k.sock ;;
+  link) ln -s nowhere k$k.sock ;;
+  esac
+  conf adm$k.conf "node_id = n1
+admin_socket = k$k.sock"
+  RUN='timeout 10' check "admin socket path is a $k" 1 "" \
+    "clpdaemon: k$k.sock: not a socket" -- --config adm$k.conf
+  cases=$((cases + 1))
+  case $k in
+  dir) [ -d k$k.sock ] ;;
+  fifo) [ -p k$k.sock ] ;;
+  link) [ -L k$k.sock ] && [ "$(readlink k$k.sock)" = nowhere ] ;;
+  esac || fail "$k at the admin socket path is kept" "$(ls -ld k$k.sock 2>&1)"
+done
+
+# A startup failure after the socket was created removes it: with 5 file
+# descriptors (inherited ones above 2 closed) the libraries load and the
+# socket is created, but the event loop cannot open its descriptors.
+conf admfd.conf 'node_id = n1
+admin_socket = fd.sock'
+printf '%s\n' 'exec timeout 10 sh -c '\''exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; ulimit -n 5; exec "$0" "$@"'\'' "$@"' >lim5.sh
+RUN='sh lim5.sh' check "admin socket removed after a later startup failure" 1 "" \
+  "clpdaemon: cannot start the event loop: Too many open files" -- --config admfd.conf
+cases=$((cases + 1))
+[ ! -e fd.sock ] || fail "admin socket left after a later startup failure" "$(ls -l fd.sock)"
+
+# Out of file descriptors at accept: the listener is not polled until a
+# client closes (or the next cycle), so the engine thread does not spin.
+# With 16 descriptors, 9 held clients use the last free ones and a 10th
+# connection waits in the backlog.
+conf admemf.conf 'node_id = n1
+tick_interval_ms = 60000
+admin_socket = emf.sock'
+cases=$((cases + 1))
+sh -c 'ulimit -n 16; exec "$0" --config "$1"' "$BIN" admemf.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+"$ADMIN" -h 9 emf.sock 'status\n' >aout.txt 2>aerr.txt &
+client=$!
+sleep 0.5
+t0=$(awk '{print $14 + $15}' /proc/$pid/stat)
+sleep 1
+t1=$(awk '{print $14 + $15}' /proc/$pid/stat)
+kill -TERM "$pid"
+wait_exit "$pid"
+wait "$client" 2>/dev/null
+ticks=$((t1 - t0))
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$ticks" -gt 20 ] || [ -e emf.sock ] ||
+  [ "$(cat err.txt)" != "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping" ]; then
+  fail "admin socket out of file descriptors" "exit $rc, lines seen $ok, CPU ticks in 1 s $ticks, stderr [$(cat err.txt)]"
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

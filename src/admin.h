@@ -53,6 +53,10 @@ clpd_admin *clpd_admin_bind(const char *path, int mode, FILE *log);
  * log and returns -1. */
 int clpd_admin_attach(clpd_admin *a, clpd_loop *loop,
                       const clpd_admin_state *s, FILE *log);
+/* Polls the listener again if accept ran out of descriptors or memory
+ * (it is then not polled until a client closes); called once per cycle.
+ * NULL is allowed. */
+void clpd_admin_resume(clpd_admin *a);
 /* Closes every client and unregisters the socket; call it before the loop
  * closes. No-op when not attached; NULL is allowed. */
 void clpd_admin_detach(clpd_admin *a);

@@ -113,9 +113,17 @@ struct clpd_admin {
   dev_t dev; /* of the socket file, to remove only our own at close */
   ino_t ino;
   clpd_loop *loop; /* NULL when not attached */
+  int paused;      /* listener not polled: accept ran out of resources */
   clpd_admin_state state;
   client *clients[CLPD_ADMIN_CLIENTS_MAX];
 };
+
+/* Polls the listener again after accept ran out of descriptors or
+ * memory. */
+static void resume(clpd_admin *a) {
+  if (a->loop == NULL || !a->paused) return;
+  if (clpd_loop_set_events(a->loop, a->fd, POLLIN) == 0) a->paused = 0;
+}
 
 static void drop(client *c) {
   clpd_admin *a = c->admin;
@@ -125,6 +133,7 @@ static void drop(client *c) {
   for (i = 0; i < CLPD_ADMIN_CLIENTS_MAX; i++)
     if (a->clients[i] == c) a->clients[i] = NULL;
   free(c);
+  resume(a); /* a descriptor is free again */
 }
 
 /* Sends what the socket takes now. MSG_NOSIGNAL: a peer that is gone gives
@@ -208,7 +217,16 @@ static void on_listen(void *ctx, int fd, short revents) {
     client *c = NULL;
     cfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (cfd < 0 && (errno == EINTR || errno == ECONNABORTED)) continue;
-    if (cfd < 0) return;
+    if (cfd < 0) {
+      /* The pending connection stays readable: stop polling the listener
+       * (or the engine thread spins) until a client closes or the next
+       * cycle (clpd_admin_resume). */
+      if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+          errno == ENOMEM) {
+        if (clpd_loop_set_events(a->loop, fd, 0) == 0) a->paused = 1;
+      }
+      return;
+    }
     for (i = 0; i < CLPD_ADMIN_CLIENTS_MAX && a->clients[i] != NULL; i++) {
     }
     if (i == CLPD_ADMIN_CLIENTS_MAX) {
@@ -293,6 +311,10 @@ int clpd_admin_attach(clpd_admin *a, clpd_loop *loop,
   }
   a->loop = loop;
   return 0;
+}
+
+void clpd_admin_resume(clpd_admin *a) {
+  if (a != NULL) resume(a);
 }
 
 void clpd_admin_detach(clpd_admin *a) {
