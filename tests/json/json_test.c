@@ -407,6 +407,25 @@ static void test_limits(void) {
 
 /* The length bounds every read: bytes after it in the caller's buffer are
  * never consumed (parse_n copies exactly len bytes, no terminator). */
+/* T7a verification: escaped duplicate spellings, surrogate offsets, float
+ * edges and NUL bytes inside constructs. */
+static void test_verifier_regressions(void) {
+  REJECT("{\"\\u00e9\":1,\"\xC3\xA9\":2}", "offset 12: duplicate key");
+  REJECT("{\"\\ud83d\\ude00\":1,\"\xF0\x9F\x98\x80\":2}", "offset 18: duplicate key");
+  REJECT("\"\\ud800\\u0041\"", "offset 1: invalid surrogate escape");
+  REJECT("\"\\ud800\\uzzzz\"", "offset 7: invalid \\u escape");
+  REJECT("-Infinity", "offset 1: expected digit");
+  REJECT("1.7976931348623159e308", "offset 0: number out of range");
+  FLT("1.7976931348623157e308", 1.7976931348623157e308);
+  clpd_json_free(ONE("\"\x7f\"", CLPD_JSON_STRING));
+  REJECT_N("\"a\\\0\"", 5, "offset 2: invalid escape");
+  REJECT_N("\"\\u00\0\"", 7, "offset 1: invalid \\u escape");
+  REJECT_N("\"\xC3\0\"", 4, "offset 1: invalid UTF-8");
+  REJECT_N("tr\0e", 4, "offset 0: invalid literal");
+  REJECT_N("[1,\0]", 5, "offset 3: NUL byte not allowed");
+  REJECT(" \xEF\xBB\xBF{}", "offset 1: expected value");
+}
+
 static void test_length_bound(void) {
   clpd_json_error err;
   clpd_json *v;
@@ -442,6 +461,7 @@ int main(void) {
   test_string_errors();
   test_limits();
   test_length_bound();
+  test_verifier_regressions();
   if (failures != 0) {
     fprintf(stderr, "%d json checks failed\n", failures);
     return 1;

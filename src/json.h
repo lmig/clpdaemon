@@ -47,6 +47,13 @@
  *   object exceeds max_elements (<n>)      the first member key over it
  *   document exceeds max_nodes (<n>)       the first value over the limit
  *   out of memory                          where allocation failed
+ * A NUL byte or the end of the buffer inside a construct reports that
+ * construct's error ("invalid escape", "invalid \u escape", "invalid UTF-8",
+ * "invalid literal"), or "unexpected end of input" for a sequence cut off
+ * by the buffer end; "NUL byte not allowed" is for a NUL where a token
+ * starts. A limit can be reported before a later syntax error. Recursion
+ * uses one stack frame per nesting level (a few hundred bytes), so keep
+ * max_depth small (the ingest pipeline uses a single-digit depth).
  */
 #ifndef CLPD_JSON_H
 #define CLPD_JSON_H
