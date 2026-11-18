@@ -183,6 +183,29 @@ static void test_write_error(void) {
                 "clpdaemon: /dev/full: cannot write: No space left on device\n") == 0);
 }
 
+/* The write-failure state is visible through clpd_trace_failing until a
+ * reopen succeeds; an inactive or healthy trace is not failing. */
+static void test_failing(void) {
+  FILE *err = tmpfile();
+  clpd_trace *t = clpd_trace_open(NULL, NULL, "n1", err);
+  EXPECT(t != NULL);
+  if (t == NULL) return;
+  EXPECT(!clpd_trace_failing(t));
+  clpd_trace_close(t);
+  t = clpd_trace_open(text_path, "/dev/full", "n1", err);
+  EXPECT(t != NULL);
+  if (t == NULL) return;
+  EXPECT(!clpd_trace_failing(t));
+  clpd_trace_output(t, NULL, "STDOUT", "a", 1);
+  EXPECT(clpd_trace_failing(t));
+  EXPECT(clpd_trace_reopen(t, err) == 0);
+  EXPECT(!clpd_trace_failing(t));
+  clpd_trace_close(t);
+  EXPECT(strcmp(err_text(err),
+                "clpdaemon: /dev/full: cannot write: No space left on device\n") == 0);
+  unlink(text_path);
+}
+
 /* After clpd_trace_set_err, write failures go to the new stream only. */
 static void test_set_err(void) {
   FILE *first = tmpfile(), *second = tmpfile();
@@ -226,6 +249,7 @@ int main(void) {
   test_reopen();
   test_write_error();
   test_set_err();
+  test_failing();
   unlink(jsonl_path);
   test_large_index();
   unlink(text_path);

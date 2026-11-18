@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
 
 #include "fdcapture.h"
+#include "log.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -23,8 +25,9 @@ typedef struct {
 
 struct clpd_fdcapture {
   clpd_trace *trace;
-  FILE *err;      /* trace error stream before start, restored at stop */
+  FILE *err;      /* the caller's err: the trace's error stream again at stop */
   FILE *log;      /* daemon messages: a copy of the original stderr */
+  FILE *prev_log; /* daemon log stream (clpd_log) before start */
   int saved[2];   /* original fds 1 and 2, closed after the join */
   int ctl[2];     /* closing ctl[1] tells the reader to drain and exit */
   /* The originals go back on 1 and 2 once, by stop or by the reader after
@@ -32,8 +35,36 @@ struct clpd_fdcapture {
   pthread_mutex_t fd_lock;
   int restored;
   pthread_t thread;
+  /* SIGPIPE disposition before start, put back at stop (see catch_sigpipe). */
+  struct sigaction old_pipe;
+  int pipe_caught;
   stream s[2];    /* [0] fd 1, [1] fd 2 */
 };
+
+static void on_sigpipe(int sig) { (void)sig; }
+
+/* While capturing, SIGPIPE is caught by a handler that does nothing, so a
+ * daemon write still blocked on a pipe when the reader fails and closes the
+ * read ends gets EPIPE (or a short count) instead of killing the daemon. A
+ * caught signal goes back to the default action at exec, so children
+ * started by CLIPS `system` keep the default SIGPIPE; SIG_IGN would be
+ * inherited. A SIGPIPE the daemon was started with ignored stays ignored. */
+static void catch_sigpipe(clpd_fdcapture *c) {
+  struct sigaction sa;
+  if (sigaction(SIGPIPE, NULL, &c->old_pipe) != 0 ||
+      c->old_pipe.sa_handler == SIG_IGN)
+    return;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = on_sigpipe;
+  sa.sa_flags = SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+  c->pipe_caught = sigaction(SIGPIPE, &sa, NULL) == 0;
+}
+
+static void restore_sigpipe(clpd_fdcapture *c) {
+  if (c->pipe_caught) sigaction(SIGPIPE, &c->old_pipe, NULL);
+  c->pipe_caught = 0;
+}
 
 /* Writes every complete line. A full buffer without any newline is written
  * as one event (the cap); otherwise the unfinished tail moves to the front
@@ -57,11 +88,15 @@ static void emit_lines(clpd_fdcapture *c, stream *s, int final) {
 
 /* Reads at most *left bytes (no limit when left is NULL). Returns 1 after
  * reading data or EINTR, 0 when the pipe is empty or at EOF (done set),
- * -1 on a read error (errno set). emit_lines leaves the buffer not full. */
+ * -1 on a read error (errno set). A read of 0 bytes means EOF only because
+ * room is never 0: emit_lines never leaves the buffer full (a full buffer
+ * either holds a newline, and everything up to the last one is written, or
+ * it is written whole as the cap), and drain calls with *left > 0. */
 static int read_some(clpd_fdcapture *c, stream *s, size_t *left) {
   size_t room = sizeof s->buf - s->len;
   ssize_t n;
   if (left != NULL && *left < room) room = *left;
+  assert(room > 0);
   n = read(s->fd, s->buf + s->len, room);
   if (n > 0) {
     s->len += (size_t)n;
@@ -87,6 +122,11 @@ static void restore_fds(clpd_fdcapture *c) {
   pthread_mutex_unlock(&c->fd_lock);
 }
 
+static void close_fd(int *fd) {
+  if (*fd >= 0) close(*fd);
+  *fd = -1;
+}
+
 /* Final pass, after fds 1 and 2 are the originals again: reads only the
  * bytes each pipe held when it starts (a child still writing cannot keep
  * it going), then writes the partial lines, stdout first. */
@@ -108,8 +148,10 @@ static void drain(clpd_fdcapture *c) {
 
 /* Reader thread: turns pipe bytes into lines until stop. If polling or
  * reading fails, it reports once on the daemon log, puts the original
- * descriptors back so no writer blocks on a pipe nobody reads, drains and
- * exits; stop still works afterwards. */
+ * descriptors back on 1 and 2, drains what the pipes hold, then closes the
+ * read ends, so a process still writing to a pipe (a child that inherited
+ * it) gets EPIPE (SIGPIPE) instead of blocking on a pipe nobody reads, and
+ * exits; stop still works afterwards (it only joins). */
 static void *reader(void *arg) {
   clpd_fdcapture *c = arg;
   int stopping = 0, failed = 0, i;
@@ -142,12 +184,9 @@ static void *reader(void *arg) {
     restore_fds(c);
   }
   drain(c);
+  if (failed)
+    for (i = 0; i < 2; i++) close_fd(&c->s[i].fd);
   return NULL;
-}
-
-static void close_fd(int *fd) {
-  if (*fd >= 0) close(*fd);
-  *fd = -1;
 }
 
 clpd_fdcapture *clpd_fdcapture_start(clpd_trace *t, FILE *err) {
@@ -188,6 +227,12 @@ clpd_fdcapture *clpd_fdcapture_start(clpd_trace *t, FILE *err) {
   close_fd(&out[1]);
   close_fd(&errp[1]);
 
+  /* Before the reader can emit: from now on a sink write failure and every
+   * daemon message go to the original stderr, never into a pipe. */
+  clpd_trace_set_err(t, c->log);
+  c->prev_log = clpd_log_set(c->log);
+  catch_sigpipe(c);
+
   /* The thread inherits this mask: signals stay with the main thread's
    * signalfd. */
   sigfillset(&all);
@@ -195,11 +240,12 @@ clpd_fdcapture *clpd_fdcapture_start(clpd_trace *t, FILE *err) {
   e = pthread_create(&c->thread, NULL, reader, c);
   pthread_sigmask(SIG_SETMASK, &old, NULL);
   if (e != 0) {
+    clpd_trace_set_err(t, err);
+    clpd_log_set(c->prev_log);
+    restore_sigpipe(c);
     errno = e;
     goto fail;
   }
-  setvbuf(stdout, NULL, _IOLBF, 0);
-  clpd_trace_set_err(t, c->log);
   return c;
 
 fail:
@@ -236,12 +282,14 @@ void clpd_fdcapture_stop(clpd_fdcapture *c) {
   close_fd(&c->ctl[1]);
   pthread_join(c->thread, NULL);
   clpd_trace_set_err(c->trace, c->err);
+  clpd_log_set(c->prev_log);
   fclose(c->log);
   close_fd(&c->ctl[0]);
   for (i = 0; i < 2; i++) {
     close_fd(&c->saved[i]);
     close_fd(&c->s[i].fd);
   }
+  restore_sigpipe(c);
   pthread_mutex_destroy(&c->fd_lock);
   free(c);
 }

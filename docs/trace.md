@@ -16,6 +16,8 @@ An empty or missing key disables that format. With both disabled, the daemon wri
   `clpdaemon: <path>: cannot open: <system error>`
 - Every line is flushed when it is written. A line that cannot be written is lost (it may be left partial), and the first failure on a file is reported until a reopen succeeds:
   `clpdaemon: <path>: cannot write: <system error>`
+- While a file is in that failure state (its last write failed and no reopen has succeeded since), CLIPS `STDERR` and `STDWRN` lines are also written to the daemon's stderr, so engine errors stay visible; `STDOUT` lines are not:
+  `clpdaemon: STDERR: <text>`, `clpdaemon: STDWRN: <text>`
 - `SIGHUP` reopens both files by path, for log rotation: move the file away, then send `SIGHUP`, and the daemon creates a new file. A file that cannot be reopened keeps its previous stream, and the daemon reports it and keeps running:
   `clpdaemon: <path>: cannot reopen: <system error>`
 
@@ -23,7 +25,7 @@ An empty or missing key disables that format. With both disabled, the daemon wri
 
 The daemon connects the trace to the CLIPS environment after the rule packages are loaded and before the single `Reset`, so the facts asserted by `Reset` (deffacts) are traced, while package load diagnostics still go to stderr. Without a trace file nothing is connected and engine output goes to the console.
 
-- **Output**: a router takes the logical names `STDOUT` (also `t`), `STDERR` and `STDWRN`. Text is cut into lines at `\n`; each line is one `output` event with its stream name. A partial line (no `\n` yet) is written at the end of every engine cycle, when a rule starts or ends firing, and at shutdown. With a trace, engine output no longer reaches the console.
+- **Output**: a router takes the logical names `STDOUT` (also `t`), `STDERR` and `STDWRN`. Text is cut into lines at `\n`; each line is one `output` event with its stream name. A partial line (no `\n` yet) is written at the end of every engine cycle, when a rule starts or ends firing, and at shutdown. A line that reaches 65536 bytes without a newline is written as one event as soon as it reaches that size, and the rest continues in the next (the same rule as for [process output](#process-output-fds-1-and-2)); shorter lines are never split. So a line of 65535 bytes is one event, 65536 bytes followed by `a` and a newline are a 65536-byte event and an `a` event, and a line of exactly 65536 bytes followed by its newline is a 65536-byte event followed by an empty event. With a trace, engine output no longer reaches the console.
 - **Facts** (`watch` includes `facts`): `assert`, `retract` and `modify` events. A `modify` is one event with the fact after the change (same index); the retract and assert CLIPS performs inside it are not traced. A modify whose result already exists as another fact only removes the old one, and is traced as its `retract`.
 - **Rules** (`watch` includes `rules`): one `fire` event before the actions of the rule run, with the module, the rule and the indices of the facts it matched in pattern order. Patterns that match no fact (`not`, `exists`) and objects (COOL instances) are left out; a rule without patterns has no facts.
 - CLIPS `watch` itself stays off: its `==>`, `<==` and `FIRE` text would repeat the events above.
@@ -35,7 +37,7 @@ The daemon connects the trace to the CLIPS environment after the rule packages a
 - A `fire` event carries the `wf_id` of the first matched fact that has one.
 - Output written while a rule fires carries that rule's `wf_id` (also when rules are not watched); output written outside a firing has none.
 
-If the hooks cannot be installed the daemon stops with exit code 1:
+If the hooks cannot be installed (none is left installed) the daemon stops with exit code 1:
 `clpdaemon: cannot attach the trace to the CLIPS environment`
 
 ## Process output (fds 1 and 2)
@@ -43,11 +45,12 @@ If the hooks cannot be installed the daemon stops with exit code 1:
 With at least one trace file, the daemon redirects the process descriptors 1 and 2 to two pipes right after connecting the trace and before `Reset`, so whatever writes to them directly (plugins, children started by the CLIPS `system` function, a stray `printf`) is traced instead of reaching the console. Under `--check`, or without a trace file, nothing is redirected and everything goes to the console.
 
 - A dedicated reader thread cuts the bytes into lines at `\n`; each line is one `output` event with the stream `stdout` (fd 1) or `stderr` (fd 2). Lowercase names tell process descriptors apart from the CLIPS logical names `STDOUT` and `STDERR`. These lines have no `wf_id`.
-- A line is written once its `\n` arrives. A line that reaches 65536 bytes without a newline is written as one event, and the rest continues in the next. Text without a final newline is written when the daemon stops.
-- `stdout` is line buffered while redirected.
-- The daemon's own messages (`clpdaemon: <node_id>: running`, `received <signal>`, reopen and write failures, event loop failures) keep going to the original stderr; they are never traced.
+- A line is written once its `\n` arrives. A line that reaches 65536 bytes without a newline is written as one event, and the rest continues in the next; a line of exactly 65536 bytes followed by its newline is therefore a 65536-byte event followed by an empty event. Text without a final newline is written when the daemon stops.
+- While fds 1 and 2 are redirected, the daemon catches `SIGPIPE` with a handler that does nothing, so a write to a closed pipe fails with `EPIPE` instead of ending the daemon; the previous disposition comes back at shutdown. A caught signal returns to its default action when a program is executed, so children started by the CLIPS `system` function keep the default `SIGPIPE`. If the daemon was started with `SIGPIPE` ignored, it stays ignored.
+- The daemon makes `stdout` line buffered at startup, before any other use, so a line written with `printf` reaches the pipe when it ends; it stays line buffered for the life of the process.
+- Every daemon message (`clpdaemon: <node_id>: running`, `received <signal>`, reopen and write failures, event loop failures, and fatal errors such as running out of memory, which exit 1) keeps going to the original stderr; none is traced or lost in the pipe at exit.
 - At shutdown, after the event loop ends, the daemon puts the original descriptors back, then reads only the bytes the pipes hold at that moment and writes the partial lines (`stdout` first). Everything the process itself wrote is traced; output a child process still running writes afterwards is not traced, and such a child cannot delay the stop. Once the daemon has exited, a child that keeps writing gets `EPIPE` (`SIGPIPE`).
-- If reading the pipes fails while running, the daemon writes one message to the original stderr, puts the original descriptors back (so nothing blocks on an unread pipe), traces what the pipes already held and keeps running without the redirection:
+- If reading the pipes fails while running, the daemon writes one message to the original stderr, puts the original descriptors back on 1 and 2, traces what the pipes already held, then closes the pipes, so a child process still writing to them gets `EPIPE` (`SIGPIPE`) instead of blocking; the daemon keeps running without the redirection (a daemon write still in progress on the pipe gets `EPIPE` or a short count, since the daemon catches `SIGPIPE` while the redirection is set up):
   `clpdaemon: trace capture failed: <system error>; stdout and stderr go back to the console`
 - If the redirection cannot be set up, the daemon stops with exit code 1:
   `clpdaemon: cannot redirect stdout and stderr to the trace: <system error>`

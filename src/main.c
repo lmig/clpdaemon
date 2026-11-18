@@ -4,6 +4,7 @@
 #include "config.h"
 #include "engine.h"
 #include "fdcapture.h"
+#include "log.h"
 #include "loop.h"
 #include "packages.h"
 #include "trace.h"
@@ -17,10 +18,11 @@ static const char usage[] =
     "usage: clpdaemon --config <file> [--foreground] [--check]\n";
 
 static int usage_error(const char *fmt, const char *arg) {
-  fputs("clpdaemon: ", stderr);
-  fprintf(stderr, fmt, arg);
-  fputc('\n', stderr);
-  fputs(usage, stderr);
+  FILE *log = clpd_log();
+  fputs("clpdaemon: ", log);
+  fprintf(log, fmt, arg);
+  fputc('\n', log);
+  fputs(usage, log);
   return 2;
 }
 
@@ -41,23 +43,16 @@ static void run_cycle(void *ctx) {
   clpd_clips_trace_flush(c->ct);
 }
 
-typedef struct {
-  clpd_trace *trace;
-  FILE *log;
-} reopen_ctx;
+static void reopen_trace(void *ctx) { clpd_trace_reopen(ctx, clpd_log()); }
 
-static void reopen_trace(void *ctx) {
-  reopen_ctx *r = ctx;
-  clpd_trace_reopen(r->trace, r->log);
-}
-
-/* Runs engine cycles until a stop signal. Daemon messages go to log (the
- * original stderr). Returns the exit code. */
+/* Runs engine cycles until a stop signal. Daemon messages go to the daemon
+ * log stream (src/log.h; the original stderr during a capture). Returns the
+ * exit code. */
 static int serve(const clpd_config *cfg, clpd_engine *engine,
                  const clpd_packages *packages, clpd_trace *trace,
-                 clpd_clips_trace *ct, FILE *log) {
+                 clpd_clips_trace *ct) {
+  FILE *log = clpd_log();
   cycle_ctx ctx;
-  reopen_ctx rctx;
   clpd_loop *loop;
   int sig;
 
@@ -68,9 +63,7 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
             strerror(errno));
     return 1;
   }
-  rctx.trace = trace;
-  rctx.log = log;
-  clpd_loop_on_hup(loop, reopen_trace, &rctx);
+  clpd_loop_on_hup(loop, reopen_trace, trace);
   ctx.engine = engine;
   ctx.packages = packages;
   ctx.ct = ct;
@@ -92,8 +85,8 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
  * the daemon could not write. The hooks come after loading, so package load
  * diagnostics keep going to stderr, and before Reset, so the facts Reset
  * asserts are traced. With a trace, fds 1 and 2 are captured into it from
- * Reset until the loop ends (FR-16); daemon messages then go to the
- * capture's log stream, the original stderr. */
+ * Reset until the loop ends (FR-16); the daemon log stream (src/log.h) is
+ * then the original stderr. */
 static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_packages packages;
   clpd_clips_trace *ct = NULL;
@@ -102,16 +95,16 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   int rc;
 
   trace = clpd_trace_open(cfg->trace_text, cfg->trace_jsonl, cfg->node_id,
-                          stderr);
+                          clpd_log());
   if (trace == NULL) return 1;
   engine = clpd_engine_create();
   if (engine == NULL) {
-    fputs("clpdaemon: cannot create the CLIPS environment\n", stderr);
+    fputs("clpdaemon: cannot create the CLIPS environment\n", clpd_log());
     clpd_trace_close(trace);
     return 1;
   }
   rc = clpd_packages_load(clpd_engine_env(engine), &cfg->packages, &packages,
-                          stderr);
+                          clpd_log());
   if (rc != 0) {
     rc = 1;
   } else if (check) {
@@ -120,22 +113,18 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
                                      cfg->watch_facts, cfg->watch_rules,
                                      &ct) != 0) {
     fputs("clpdaemon: cannot attach the trace to the CLIPS environment\n",
-          stderr);
+          clpd_log());
     rc = 1;
   } else {
     clpd_fdcapture *cap = NULL;
-    FILE *log = stderr;
-    if (clpd_trace_active(trace)) {
-      cap = clpd_fdcapture_start(trace, stderr);
-      if (cap != NULL) log = clpd_fdcapture_log(cap);
-    }
-    if (clpd_trace_active(trace) && cap == NULL) {
+    if (clpd_trace_active(trace) &&
+        (cap = clpd_fdcapture_start(trace, clpd_log())) == NULL) {
       rc = 1;
     } else {
       Reset(clpd_engine_env(engine));
-      rc = serve(cfg, engine, &packages, trace, ct, log);
+      rc = serve(cfg, engine, &packages, trace, ct);
+      clpd_fdcapture_stop(cap);
     }
-    clpd_fdcapture_stop(cap);
   }
   clpd_clips_trace_detach(ct);
   clpd_packages_free(&packages);
@@ -149,6 +138,10 @@ int main(int argc, char **argv) {
   int check = 0, i, rc;
   clpd_config cfg;
 
+  /* Before any other use of stdout (setvbuf must come first): lines written
+   * with printf, by the engine or a plugin, reach the trace capture pipe as
+   * they end (docs/trace.md). */
+  setvbuf(stdout, NULL, _IOLBF, 0);
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0) {
       fputs(usage, stdout);
@@ -169,7 +162,7 @@ int main(int argc, char **argv) {
   if (config_path == NULL)
     return usage_error("missing required option --config%s", "");
 
-  rc = clpd_config_load(config_path, &cfg, stderr);
+  rc = clpd_config_load(config_path, &cfg, clpd_log());
   rc = rc != 0 ? 1 : start(config_path, &cfg, check);
   clpd_config_free(&cfg);
   return rc;

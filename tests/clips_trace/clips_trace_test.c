@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 
 #include "clips_trace.h"
+#include "log.h"
 
 #include "../common/expect.h"
 
@@ -23,8 +24,9 @@ static void fixed_clock(long long *sec, long *nsec) {
   *nsec = 641999999;
 }
 
+/* Big enough for the line-cap test (three lines of up to 64 KiB). */
 static char *slurp(const char *path) {
-  static char buf[16384];
+  static char buf[512 * 1024];
   size_t n;
   FILE *f = fopen(path, "r");
   if (f == NULL) return NULL;
@@ -86,6 +88,17 @@ static void teardown(fixture *f) {
 
 static void eval(Environment *env, const char *expr) {
   EXPECT(Eval(env, expr, NULL) == EE_NO_ERROR);
+}
+
+/* Contents of a temporary stream, which is closed. */
+static char *stream_text(FILE *f) {
+  static char buf[1024];
+  size_t n;
+  rewind(f);
+  n = fread(buf, 1, sizeof buf - 1, f);
+  buf[n] = '\0';
+  fclose(f);
+  return buf;
 }
 
 /* Fragments become lines; a pending partial line is written by flush and
@@ -277,7 +290,9 @@ static void test_detach(void) {
  * and no router or callback is added. */
 static void test_inactive(void) {
   char out_path[300];
-  clpd_clips_trace *ct = (clpd_clips_trace *)&ct;
+  /* Non-NULL sentinel, never dereferenced: attach must overwrite it. */
+  static char sentinel;
+  clpd_clips_trace *ct = (clpd_clips_trace *)&sentinel;
   clpd_trace *t = clpd_trace_open(NULL, NULL, "n1", stderr);
   Environment *env = CreateEnvironment();
   int saved, fd;
@@ -310,6 +325,186 @@ static void test_inactive(void) {
   clpd_trace_close(t);
 }
 
+/* L52 R4: while the sink fails to write, STDERR and STDWRN lines also go
+ * to the daemon log stream (STDOUT does not); with a healthy sink they
+ * only go to the trace. */
+static void test_failing_sink_to_log(void) {
+  FILE *err = tmpfile(), *log = tmpfile(), *prev;
+  clpd_trace *t;
+  clpd_clips_trace *ct = NULL;
+  Environment *env = CreateEnvironment();
+  EXPECT(err != NULL && log != NULL && env != NULL);
+  if (err == NULL || log == NULL || env == NULL) return;
+  prev = clpd_log_set(log);
+
+  unlink(text_path);
+  t = clpd_trace_open(text_path, NULL, "n1", err);
+  EXPECT(t != NULL);
+  if (t == NULL) return;
+  clpd_trace_set_clock(t, fixed_clock);
+  EXPECT(clpd_clips_trace_attach(env, t, 1, 1, &ct) == 0);
+  EXPECT(!clpd_trace_failing(t));
+  WriteString(env, STDERR, "healthy\n");
+  clpd_clips_trace_detach(ct);
+  clpd_trace_close(t);
+
+  t = clpd_trace_open("/dev/full", NULL, "n1", err);
+  EXPECT(t != NULL);
+  if (t == NULL) return;
+  EXPECT(clpd_clips_trace_attach(env, t, 1, 1, &ct) == 0);
+  WriteString(env, STDOUT, "o1\n");
+  EXPECT(clpd_trace_failing(t));
+  WriteString(env, STDERR, "e1\n");
+  WriteString(env, STDWRN, "w1\n");
+  WriteString(env, STDERR, "e2");
+  EXPECT(AssertString(env, "(catalog a)") != NULL);
+  clpd_clips_trace_flush(ct);
+  clpd_clips_trace_detach(ct);
+  clpd_trace_close(t);
+  DestroyEnvironment(env);
+
+  clpd_log_set(prev);
+  EXPECT(strcmp(stream_text(err), "clpdaemon: /dev/full: cannot write: No "
+                                  "space left on device\n") == 0);
+  EXPECT(strcmp(stream_text(log), "clpdaemon: STDERR: e1\n"
+                                  "clpdaemon: STDWRN: w1\n"
+                                  "clpdaemon: STDERR: e2\n") == 0);
+  expect_file("healthy sink", text_path, TS "- STDERR healthy\n");
+}
+
+/* L52 R4: a pending output line that reaches CLPD_TRACE_LINE_MAX bytes is
+ * written as one event and the rest continues, whether it arrives in
+ * pieces or in one string (same rule as the fd capture, so a line of
+ * exactly the cap is followed by an empty line); shorter lines are never
+ * split. */
+static void test_line_cap(void) {
+  enum { CAP = CLPD_TRACE_LINE_MAX };
+  size_t head = strlen(TS "- STDOUT ");
+  char *in = malloc(CAP + 16), *want = malloc(3 * CAP + 8 * head + 64), *p;
+  fixture f;
+  EXPECT(in != NULL && want != NULL);
+  if (in == NULL || want == NULL || setup(&f, 0, 0, NULL) != 0) {
+    free(in);
+    free(want);
+    return;
+  }
+  /* CAP + 10 'a' in two pieces, then the newline. */
+  memset(in, 'a', CAP / 2);
+  in[CAP / 2] = '\0';
+  WriteString(f.env, STDOUT, in);
+  memset(in, 'a', CAP / 2 + 10);
+  in[CAP / 2 + 10] = '\0';
+  WriteString(f.env, STDOUT, in);
+  WriteString(f.env, STDOUT, "\n");
+  /* CAP + 5 'b' and the newline in one string. */
+  memset(in, 'b', CAP + 5);
+  memcpy(in + CAP + 5, "\n", 2);
+  WriteString(f.env, STDOUT, in);
+  /* Exactly CAP 'c', then the newline. */
+  memset(in, 'c', CAP);
+  memcpy(in + CAP, "\n", 2);
+  WriteString(f.env, STDOUT, in);
+  /* A short line in pieces stays one line. */
+  WriteString(f.env, STDOUT, "sh");
+  WriteString(f.env, STDOUT, "ort\n");
+  teardown(&f);
+
+  p = want;
+#define LINE(ch, n)                         \
+  do {                                      \
+    memcpy(p, TS "- STDOUT ", head);        \
+    p += head;                              \
+    memset(p, ch, n);                       \
+    p += n;                                 \
+    *p++ = '\n';                            \
+  } while (0)
+  LINE('a', CAP);
+  LINE('a', 10);
+  LINE('b', CAP);
+  LINE('b', 5);
+  LINE('c', CAP);
+#undef LINE
+  strcpy(p, TS "- STDOUT \n" TS "- STDOUT short\n");
+  expect_file("line cap", text_path, want);
+  free(in);
+  free(want);
+}
+
+/* Calls the trace's modify callback with (fact, NULL) only: the first half
+ * of a modify that never reaches its second callback. */
+static void half_modify(Environment *env, Fact *fact) {
+  ModifyCallFunctionItem *m;
+  for (m = FactData(env)->ListOfModifyFunctions; m != NULL; m = m->next)
+    if (strcmp(m->name, "clpd-trace") == 0) {
+      m->func(env, fact, NULL, m->context);
+      return;
+    }
+  EXPECT(!"modify callback not installed");
+}
+
+/* L52 R3: suppression state left by a modify that ends between its two
+ * callbacks does not survive the end of the cycle (flush) or the start of
+ * the next rule firing: the fact's later retract is traced. */
+static void test_aborted_modify(void) {
+  fixture f;
+  Fact *a, *b;
+  if (setup(&f, 1, 0,
+            "(deftemplate order (slot wf-id) (slot qty))"
+            "(defrule drop ?o <- (order (qty 2)) => (retract ?o))") != 0)
+    return;
+  Reset(f.env);
+  a = AssertString(f.env, "(order (wf-id w1) (qty 1))");
+  b = AssertString(f.env, "(order (wf-id w2) (qty 2))");
+  EXPECT(a != NULL && b != NULL);
+  if (a == NULL || b == NULL) {
+    teardown(&f);
+    return;
+  }
+  half_modify(f.env, a);
+  clpd_clips_trace_flush(f.ct);
+  EXPECT(Retract(a) == RE_NO_ERROR);
+  half_modify(f.env, b);
+  EXPECT(Run(f.env, -1) == 1);
+  teardown(&f);
+  expect_file("aborted modify", text_path,
+              TS "w1 FACT+ f-1 (order (wf-id w1) (qty 1))\n"
+              TS "w2 FACT+ f-2 (order (wf-id w2) (qty 2))\n"
+              TS "w1 FACT- f-1 (order (wf-id w1) (qty 1))\n"
+              TS "w2 FACT- f-2 (order (wf-id w2) (qty 2))\n");
+}
+
+static bool query_none(Environment *env, const char *name, void *ctx) {
+  (void)env;
+  (void)name;
+  (void)ctx;
+  return false;
+}
+
+/* L52 R3: when the hooks cannot be installed (here a router already holds
+ * the name), attach returns -1, sets *out to NULL and leaves nothing of its
+ * own installed, without removing what it did not install. */
+static void test_attach_failure(void) {
+  static char sentinel;
+  clpd_clips_trace *ct = (clpd_clips_trace *)&sentinel;
+  clpd_trace *t = clpd_trace_open(text_path, NULL, "n1", stderr);
+  Environment *env = CreateEnvironment();
+  EXPECT(t != NULL && env != NULL);
+  if (t == NULL || env == NULL) return;
+  EXPECT(AddRouter(env, "clpd-trace", 0, query_none, NULL, NULL, NULL, NULL,
+                   NULL));
+  EXPECT(clpd_clips_trace_attach(env, t, 1, 1, &ct) == -1);
+  EXPECT(ct == NULL);
+  EXPECT(!RemoveBeforeRuleFiresFunction(env, "clpd-trace"));
+  EXPECT(!RemoveAfterRuleFiresFunction(env, "clpd-trace"));
+  EXPECT(!RemoveAssertFunction(env, "clpd-trace"));
+  EXPECT(!RemoveRetractFunction(env, "clpd-trace"));
+  EXPECT(!RemoveModifyFunction(env, "clpd-trace"));
+  EXPECT(DeleteRouter(env, "clpd-trace")); /* the other router survived */
+  EXPECT(!DeleteRouter(env, "clpd-trace"));
+  DestroyEnvironment(env);
+  clpd_trace_close(t);
+}
+
 int main(void) {
   if (mkdtemp(dir) == NULL) {
     perror("mkdtemp");
@@ -324,6 +519,10 @@ int main(void) {
   test_modify_jsonl();
   test_detach();
   test_inactive();
+  test_failing_sink_to_log();
+  test_line_cap();
+  test_aborted_modify();
+  test_attach_failure();
   unlink(text_path);
   unlink(jsonl_path);
   rmdir(dir);

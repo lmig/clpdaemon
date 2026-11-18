@@ -243,6 +243,15 @@ int clpd_trace_active(const clpd_trace *t) {
   return t->text.path != NULL || t->jsonl.path != NULL;
 }
 
+int clpd_trace_failing(clpd_trace *t) {
+  int failing;
+  pthread_mutex_lock(&t->lock);
+  failing = (t->text.f != NULL && t->text.write_failed) ||
+            (t->jsonl.f != NULL && t->jsonl.write_failed);
+  pthread_mutex_unlock(&t->lock);
+  return failing;
+}
+
 int clpd_trace_reopen(clpd_trace *t, FILE *err) {
   sink *sinks[2];
   int i, failed = 0;

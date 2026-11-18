@@ -21,8 +21,9 @@ foreach(t scheduler engine loop lint manifest packages trace clips_trace fdcaptu
   add_test(NAME clpdaemon_${t} COMMAND ${t}_test)
 endforeach()
 
-# Link seam for the reader-failure case: the test wraps poll.
-target_link_options(fdcapture_test PRIVATE -Wl,--wrap=poll)
+# Link seam for the reader-failure cases, this test binary only: the test
+# wraps poll and read (production objects are unchanged).
+target_link_options(fdcapture_test PRIVATE -Wl,--wrap=poll -Wl,--wrap=read)
 
 # A lost stop signal must fail a test, not hang it until the default timeout.
 set_tests_properties(clpdaemon_scheduler clpdaemon_engine clpdaemon_loop

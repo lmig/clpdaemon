@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "clips_trace.h"
+#include "log.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -26,28 +27,46 @@ typedef struct {
   size_t len, cap;
 } line_buf;
 
+/* Hooks attach installed, so a failed attach or detach removes only those. */
+enum {
+  HOOK_ROUTER = 1,
+  HOOK_BEFORE = 2,
+  HOOK_AFTER = 4,
+  HOOK_ASSERT = 8,
+  HOOK_RETRACT = 16,
+  HOOK_MODIFY = 32
+};
+
 struct clpd_clips_trace {
   Environment *env;
   clpd_trace *trace;
-  int watch_facts;
+  int installed; /* HOOK_* bits */
+  /* Partial output line per stream, shorter than CLPD_TRACE_LINE_MAX. */
   line_buf pending[STREAM_COUNT];
+  /* Scratch output of render_fact and fact_wf_id. Each use resets it, so
+   * a result read from it (render_fact returns its contents) is valid only
+   * until the next render_fact or fact_wf_id call: callers consume or copy
+   * it first (fact_wf_id itself returns a copy). */
   StringBuilder *sb;
   /* wf_id of the firing rule (NULL outside a firing or when unknown). */
   char *rule_wf_id;
   /* The fact being modified, between the two modify callbacks; its nested
    * retract and assert are not traced (L48). The old version is kept in
-   * case the modify ends without that fact (a duplicate). */
+   * case the modify ends without that fact (a duplicate). CLIPS 6.4.2 calls
+   * both callbacks unconditionally (ReplaceFact, tmpltfun.c), and a modify
+   * never spans a rule firing boundary or a cycle end, so the state is also
+   * cleared there: a modify cut short (for example by a callback of
+   * another component) cannot suppress later events. */
   Fact *modifying;
   long long old_index;
   char *old_tmpl, *old_text, *old_wf_id;
 };
 
+/* Out of memory inside a CLIPS callback, which has no way to report an
+ * error: fatal, on the daemon log stream (never into the trace pipe). */
 static void *xrealloc(void *p, size_t n) {
   void *q = realloc(p, n);
-  if (q == NULL) {
-    perror("clpdaemon");
-    exit(1);
-  }
+  if (q == NULL) clpd_log_die_errno();
   return q;
 }
 
@@ -60,6 +79,9 @@ static char *xstrdup(const char *s) {
 
 /* --- router -------------------------------------------------------------- */
 
+/* Index of a logical name in stream_name, -1 for any other name. CLIPS
+ * calls router_write only for names router_query accepted, that is names
+ * for which this returns an index. */
 static int stream_of(const char *name) {
   if (strcmp(name, STDOUT) == 0) return STREAM_OUT;
   if (strcmp(name, STDERR) == 0) return STREAM_ERR;
@@ -67,9 +89,20 @@ static int stream_of(const char *name) {
   return -1;
 }
 
+/* Writes one output line. While the sink is failing, STDERR and STDWRN
+ * lines also go to the daemon log stream, so engine errors stay visible
+ * (L52 R4): "clpdaemon: <STDERR|STDWRN>: <text>". */
 static void emit_line(clpd_clips_trace *ct, int s, const char *text,
                       size_t len) {
   clpd_trace_output(ct->trace, ct->rule_wf_id, stream_name[s], text, len);
+  if (s != STREAM_OUT && clpd_trace_failing(ct->trace)) {
+    FILE *log = clpd_log();
+    flockfile(log);
+    fprintf(log, "clpdaemon: %s: ", stream_name[s]);
+    fwrite(text, 1, len, log);
+    fputc('\n', log);
+    funlockfile(log);
+  }
 }
 
 static void flush_pending(clpd_clips_trace *ct) {
@@ -99,31 +132,53 @@ static bool router_query(Environment *env, const char *name, void *ctx) {
   return stream_of(name) >= 0;
 }
 
-/* Emits every complete line; the rest waits for more text or a flush. */
+/* Writes the pending line of stream s followed by n bytes of p as one
+ * line, and empties the pending line. */
+static void emit_joined(clpd_clips_trace *ct, int s, const char *p,
+                        size_t n) {
+  line_buf *b = &ct->pending[s];
+  if (b->len == 0) {
+    emit_line(ct, s, p, n);
+    return;
+  }
+  append(b, p, n);
+  emit_line(ct, s, b->buf, b->len);
+  b->len = 0;
+}
+
+/* Emits every complete line; the rest waits for more text or a flush. A
+ * line that reaches CLPD_TRACE_LINE_MAX bytes without a newline is written
+ * as one event of exactly that size and the rest continues (the fd capture
+ * rule), so the pending line stays shorter than the cap. */
 static void router_write(Environment *env, const char *name, const char *str,
                          void *ctx) {
   clpd_clips_trace *ct = ctx;
   int s = stream_of(name);
-  line_buf *b = &ct->pending[s];
-  const char *nl;
+  line_buf *b;
   (void)env;
-  while ((nl = strchr(str, '\n')) != NULL) {
-    size_t n = (size_t)(nl - str);
-    if (b->len == 0) {
-      emit_line(ct, s, str, n);
-    } else {
-      append(b, str, n);
-      emit_line(ct, s, b->buf, b->len);
-      b->len = 0;
+  if (s < 0) return; /* not reached, see stream_of */
+  b = &ct->pending[s];
+  for (;;) {
+    const char *nl = strchr(str, '\n');
+    size_t n = nl != NULL ? (size_t)(nl - str) : strlen(str);
+    while (b->len + n >= CLPD_TRACE_LINE_MAX) {
+      size_t k = CLPD_TRACE_LINE_MAX - b->len;
+      emit_joined(ct, s, str, k);
+      str += k;
+      n -= k;
     }
+    if (nl == NULL) {
+      append(b, str, n);
+      return;
+    }
+    emit_joined(ct, s, str, n);
     str = nl + 1;
   }
-  append(b, str, strlen(str));
 }
 
 /* --- facts --------------------------------------------------------------- */
 
-/* Renders the fact into ct->sb on one line. */
+/* Renders the fact into ct->sb on one line; see the ct->sb contract. */
 static const char *render_fact(clpd_clips_trace *ct, Fact *f) {
   SBReset(ct->sb);
   OpenStringBuilderDestination(ct->env, PP_NAME, ct->sb);
@@ -134,7 +189,8 @@ static const char *render_fact(clpd_clips_trace *ct, Fact *f) {
 
 /* Copy of the wf-id slot of f: symbol or string contents, a number as
  * CLIPS prints it; NULL for ordered facts, templates without the slot, the
- * symbol nil (the slot default: not set) and other values. */
+ * symbol nil (the slot default: not set) and other values. Uses ct->sb for
+ * numbers, so it invalidates an earlier render_fact result. */
 static char *fact_wf_id(clpd_clips_trace *ct, Fact *f) {
   Deftemplate *d = FactDeftemplate(f);
   CLIPSValue v;
@@ -161,7 +217,7 @@ static char *fact_wf_id(clpd_clips_trace *ct, Fact *f) {
 
 static void trace_fact(clpd_clips_trace *ct, clpd_trace_fact_kind kind,
                        Fact *f) {
-  char *wf_id = fact_wf_id(ct, f);
+  char *wf_id = fact_wf_id(ct, f); /* before render_fact: both use ct->sb */
   clpd_trace_fact(ct->trace, kind, wf_id, FactIndex(f),
                   DeftemplateName(FactDeftemplate(f)), render_fact(ct, f));
   free(wf_id);
@@ -226,6 +282,7 @@ static void start_rule(clpd_clips_trace *ct, Activation *act, int trace_fire) {
   unsigned short i;
 
   flush_pending(ct);
+  clear_modify(ct);
   free(ct->rule_wf_id);
   ct->rule_wf_id = NULL;
   if (trace_fire && basis->bcount > 0)
@@ -260,21 +317,29 @@ static void after_fire(Environment *env, Activation *act, void *ctx) {
   (void)env;
   if (act == NULL) return;
   flush_pending(ct);
+  clear_modify(ct);
   free(ct->rule_wf_id);
   ct->rule_wf_id = NULL;
 }
 
 /* --- attach / detach ----------------------------------------------------- */
 
+/* Removes the hooks attach installed, and only those: a router or callback
+ * of the same name that belongs to someone else stays. */
 static void remove_hooks(clpd_clips_trace *ct) {
-  DeleteRouter(ct->env, NAME);
-  RemoveBeforeRuleFiresFunction(ct->env, NAME);
-  RemoveAfterRuleFiresFunction(ct->env, NAME);
-  if (ct->watch_facts) {
-    RemoveAssertFunction(ct->env, NAME);
-    RemoveRetractFunction(ct->env, NAME);
-    RemoveModifyFunction(ct->env, NAME);
-  }
+  if (ct->installed & HOOK_ROUTER) DeleteRouter(ct->env, NAME);
+  if (ct->installed & HOOK_BEFORE) RemoveBeforeRuleFiresFunction(ct->env, NAME);
+  if (ct->installed & HOOK_AFTER) RemoveAfterRuleFiresFunction(ct->env, NAME);
+  if (ct->installed & HOOK_ASSERT) RemoveAssertFunction(ct->env, NAME);
+  if (ct->installed & HOOK_RETRACT) RemoveRetractFunction(ct->env, NAME);
+  if (ct->installed & HOOK_MODIFY) RemoveModifyFunction(ct->env, NAME);
+  ct->installed = 0;
+}
+
+/* Records hook bit when ok; returns ok. */
+static bool installed(clpd_clips_trace *ct, int hook, bool ok) {
+  if (ok) ct->installed |= hook;
+  return ok;
 }
 
 static void free_ct(clpd_clips_trace *ct) {
@@ -297,19 +362,25 @@ int clpd_clips_trace_attach(Environment *env, clpd_trace *t, int watch_facts,
   if (ct == NULL) return -1;
   ct->env = env;
   ct->trace = t;
-  ct->watch_facts = watch_facts;
   ct->sb = CreateStringBuilder(env, 256);
   ok = ct->sb != NULL &&
-       AddRouter(env, NAME, ROUTER_PRIORITY, router_query, router_write, NULL,
-                 NULL, NULL, ct);
-  ok = ok && AddBeforeRuleFiresFunction(
-                 env, NAME, watch_rules ? before_fire_watched : before_fire, 0,
-                 ct);
-  ok = ok && AddAfterRuleFiresFunction(env, NAME, after_fire, 0, ct);
+       installed(ct, HOOK_ROUTER,
+                 AddRouter(env, NAME, ROUTER_PRIORITY, router_query,
+                           router_write, NULL, NULL, NULL, ct));
+  ok = ok && installed(ct, HOOK_BEFORE,
+                       AddBeforeRuleFiresFunction(
+                           env, NAME,
+                           watch_rules ? before_fire_watched : before_fire, 0,
+                           ct));
+  ok = ok && installed(ct, HOOK_AFTER,
+                       AddAfterRuleFiresFunction(env, NAME, after_fire, 0, ct));
   if (ok && watch_facts)
-    ok = AddAssertFunction(env, NAME, on_assert, 0, ct) &&
-         AddRetractFunction(env, NAME, on_retract, 0, ct) &&
-         AddModifyFunction(env, NAME, on_modify, 0, ct);
+    ok = installed(ct, HOOK_ASSERT,
+                   AddAssertFunction(env, NAME, on_assert, 0, ct)) &&
+         installed(ct, HOOK_RETRACT,
+                   AddRetractFunction(env, NAME, on_retract, 0, ct)) &&
+         installed(ct, HOOK_MODIFY,
+                   AddModifyFunction(env, NAME, on_modify, 0, ct));
   if (!ok) {
     remove_hooks(ct);
     free_ct(ct);
@@ -320,7 +391,9 @@ int clpd_clips_trace_attach(Environment *env, clpd_trace *t, int watch_facts,
 }
 
 void clpd_clips_trace_flush(clpd_clips_trace *ct) {
-  if (ct != NULL) flush_pending(ct);
+  if (ct == NULL) return;
+  flush_pending(ct);
+  clear_modify(ct);
 }
 
 void clpd_clips_trace_detach(clpd_clips_trace *ct) {

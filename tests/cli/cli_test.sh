@@ -509,5 +509,61 @@ if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "
 fi
 : >ypid
 
+# L52 R4: while the trace cannot be written, CLIPS STDERR lines also go to
+# the daemon log stream, the original stderr (fds 1 and 2 are captured).
+mkdir errpkg
+conf errpkg/package.conf 'definition = err
+version = 1
+files = e.clp'
+conf errpkg/e.clp '(defrule warn => (printout stderr "engine-error" crlf) (printout t "engine-out" crlf))'
+conf trfull.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = errpkg
+trace_text = /dev/full'
+cases=$((cases + 1))
+"$BIN" --config trfull.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: STDERR: engine-error" || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: /dev/full: cannot write: No space left on device
+clpdaemon: STDERR: engine-error
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "failing trace: engine errors on stderr" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# T5d A2: router lines at the 65536-byte cap. A 65535-byte line is one
+# event; 65536 bytes then "a" give a 65536-byte event and "a".
+mkdir cappkg
+conf cappkg/package.conf 'definition = cap
+version = 1
+files = c.clp'
+conf cappkg/c.clp '(defrule big => (bind ?s "x") (loop-for-count 16 (bind ?s (str-cat ?s ?s))) (printout t (sub-string 1 65535 ?s) crlf) (printout t ?s "a" crlf))'
+conf trcap.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = cappkg
+trace_text = t.txt'
+cases=$((cases + 1))
+"$BIN" --config trcap.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_line err.txt "clpdaemon: n1: running" || ok=0
+wait_has t.txt ' - STDOUT a' || ok=0
+kill -TERM "$pid"
+wait_exit "$pid"
+got=$(grep -F ' STDOUT ' t.txt | sed 's/^[^ ]* n1 - STDOUT //' | awk '{ printf "%s%d", sep, length($0); sep = "," }')
+last=$(grep -F ' STDOUT ' t.txt | tail -n 1 | sed 's/^[^ ]* n1 - STDOUT //')
+want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  [ "$got" != "65535,65536,1" ] || [ "$last" != a ]; then
+  fail "router line cap" "exit $rc, lines seen $ok, lengths [$got], last [$last], stderr [$(cat err.txt)]"
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

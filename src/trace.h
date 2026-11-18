@@ -11,6 +11,11 @@
 
 typedef struct clpd_trace clpd_trace;
 
+/* Longest output line producers hand to the sink: a pending line that
+ * reaches it without a newline is written as one event and the rest
+ * continues in the next (src/fdcapture.c, src/clips_trace.c). */
+#define CLPD_TRACE_LINE_MAX 65536
+
 /* Wall clock used for timestamps (seconds and nanoseconds since the
  * epoch); replaceable for tests. */
 typedef void clpd_trace_clock(long long *sec, long *nsec);
@@ -34,6 +39,9 @@ void clpd_trace_set_clock(clpd_trace *t, clpd_trace_clock *clock);
 void clpd_trace_set_err(clpd_trace *t, FILE *err);
 /* 1 when at least one file is configured. */
 int clpd_trace_active(const clpd_trace *t);
+/* 1 while at least one file is in the write-failure state (its last write
+ * or flush failed and no reopen has succeeded since). Thread-safe. */
+int clpd_trace_failing(clpd_trace *t);
 /* Reopens every file by path (log rotation). A file that cannot be reopened
  * keeps its previous stream and "clpdaemon: <path>: cannot reopen: <error>"
  * goes to err. Returns the number of files that failed. */

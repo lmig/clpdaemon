@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 
 #include "fdcapture.h"
+#include "log.h"
 #include "trace.h"
 
 #include "../common/expect.h"
@@ -12,9 +13,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -326,25 +330,52 @@ static void test_concurrent(void) {
   EXPECT(count_lines(jsonl_path) == 1000);
 }
 
-/* Link seam (-Wl,--wrap=poll, this test only): the next poll fails once. */
-static int fail_poll;
+/* Link seam (-Wl,--wrap=poll -Wl,--wrap=read, this test binary only): the
+ * next poll or read fails once with the stored errno. Only the reader
+ * thread calls read directly (stdio reads do not go through the wrapper). */
+static int fail_poll, fail_read, slow_read;
 int __real_poll(struct pollfd *fds, nfds_t n, int timeout);
 int __wrap_poll(struct pollfd *fds, nfds_t n, int timeout);
 int __wrap_poll(struct pollfd *fds, nfds_t n, int timeout) {
-  if (__atomic_exchange_n(&fail_poll, 0, __ATOMIC_SEQ_CST)) {
-    errno = ENOMEM;
+  int e = __atomic_exchange_n(&fail_poll, 0, __ATOMIC_SEQ_CST);
+  if (e != 0) {
+    errno = e;
     return -1;
   }
   return __real_poll(fds, n, timeout);
 }
+ssize_t __real_read(int fd, void *buf, size_t n);
+ssize_t __wrap_read(int fd, void *buf, size_t n);
+ssize_t __wrap_read(int fd, void *buf, size_t n) {
+  int e = __atomic_exchange_n(&fail_read, 0, __ATOMIC_SEQ_CST);
+  if (e != 0) {
+    errno = e;
+    return -1;
+  }
+  if (__atomic_load_n(&slow_read, __ATOMIC_SEQ_CST)) {
+    struct timespec t = {0, 2000000};
+    nanosleep(&t, NULL);
+  }
+  return __real_read(fd, buf, n);
+}
 
-/* A reader failure is reported once on the daemon log, the original
- * descriptors come back so writers never block, and stop still works. */
-static void test_reader_failure(void) {
+/* 1 once no process holds the read end of the pipe w writes to. */
+static int readers_gone(int w) {
+  struct pollfd p = {w, POLLOUT, 0};
+  return poll(&p, 1, 0) == 1 && (p.revents & POLLERR) != 0;
+}
+
+/* A reader failure (poll or read, through *seam) is reported once on the
+ * daemon log, the original descriptors come back so writers never block,
+ * the pipe read ends are closed after the failure drain so a writer still
+ * holding a pipe (a child) gets EPIPE instead of blocking, and stop still
+ * works. */
+static void reader_failure(int *seam, int err, const char *message) {
   enum { BIG = 256 * 1024 };
   char out_path[300], err_path[300], *got, *big = malloc(BIG);
   struct timespec ms = {0, 1000000};
-  int saved_out = dup(1), saved_err = dup(2), fo, fe, i;
+  int saved_out = dup(1), saved_err = dup(2), fo, fe, i, w = -1, gone = 0,
+      epipe = 0;
   size_t n;
   snprintf(out_path, sizeof out_path, "%s/stdout.txt", dir);
   snprintf(err_path, sizeof err_path, "%s/stderr.txt", dir);
@@ -360,13 +391,20 @@ static void test_reader_failure(void) {
   close(fo);
   close(fe);
   if (begin()) {
+    void (*old_pipe)(int);
+    w = dup(1); /* a write end kept by "a child" */
     write_all(1, "warm\n", 5);
     wait_lines(1);
-    __atomic_store_n(&fail_poll, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(seam, err, __ATOMIC_SEQ_CST);
     write_all(1, "x\n", 2); /* wakes the reader, which then fails */
     for (i = 0; i < 5000 && !same_file(1, &orig_out); i++) nanosleep(&ms, NULL);
     write_all(1, big, BIG); /* blocks forever if fd 1 were still a pipe */
     fprintf(stderr, "after\n");
+    for (i = 0; i < 5000 && !(gone = readers_gone(w)); i++) nanosleep(&ms, NULL);
+    old_pipe = signal(SIGPIPE, SIG_IGN);
+    epipe = write(w, "y\n", 2) < 0 && errno == EPIPE;
+    signal(SIGPIPE, old_pipe);
+    close(w);
     finish();
   }
   fflush(stdout);
@@ -374,11 +412,12 @@ static void test_reader_failure(void) {
   dup2(saved_err, 2);
   close(saved_out);
   close(saved_err);
+  EXPECT(gone);
+  EXPECT(epipe);
   got = slurp(err_path, NULL);
-  EXPECT(got != NULL &&
-         strcmp(got, "clpdaemon: trace capture failed: Cannot allocate "
-                     "memory; stdout and stderr go back to the console\n"
-                     "after\n") == 0);
+  EXPECT(got != NULL && strcmp(got, message) == 0);
+  if (got != NULL && strcmp(got, message) != 0)
+    fprintf(stderr, "--- got\n%s---\n", got);
   free(got);
   got = slurp(out_path, &n);
   /* "x" reached either the trace (still in the pipe) or the console. */
@@ -390,6 +429,163 @@ static void test_reader_failure(void) {
   free(big);
   unlink(out_path);
   unlink(err_path);
+}
+
+static void test_reader_failure(void) {
+  reader_failure(&fail_poll, ENOMEM,
+                 "clpdaemon: trace capture failed: Cannot allocate memory; "
+                 "stdout and stderr go back to the console\n"
+                 "after\n");
+}
+
+static void test_read_failure(void) {
+  reader_failure(&fail_read, EIO,
+                 "clpdaemon: trace capture failed: Input/output error; "
+                 "stdout and stderr go back to the console\n"
+                 "after\n");
+}
+
+/* Redirects fd 2 to a fresh file under dir; returns the saved fd 2. */
+static int stderr_to(const char *path) {
+  int saved = dup(2), fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  EXPECT(saved >= 0 && fd >= 0);
+  if (saved < 0 || fd < 0) return -1;
+  dup2(fd, 2);
+  close(fd);
+  return saved;
+}
+
+/* During a capture the daemon log stream (clpd_log) is the original
+ * stderr, so a daemon message is not traced; after stop it is stderr. */
+static void test_log_accessor(void) {
+  char log_path[300], *got;
+  int saved, during = 0;
+  snprintf(log_path, sizeof log_path, "%s/stderr.txt", dir);
+  if ((saved = stderr_to(log_path)) < 0) return;
+  if (begin()) {
+    during = clpd_log() == clpd_fdcapture_log(cap);
+    fprintf(clpd_log(), "clpdaemon: via the accessor\n");
+    fprintf(stderr, "captured\n");
+    finish();
+  }
+  dup2(saved, 2);
+  close(saved);
+  EXPECT(during);
+  EXPECT(clpd_log() == stderr);
+  got = slurp(log_path, NULL);
+  EXPECT(got != NULL && strcmp(got, "clpdaemon: via the accessor\n") == 0);
+  free(got);
+  expect_file(text_path, TS " n1 - stderr captured\n");
+  unlink(log_path);
+}
+
+/* Arms a read failure while the main thread is blocked writing. */
+static void *arm_read_failure(void *arg) {
+  struct timespec t = {0, 30000000};
+  (void)arg;
+  nanosleep(&t, NULL);
+  __atomic_store_n(&fail_read, EIO, __ATOMIC_SEQ_CST);
+  return NULL;
+}
+
+/* L52/T5d A1: a write already blocked on the pipe when the reader fails
+ * gets EPIPE (or a short count) once the read ends close, and the daemon
+ * survives: the capture catches SIGPIPE while it runs. In a child, since a
+ * regression kills the process with SIGPIPE. */
+static void test_blocked_writer_survives(void) {
+  enum { BIG = 16 * 1024 * 1024 };
+  static const char want[] =
+      "clpdaemon: trace capture failed: Input/output error; stdout and "
+      "stderr go back to the console\n";
+  char log_path[300], *got;
+  int saved, status = 0;
+  pid_t pid;
+  snprintf(log_path, sizeof log_path, "%s/stderr.txt", dir);
+  if ((saved = stderr_to(log_path)) < 0) return;
+  fflush(stdout);
+  pid = fork();
+  if (pid == 0) {
+    char *big = malloc(BIG);
+    pthread_t th;
+    ssize_t w;
+    if (big == NULL || !begin()) _exit(3);
+    memset(big, 'q', BIG);
+    __atomic_store_n(&slow_read, 1, __ATOMIC_SEQ_CST);
+    if (pthread_create(&th, NULL, arm_read_failure, NULL) != 0) _exit(4);
+    w = write(1, big, BIG); /* blocked when the reader fails */
+    pthread_join(th, NULL);
+    __atomic_store_n(&slow_read, 0, __ATOMIC_SEQ_CST);
+    finish();
+    _exit(w < BIG && failures == 0 ? 0 : 5);
+  }
+  dup2(saved, 2);
+  close(saved);
+  EXPECT(pid > 0 && waitpid(pid, &status, 0) == pid);
+  EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  if (WIFSIGNALED(status))
+    fprintf(stderr, "child killed by signal %d\n", WTERMSIG(status));
+  else if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+    fprintf(stderr, "child exit %d\n", WEXITSTATUS(status));
+  got = slurp(log_path, NULL);
+  EXPECT(got != NULL && strcmp(got, want) == 0);
+  free(got);
+  unlink(log_path);
+}
+
+/* SigIgn mask of a process started by sh during a capture: SIGPIPE must not
+ * be in it (the capture catches SIGPIPE, it never ignores it, so children
+ * get the default disposition back at exec). */
+static void test_child_default_sigpipe(void) {
+  char path[300], cmd[400], *got, *p;
+  unsigned long long ign = ~0ULL;
+  struct sigaction during, after;
+  int rc = -1;
+  snprintf(path, sizeof path, "%s/sig.txt", dir);
+  snprintf(cmd, sizeof cmd, "grep '^SigIgn:' /proc/self/status > %s", path);
+  if (!begin()) return;
+  sigaction(SIGPIPE, NULL, &during);
+  rc = system(cmd);
+  finish();
+  sigaction(SIGPIPE, NULL, &after);
+  EXPECT(rc == 0);
+  EXPECT(during.sa_handler != SIG_IGN && during.sa_handler != SIG_DFL);
+  EXPECT(after.sa_handler == SIG_DFL);
+  got = slurp(path, NULL);
+  p = got != NULL ? strchr(got, ':') : NULL;
+  if (p != NULL) ign = strtoull(p + 1, NULL, 16);
+  EXPECT((ign & (1ULL << (SIGPIPE - 1))) == 0);
+  free(got);
+  unlink(path);
+}
+
+/* A fatal error during a capture (the OOM paths) reaches the original
+ * stderr before exit 1 and is not traced. */
+static void test_fatal_during_capture(void) {
+  char log_path[300], *got;
+  int saved, status = 0;
+  pid_t pid;
+  snprintf(log_path, sizeof log_path, "%s/stderr.txt", dir);
+  if ((saved = stderr_to(log_path)) < 0) return;
+  fflush(stdout);
+  pid = fork();
+  if (pid == 0) {
+    if (begin()) {
+      write_all(1, "before\n", 7);
+      wait_lines(1);
+      errno = ENOMEM;
+      clpd_log_die_errno();
+    }
+    _exit(3);
+  }
+  dup2(saved, 2);
+  close(saved);
+  EXPECT(pid > 0 && waitpid(pid, &status, 0) == pid);
+  EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+  got = slurp(log_path, NULL);
+  EXPECT(got != NULL && strcmp(got, "clpdaemon: Cannot allocate memory\n") == 0);
+  free(got);
+  expect_file(text_path, TS " n1 - stdout before\n");
+  unlink(log_path);
 }
 
 /* A setup failure is reported and leaves the descriptors as they were. */
@@ -408,6 +604,7 @@ static void test_setup_failure(void) {
   dup2(saved, 1);
   close(saved);
   EXPECT(same_file(2, &before));
+  EXPECT(clpd_log() == stderr); /* the daemon log stream is unchanged */
   rewind(err);
   n = fread(buf, 1, sizeof buf - 1, err);
   buf[n] = '\0';
@@ -418,6 +615,9 @@ static void test_setup_failure(void) {
 }
 
 int main(void) {
+  /* As src/main.c does at startup: printf lines reach the pipe as they end
+   * (the capture no longer changes stdout buffering). */
+  setvbuf(stdout, NULL, _IOLBF, 0);
   if (mkdtemp(dir) == NULL) {
     perror("mkdtemp");
     return 1;
@@ -434,6 +634,11 @@ int main(void) {
   test_short_lines_bulk();
   test_varying_lines();
   test_reader_failure();
+  test_read_failure();
+  test_log_accessor();
+  test_fatal_during_capture();
+  test_blocked_writer_survives();
+  test_child_default_sigpipe();
   unlink(text_path);
   unlink(jsonl_path);
   rmdir(dir);
