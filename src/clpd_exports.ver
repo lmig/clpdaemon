@@ -1,0 +1,10 @@
+/* Dynamic symbols of an executable built with clpd_export_clips
+ * (src/CMakeLists.txt, docs/plugins.md): -rdynamic exports every global
+ * symbol, and this script hides the daemon's clpd_* internals, which are
+ * not part of the plugin contract. GNU ld gives a pattern with other
+ * characters than a lone '*' precedence over '*', so clpd_* is local and
+ * every other symbol (the CLIPS API) stays global. */
+{
+  global: *;
+  local: clpd_*;
+};

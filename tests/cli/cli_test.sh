@@ -1,11 +1,13 @@
 #!/bin/sh
 # CLI and configuration tests for clpdaemon (T2, docs/configuration.md).
-# usage: cli_test.sh <path-to-clpdaemon> <plugin-dir>
-# <plugin-dir> holds the example and test plugins (<build>/plugins).
+# usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>
+# <plugin-dir> holds the example and test plugins (<build>/plugins);
+# <plugin-desc-size> prints sizeof(clpd_plugin) of this build.
 set -u
 
-BIN=${1:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir>}
-PLUGINS=${2:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir>}
+BIN=${1:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}
+PLUGINS=${2:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}
+DESC_SIZE=$("${3:?usage: cli_test.sh <path-to-clpdaemon> <plugin-dir> <plugin-desc-size>}") || exit 2
 case $BIN in /*) ;; *) BIN=$PWD/$BIN ;; esac
 case $PLUGINS in /*) ;; *) PLUGINS=$PWD/$PLUGINS ;; esac
 WORK=$(mktemp -d)
@@ -614,9 +616,11 @@ plugerr "clpd_plugin_get returns NULL" "$PLUGINS/test_bad_null.so" \
   "clpdaemon: $PLUGINS/test_bad_null.so: clpd_plugin_get returned NULL"
 plugerr "plugin ABI mismatch" "$PLUGINS/test_bad_abi.so" \
   "clpdaemon: $PLUGINS/test_bad_abi.so: ABI version 2, expected 1"
-# 72 = sizeof(clpd_plugin) on LP64 targets.
 plugerr "plugin descriptor too small" "$PLUGINS/test_bad_size.so" \
-  "clpdaemon: $PLUGINS/test_bad_size.so: descriptor size 8, expected at least 72"
+  "clpdaemon: $PLUGINS/test_bad_size.so: descriptor size 8, expected at least $DESC_SIZE"
+# The daemon exports the CLIPS API only, not its clpd_* internals (T6b).
+plugerr "plugin using a daemon internal" "$PLUGINS/test_bad_internal.so" \
+  "clpdaemon: $PLUGINS/test_bad_internal.so: cannot load: $PLUGINS/test_bad_internal.so: undefined symbol: clpd_log"
 plugerr "invalid plugin name" "$PLUGINS/test_bad_name.so" \
   "clpdaemon: $PLUGINS/test_bad_name.so: plugin name: expected 1-64 characters from [A-Za-z0-9._-], got 'bad name'"
 plugerr "plugin without init" "$PLUGINS/test_bad_noinit.so" \
@@ -643,6 +647,18 @@ packages = nopkg"
 RUN='timeout 10' check "package error after plugins shuts them down" 1 "" "clpdaemon: example: init
 clpdaemon: nopkg/package.conf: cannot open: No such file or directory
 clpdaemon: example: shutdown" -- --config plugpkg.conf
+# Teardown order (T6b): shutdown, the CLIPS environment, then dlclose.
+conf plugmark.conf "node_id = n1
+plugins = $PLUGINS/test_markers.so"
+export CLPD_TEST_MARKERS="$WORK/markers.txt"
+RUN='timeout 10' check "check unloads after the environment" 0 \
+  "clpdaemon: plugmark.conf: configuration OK" "clpdaemon: markers: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: markers: shutdown" -- --config plugmark.conf --check
+unset CLPD_TEST_MARKERS
+cases=$((cases + 1))
+if [ "$(cat markers.txt 2>/dev/null)" != "shutdown${NL}env-cleanup${NL}destructor" ]; then
+  fail "unload order shutdown, env cleanup, destructor" "markers [$(cat markers.txt 2>/dev/null)]"
+fi
 conf plugabi.conf "node_id = n1
 plugins = $PLUGINS/test_bad_abi.so"
 RUN='timeout 10' check "plugin error aborts a run too" 1 "" \
@@ -700,6 +716,66 @@ clpdaemon: hooks-a: cycle_end ok=1
 clpdaemon: hooks-b: cycle_end ok=1
 clpdaemon: received SIGTERM, stopping
 clpdaemon: hooks-b: shutdown
+clpdaemon: hooks-a: shutdown"
+
+# cycle_end ok (T6b, L59): 0 only when Run stopped on a CLIPS evaluation
+# error; a Run cut by max_rules_per_cycle or halted by SIGTERM is ok.
+mkdir throwpkg looppkg
+conf throwpkg/package.conf 'definition = throw
+version = 1
+files = t.clp'
+conf throwpkg/t.clp '(deftemplate job (slot wf-id))
+(deffacts jobs (job (wf-id w1)))
+(defrule boom (job (wf-id ?w)) => (hooks-a-throw))'
+conf looppkg/package.conf 'definition = loop
+version = 1
+files = l.clp'
+conf looppkg/l.clp '(deftemplate counter (slot wf-id) (slot n))
+(deffacts seed (counter (wf-id c1) (n 0)))
+(defrule step ?c <- (counter (wf-id ?w) (n ?n)) => (modify ?c (n (+ ?n 1))))'
+conf plugthrow.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_hooks_a.so
+packages = throwpkg"
+plugdaemon "cycle_end ok=0 after UDFThrowError" plugthrow.conf \
+  "clpdaemon: hooks-a: cycle_end ok=0" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+[PRCCODE4] Execution halted during the actions of defrule 'boom'.
+clpdaemon: hooks-a: cycle_end ok=0
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+conf pluglimit.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+max_rules_per_cycle = 1
+plugins = $PLUGINS/test_hooks_a.so
+packages = looppkg"
+plugdaemon "cycle_end ok=1 for a Run cut by max_rules_per_cycle" pluglimit.conf \
+  "clpdaemon: hooks-a: cycle_end ok=1" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+clpdaemon: hooks-a: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+# Without a rule limit the first Run never ends by itself: only SIGTERM
+# halts it (the default max_rules_per_cycle would end it first).
+conf plugterm.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+max_rules_per_cycle = -1
+plugins = $PLUGINS/test_hooks_a.so
+packages = looppkg"
+plugdaemon "cycle_end ok=1 for a Run halted by SIGTERM" plugterm.conf \
+  "clpdaemon: hooks-a: cycle_begin" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 ENOSYS
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+clpdaemon: hooks-a: cycle_end ok=1
+clpdaemon: received SIGTERM, stopping
 clpdaemon: hooks-a: shutdown"
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"

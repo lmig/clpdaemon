@@ -74,16 +74,18 @@ Every message goes to stderr and is followed by exit 1. Only the first failing p
 | `init` is `NULL` | `clpdaemon: <path>: descriptor has no init` |
 | `init` fails | `clpdaemon: <path>: init failed` |
 
-For a missing file, glibc's `dlerror` text repeats the path, for example `clpdaemon: ./x.so: cannot load: ./x.so: cannot open shared object file: No such file or directory`.
+For a missing file, glibc's `dlerror` text repeats the path, for example `clpdaemon: ./x.so: cannot load: ./x.so: cannot open shared object file: No such file or directory`. The library is opened with `RTLD_NOW`, so a reference no loaded object defines fails here too, for example `clpdaemon: ./x.so: cannot load: ./x.so: undefined symbol: clpd_log` for a plugin that calls a daemon internal.
 
 ## Building a plugin
 
-A plugin includes `clpd_plugin.h` (which includes the CLIPS `clips.h`), compiles with the CLIPS headers and the same CLIPS configuration macro as the daemon (`-DLINUX`), and is linked as a shared library **without** CLIPS: the daemon links every CLIPS object and exports all of them (`-rdynamic`), and the plugin's CLIPS references resolve against the executable at `dlopen`.
+A plugin includes `clpd_plugin.h` (which includes the CLIPS `clips.h`), compiles with the CLIPS headers and the same CLIPS configuration macro as the daemon (`-DLINUX`), and is linked as a shared library **without** CLIPS: the daemon links every CLIPS object and exports all of them (`-rdynamic`), and the plugin's CLIPS references resolve against the executable at `dlopen`. The daemon's own `clpd_*` symbols are not exported (the linker version script `src/clpd_exports.ver`), so a plugin cannot depend on them.
 
 ```sh
-cc -std=c99 -fPIC -shared -DLINUX -Iinclude -Ivendor/clips/src \
+cc -std=c99 -fPIC -shared -DLINUX -Iinclude -isystem vendor/clips/src \
   -o my_plugin.so my_plugin.c
 ```
+
+`-isystem` marks the CLIPS headers as system headers, so warning options such as `-Wpedantic` report the plugin's code and not the CLIPS headers.
 
 Inside this repository, `clpd_plugin_module(<target> <sources>)` (in `src/CMakeLists.txt`) builds `<build>/plugins/<target>.so` that way. The example [`examples/plugins/clpd_example.c`](../examples/plugins/clpd_example.c) builds as `<build>/plugins/clpd_example.so` and registers:
 

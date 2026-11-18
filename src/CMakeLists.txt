@@ -15,14 +15,17 @@ target_compile_definitions(clpd_plugin_api INTERFACE
   $<TARGET_PROPERTY:clips,INTERFACE_COMPILE_DEFINITIONS>)
 
 # clpd_export_clips(<executable>): links every CLIPS object (whole archive,
-# not only the ones the daemon calls) and exports all global symbols to the
-# dynamic symbol table (-rdynamic), so plugins can call any CLIPS API.
-# CMake 3.20 has no $<LINK_LIBRARY:WHOLE_ARCHIVE> (3.24), hence the
-# explicit linker options.
+# not only the ones the daemon calls) and exports the global symbols to the
+# dynamic symbol table (-rdynamic), so plugins can call any CLIPS API. The
+# version script clpd_exports.ver keeps the clpd_* internals out of that
+# table (GNU ld). CMake 3.20 has no $<LINK_LIBRARY:WHOLE_ARCHIVE> (3.24),
+# hence the explicit linker options.
 function(clpd_export_clips target)
-  set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON)
+  set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON
+    LINK_DEPENDS ${PROJECT_SOURCE_DIR}/src/clpd_exports.ver)
   target_link_options(${target} PRIVATE
-    "LINKER:--whole-archive" "$<TARGET_FILE:clips>" "LINKER:--no-whole-archive")
+    "LINKER:--whole-archive" "$<TARGET_FILE:clips>" "LINKER:--no-whole-archive"
+    "LINKER:--version-script=${PROJECT_SOURCE_DIR}/src/clpd_exports.ver")
 endfunction()
 
 # clpd_plugin_module(<target> <sources...>): builds a plugin as

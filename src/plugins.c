@@ -17,7 +17,9 @@
 typedef struct {
   const char *path;           /* the configured path (owned by the config) */
   void *handle;               /* dlopen handle, closed by clpd_plugins_close */
-  const clpd_plugin *desc;    /* NULL until the descriptor checks pass */
+  const clpd_plugin *desc;    /* NULL until the descriptor checks pass;
+                               * set in every entry once clpd_plugins_load
+                               * returned with active still 1 */
   void *state;                /* what init stored */
   int initialized;            /* init returned 0 */
 } entry;
@@ -26,7 +28,10 @@ struct clpd_plugins {
   clpd_host host;
   entry *items;
   size_t count;
-  int active; /* 0 once shut down (or after a failed load) */
+  /* 0 once shut down. A failed load shuts down before returning, so while
+   * active is 1 every entry passed load_one and has a desc: the hook loops
+   * below rely on it. */
+  int active;
 };
 
 static void host_log(const clpd_plugin *plugin, const char *fmt, ...) {
@@ -111,9 +116,10 @@ static int load_one(Environment *env, clpd_plugins *p, FILE *err) {
             e->path, CLPD_PLUGIN_NAME_MAX, d->name != NULL ? d->name : "");
     return 1;
   }
+  /* The earlier entries all loaded (the first failure stops the load), so
+   * each has a desc. */
   for (i = 0; i + 1 < p->count; i++) {
-    if (p->items[i].desc != NULL &&
-        strcmp(p->items[i].desc->name, d->name) == 0) {
+    if (strcmp(p->items[i].desc->name, d->name) == 0) {
       fprintf(err, "clpdaemon: %s: plugin %s is already loaded from %s\n",
               e->path, d->name, p->items[i].path);
       return 1;

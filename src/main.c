@@ -141,6 +141,9 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
       clpd_plugins_after_load(plugins);
       Reset(clpd_engine_env(engine));
       rc = serve(cfg, engine, &packages, plugins, trace, ct);
+      /* Shut down before the capture stops, so what the plugins print in
+       * shutdown still reaches the trace; the call after this block is
+       * then a no-op (it covers the paths that never got here). */
       clpd_plugins_shutdown(plugins);
       clpd_fdcapture_stop(cap);
     }

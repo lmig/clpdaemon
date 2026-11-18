@@ -5,7 +5,8 @@
  * It exports exactly one symbol, clpd_plugin_get, and registers its CLIPS
  * functions with AddUDF from init, following the CLIPS UserDefinedFunction
  * contract. Plugins do not link CLIPS: the daemon exports every CLIPS symbol
- * (-rdynamic), and a plugin only compiles against the CLIPS headers.
+ * (-rdynamic, but none of its own clpd_* internals), and a plugin only
+ * compiles against the CLIPS headers.
  *
  * Every hook runs on the engine thread, the only thread that may call CLIPS
  * (NFR-1). Only host->post_fact may be called from another thread. */

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../common/expect.h"
 
@@ -234,6 +235,103 @@ static void test_cannot_load(void) {
   EXPECT(strcmp(take_log(), "") == 0);
 }
 
+/* <name> loads alone; init and shutdown are its only log lines. */
+static void expect_loads(const char *name, const char *plugin_name) {
+  const char *paths[1];
+  char want[512];
+  run r;
+  paths[0] = plugin(name);
+  load(&r, paths, 1);
+  EXPECT(r.rc == 0);
+  EXPECT(strcmp(r.err, "") == 0);
+  done(&r);
+  snprintf(want, sizeof want,
+           "clpdaemon: %s: init node_id=n7 post_fact=-1 ENOSYS\n"
+           "clpdaemon: %s: shutdown\n",
+           plugin_name, plugin_name);
+  if (strcmp(take_log(), want) != 0) {
+    failures++;
+    fprintf(stderr, "FAIL %s: unexpected log\n", name);
+  }
+}
+
+/* T6b: the descriptor size and name boundaries. */
+static void test_boundaries(void) {
+  char msg[128];
+  snprintf(msg, sizeof msg, "descriptor size %zu, expected at least %zu",
+           sizeof(clpd_plugin) - 1, sizeof(clpd_plugin));
+  expect_failure(plugin("test_bad_size1"), msg, "");
+  expect_failure(plugin("test_bad_name65"),
+                 "plugin name: expected 1-64 characters from [A-Za-z0-9._-], "
+                 "got 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                 "aaaaaa'",
+                 "");
+  /* A descriptor from a later revision (larger) and a 64-character name. */
+  expect_loads("test_big", "big");
+  expect_loads("test_name64",
+               "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+}
+
+/* T6b: an unresolved reference fails at dlopen (RTLD_NOW), including a
+ * reference to a daemon internal, which the executable does not export. */
+static void test_undefined_symbols(void) {
+  char want[1200];
+  const char *p = plugin("test_bad_undef");
+  snprintf(want, sizeof want,
+           "cannot load: %s: undefined symbol: clpd_test_no_such_symbol", p);
+  expect_failure(p, want, "");
+  p = plugin("test_bad_internal");
+  snprintf(want, sizeof want, "cannot load: %s: undefined symbol: clpd_log",
+           p);
+  expect_failure(p, want, "");
+}
+
+/* T6b: post_fact from a thread other than the engine thread. */
+static void test_post_fact_thread(void) {
+  const char *paths[1];
+  run r;
+  paths[0] = plugin("test_thread");
+  load(&r, paths, 1);
+  EXPECT(r.rc == 0);
+  done(&r);
+  EXPECT(strcmp(take_log(),
+                "clpdaemon: thread: init node_id=n7 post_fact=-1 ENOSYS\n"
+                "clpdaemon: thread: thread post_fact=-1 ENOSYS\n"
+                "clpdaemon: thread: shutdown\n") == 0);
+}
+
+/* T6b: shutdown runs while the environment exists, the environment cleanup
+ * next, and the library is unloaded last. */
+static void test_unload_order(void) {
+  const char *paths[1];
+  char markers[64] = "", path[] = "/tmp/clpd-markers-XXXXXX";
+  FILE *f;
+  size_t n;
+  int fd = mkstemp(path);
+  run r;
+  if (fd < 0) exit(2);
+  close(fd);
+  setenv("CLPD_TEST_MARKERS", path, 1);
+  paths[0] = plugin("test_markers");
+  load(&r, paths, 1);
+  EXPECT(r.rc == 0);
+  done(&r);
+  unsetenv("CLPD_TEST_MARKERS");
+  f = fopen(path, "r");
+  if (f == NULL) exit(2);
+  n = fread(markers, 1, sizeof markers - 1, f);
+  markers[n] = '\0';
+  fclose(f);
+  remove(path);
+  if (strcmp(markers, "shutdown\nenv-cleanup\ndestructor\n") != 0) {
+    failures++;
+    fprintf(stderr, "FAIL unload order: [%s]\n", markers);
+  }
+  EXPECT(strcmp(take_log(),
+                "clpdaemon: markers: init node_id=n7 post_fact=-1 ENOSYS\n"
+                "clpdaemon: markers: shutdown\n") == 0);
+}
+
 int main(void) {
   dir = getenv("CLPD_PLUGIN_DIR");
   if (dir == NULL) {
@@ -248,6 +346,10 @@ int main(void) {
   test_order();
   test_errors();
   test_cannot_load();
+  test_boundaries();
+  test_undefined_symbols();
+  test_post_fact_thread();
+  test_unload_order();
   clpd_log_set(NULL);
   fclose(log_stream);
   if (failures != 0) fprintf(stderr, "%d failed checks\n", failures);
