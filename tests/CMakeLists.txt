@@ -39,6 +39,17 @@ add_test(NAME clpdaemon_db COMMAND db_test)
 add_test(NAME clpdaemon_db_sqlite_suite COMMAND db_test sqlite-suite)
 set_tests_properties(clpdaemon_db clpdaemon_db_sqlite_suite PROPERTIES TIMEOUT 30)
 
+# PostgreSQL backend (T8c): the shared suite and PostgreSQL-only cases on a
+# throwaway cluster; SKIPPED (exit 77) without initdb/pg_ctl/psql in PATH
+# or CLPD_PG_BINDIR.
+add_executable(db_pg_test db/db_pg_test.c db/db_suite.c)
+target_link_libraries(db_pg_test PRIVATE clpd_core)
+target_include_directories(db_pg_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+target_compile_options(db_pg_test PRIVATE ${CLPD_WARNINGS})
+add_test(NAME clpdaemon_db_pg
+  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:db_pg_test>)
+set_tests_properties(clpdaemon_db_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+
 # Link seam for the reader-failure cases, this test binary only: the test
 # wraps poll and read (production objects are unchanged).
 target_link_options(fdcapture_test PRIVATE -Wl,--wrap=poll -Wl,--wrap=read)
