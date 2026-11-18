@@ -33,8 +33,10 @@ int clpd_trace_active(const clpd_trace *t);
  * goes to err. Returns the number of files that failed. */
 int clpd_trace_reopen(clpd_trace *t, FILE *err);
 
-/* wf_id may be NULL (unknown). Text arguments are not NUL-sensitive beyond
- * their terminator, except output, which takes an explicit length. */
+/* wf_id may be NULL (unknown). String arguments are NUL-terminated; only
+ * the output text takes an explicit length and may contain NUL bytes. A
+ * failed write is reported on the open() err stream, once per file until a
+ * reopen succeeds. */
 void clpd_trace_fact(clpd_trace *t, clpd_trace_fact_kind kind,
                      const char *wf_id, long long index, const char *tmpl,
                      const char *text);

@@ -10,12 +10,14 @@
 typedef struct {
   char *path; /* NULL = format disabled */
   FILE *f;
+  int write_failed; /* reported once until the next successful reopen */
 } sink;
 
 struct clpd_trace {
   sink text, jsonl;
   char *node_id;
   clpd_trace_clock *clock;
+  FILE *err; /* daemon messages (write failures) */
 };
 
 /* Growable line buffer. On allocation failure it is marked broken and the
@@ -47,9 +49,13 @@ static void put(line *b, const char *s, size_t n) {
 
 static void puts_(line *b, const char *s) { put(b, s, strlen(s)); }
 
+/* Formats one integer with a short fixed affix; longer text goes through
+ * puts_. A result that does not fit is cut, never over-read. */
 static void putf(line *b, const char *fmt, long long v) {
-  char tmp[32];
+  char tmp[48];
   int n = snprintf(tmp, sizeof tmp, fmt, v);
+  if (n < 0) return;
+  if ((size_t)n >= sizeof tmp) n = (int)(sizeof tmp - 1);
   put(b, tmp, (size_t)n);
 }
 
@@ -149,13 +155,19 @@ static void json_head(line *b, const clpd_trace *t, const char *ts,
 }
 
 /* Writes a finished line and flushes it, so the trace is current when the
- * daemon stops abnormally. A write error drops the line. */
-static void emit(sink *s, line *b) {
+ * daemon stops abnormally. A failed write or flush loses the line (it may be
+ * left partial) and is reported once on err until the next successful
+ * reopen. */
+static void emit(const clpd_trace *t, sink *s, line *b) {
   if (s->f != NULL && !b->broken) {
     put(b, "\n", 1);
-    if (!b->broken) {
-      fwrite(b->s, 1, b->len, s->f);
-      fflush(s->f);
+    if (!b->broken &&
+        (fwrite(b->s, 1, b->len, s->f) != b->len || fflush(s->f) != 0)) {
+      if (!s->write_failed)
+        fprintf(t->err, "clpdaemon: %s: cannot write: %s\n", s->path,
+                strerror(errno));
+      s->write_failed = 1;
+      clearerr(s->f);
     }
   }
   free(b->s);
@@ -175,7 +187,13 @@ clpd_trace *clpd_trace_open(const char *text_path, const char *jsonl_path,
     return NULL;
   }
   t->clock = real_clock;
+  t->err = err;
   t->node_id = strdup(node_id);
+  if (t->node_id == NULL) {
+    fprintf(err, "clpdaemon: cannot open the trace: %s\n", strerror(errno));
+    free(t);
+    return NULL;
+  }
   paths[0] = text_path;
   paths[1] = jsonl_path;
   sinks[0] = &t->text;
@@ -195,10 +213,6 @@ clpd_trace *clpd_trace_open(const char *text_path, const char *jsonl_path,
               strerror(errno));
       failed = 1;
     }
-  }
-  if (t->node_id == NULL && !failed) {
-    fprintf(err, "clpdaemon: cannot open the trace: %s\n", strerror(errno));
-    failed = 1;
   }
   if (failed) {
     clpd_trace_close(t);
@@ -233,12 +247,18 @@ int clpd_trace_reopen(clpd_trace *t, FILE *err) {
     }
     fclose(sinks[i]->f);
     sinks[i]->f = f;
+    sinks[i]->write_failed = 0;
   }
   return failed;
 }
 
-static const char *const fact_text_tag[] = {"FACT+", "FACT-", "FACT~"};
-static const char *const fact_event[] = {"assert", "retract", "modify"};
+static const char *const fact_text_tag[] = {
+    [CLPD_TRACE_ASSERT] = "FACT+",
+    [CLPD_TRACE_RETRACT] = "FACT-",
+    [CLPD_TRACE_MODIFY] = "FACT~"};
+static const char *const fact_event[] = {[CLPD_TRACE_ASSERT] = "assert",
+                                         [CLPD_TRACE_RETRACT] = "retract",
+                                         [CLPD_TRACE_MODIFY] = "modify"};
 
 void clpd_trace_fact(clpd_trace *t, clpd_trace_fact_kind kind,
                      const char *wf_id, long long index, const char *tmpl,
@@ -252,17 +272,18 @@ void clpd_trace_fact(clpd_trace *t, clpd_trace_fact_kind kind,
     puts_(&b, fact_text_tag[kind]);
     putf(&b, " f-%lld ", index);
     put_text(&b, text, strlen(text));
-    emit(&t->text, &b);
+    emit(t, &t->text, &b);
   }
   if (t->jsonl.f != NULL) {
     line b = {0};
     json_head(&b, t, ts, wf_id, fact_event[kind]);
-    putf(&b, ",\"fact\":%lld,\"template\":", index);
+    putf(&b, ",\"fact\":%lld", index);
+    puts_(&b, ",\"template\":");
     put_json_str(&b, tmpl);
     puts_(&b, ",\"text\":");
     put_json_str(&b, text);
     puts_(&b, "}");
-    emit(&t->jsonl, &b);
+    emit(t, &t->jsonl, &b);
   }
 }
 
@@ -280,7 +301,7 @@ void clpd_trace_fire(clpd_trace *t, const char *wf_id, const char *module,
     puts_(&b, "::");
     put_text(&b, rule, strlen(rule));
     for (i = 0; i < n; i++) putf(&b, i == 0 ? " f-%lld" : ",f-%lld", facts[i]);
-    emit(&t->text, &b);
+    emit(t, &t->text, &b);
   }
   if (t->jsonl.f != NULL) {
     line b = {0};
@@ -292,7 +313,7 @@ void clpd_trace_fire(clpd_trace *t, const char *wf_id, const char *module,
     puts_(&b, ",\"facts\":[");
     for (i = 0; i < n; i++) putf(&b, i == 0 ? "%lld" : ",%lld", facts[i]);
     puts_(&b, "]}");
-    emit(&t->jsonl, &b);
+    emit(t, &t->jsonl, &b);
   }
 }
 
@@ -307,7 +328,7 @@ void clpd_trace_output(clpd_trace *t, const char *wf_id, const char *stream,
     puts_(&b, stream);
     puts_(&b, " ");
     put_text(&b, text, len);
-    emit(&t->text, &b);
+    emit(t, &t->text, &b);
   }
   if (t->jsonl.f != NULL) {
     line b = {0};
@@ -317,7 +338,7 @@ void clpd_trace_output(clpd_trace *t, const char *wf_id, const char *stream,
     puts_(&b, ",\"text\":");
     put_json(&b, text, len);
     puts_(&b, "}");
-    emit(&t->jsonl, &b);
+    emit(t, &t->jsonl, &b);
   }
 }
 

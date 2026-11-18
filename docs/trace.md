@@ -14,7 +14,8 @@ An empty or missing key disables that format. With both disabled, the daemon wri
 - Files are opened in append mode at startup, before the CLIPS environment is created (FR-2). `--check` opens them too (creating missing files, writing nothing), so a path the daemon cannot write fails the check.
 - A file that cannot be opened stops startup with exit code 1:
   `clpdaemon: <path>: cannot open: <system error>`
-- Every line is flushed when it is written.
+- Every line is flushed when it is written. A line that cannot be written is lost (it may be left partial), and the first failure on a file is reported until a reopen succeeds:
+  `clpdaemon: <path>: cannot write: <system error>`
 - `SIGHUP` reopens both files by path, for log rotation: move the file away, then send `SIGHUP`, and the daemon creates a new file. A file that cannot be reopened keeps its previous stream, and the daemon reports it and keeps running:
   `clpdaemon: <path>: cannot reopen: <system error>`
 

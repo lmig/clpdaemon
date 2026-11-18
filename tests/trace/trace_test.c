@@ -167,6 +167,36 @@ static void test_reopen(void) {
   unlink(rotated);
 }
 
+/* A failing write is reported once per file until a reopen succeeds. */
+static void test_write_error(void) {
+  FILE *err = tmpfile();
+  clpd_trace *t = clpd_trace_open("/dev/full", NULL, "n1", err);
+  EXPECT(t != NULL);
+  if (t == NULL) return;
+  clpd_trace_output(t, NULL, "STDOUT", "a", 1);
+  clpd_trace_output(t, NULL, "STDOUT", "b", 1);
+  EXPECT(clpd_trace_reopen(t, err) == 0);
+  clpd_trace_output(t, NULL, "STDOUT", "c", 1);
+  clpd_trace_close(t);
+  EXPECT(strcmp(err_text(err),
+                "clpdaemon: /dev/full: cannot write: No space left on device\n"
+                "clpdaemon: /dev/full: cannot write: No space left on device\n") == 0);
+}
+
+/* The largest fact index is written in full, not cut or over-read. */
+static void test_large_index(void) {
+  clpd_trace *t = clpd_trace_open(NULL, jsonl_path, "n1", stderr);
+  EXPECT(t != NULL);
+  if (t == NULL) return;
+  clpd_trace_set_clock(t, fixed_clock);
+  clpd_trace_fact(t, CLPD_TRACE_ASSERT, NULL, 9223372036854775807LL, "x",
+                  "(x)");
+  clpd_trace_close(t);
+  expect_file(jsonl_path,
+              "{\"ts\":\"2026-11-18T10:37:25.641Z\",\"node_id\":\"n1\",\"event\":\"assert\",\"fact\":9223372036854775807,\"template\":\"x\",\"text\":\"(x)\"}\n");
+  unlink(jsonl_path);
+}
+
 int main(void) {
   if (mkdtemp(dir) == NULL) {
     perror("mkdtemp");
@@ -180,6 +210,9 @@ int main(void) {
   test_inactive();
   test_open_errors();
   test_reopen();
+  test_write_error();
+  unlink(jsonl_path);
+  test_large_index();
   unlink(text_path);
   unlink(jsonl_path);
   rmdir(dir);
