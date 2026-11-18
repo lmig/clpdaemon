@@ -173,7 +173,7 @@ plugins                  = /usr/lib/clpdaemon/clpd-orm.so, /usr/lib/clpdaemon/cl
 ## 9. Open items and assumptions
 - **A1** Mechanism for other writers (D22): triggers on aggregate tables versus explicit `IN` messages written by those processes. To be decided per table in T13.
 - **A2** Exact CLIPS slot-introspection function names (APG §12.3.5) to be confirmed against headers in T9.
-- **A3** Rule-package lint exemptions format (FR-7) to be defined in T4.
+- **A3** Rule-package lint exemptions format (FR-7): resolved in T4 as a `lint_exempt` list in the package manifest (`docs/packages.md`).
 - **A4** Resolved: `clpdaemon` is its own monorepo (hosted on the owner's personal GitHub); layout in `README.md`.
 
 ## 10. Delivery plan

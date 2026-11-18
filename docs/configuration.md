@@ -10,12 +10,12 @@ usage: clpdaemon --config <file> [--foreground] [--check]
 |---|---|
 | `--config <file>` | Configuration file. Required. |
 | `--foreground` | Run in the foreground. This is the default (systemd `Type=notify`); the daemon never double-forks. |
-| `--check` | Validate the configuration and exit. |
+| `--check` | Validate the configuration, load and lint the rule packages, and exit. |
 | `--help` | Print the usage line on stdout and exit 0. |
 
 Exit codes: `0` success, `1` invalid configuration, `2` command-line error.
 
-Without `--check`, the daemon validates the configuration and then runs until it receives `SIGTERM` or `SIGINT`. It always stays in the foreground, with or without `--foreground`; there is no detached mode (systemd supervises it, T17).
+With `--check`, the daemon validates the configuration, loads and lints the rule packages ([`packages.md`](packages.md)), and exits. Without `--check`, it does the same and then runs until it receives `SIGTERM` or `SIGINT`. It always stays in the foreground, with or without `--foreground`; there is no detached mode (systemd supervises it, T17).
 
 ## Running
 

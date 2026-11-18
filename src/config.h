@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include "kvfile.h"
+
 #define CLPD_NODE_ID_MAX 64
 
 /* Defaults for optional keys (docs/configuration.md). */
@@ -14,11 +16,6 @@
 #define CLPD_DEFAULT_SAFETY_POLL_INTERVAL_MS 5000
 #define CLPD_DEFAULT_IDLE_EVICTION_AFTER_S (30L * 60)
 #define CLPD_DEFAULT_ADMIN_SOCKET "/run/clpdaemon/admin.sock"
-
-typedef struct {
-  char **items;
-  size_t count;
-} clpd_list;
 
 typedef struct {
   char node_id[CLPD_NODE_ID_MAX + 1];
@@ -42,5 +39,8 @@ typedef struct {
 int clpd_config_load(const char *path, clpd_config *cfg, FILE *err);
 
 void clpd_config_free(clpd_config *cfg);
+
+/* 1 when s has 1..max characters from [A-Za-z0-9._-]. */
+int clpd_valid_name(const char *s, size_t max);
 
 #endif
