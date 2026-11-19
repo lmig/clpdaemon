@@ -2,7 +2,7 @@
 
 A rule package can map its deftemplates to database tables and name the database sequences its rules use (S7, S11, FR-22). The mapping lives in a separate file named by the manifest key `orm` ([`packages.md`](packages.md#manifest)). Nothing in it is implicit: every slot of a mapped template gets its own line with the column, the SQL type, the CLIPS type and what a NULL becomes.
 
-The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b, T9e), the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23), and the [sequence functions](#sequence-functions) `db-create-sequence` and `db-nextval` (T9c, T9e). The [cycle transaction](database.md#cycle-transaction) (T10a) runs every statement of a cycle in one transaction, and the [automatic synchronization](#automatic-synchronization) (T10b, FR-25) writes the changes of the mapped facts at the end of each cycle inside it.
+The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b, T9e), the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23), and the [sequence functions](#sequence-functions) `db-create-sequence` and `db-nextval` (T9c, T9e). The [cycle transaction](database.md#cycle-transaction) (T10a) runs every statement of a cycle in one transaction, the [automatic synchronization](#automatic-synchronization) (T10b, FR-25) writes the changes of the mapped facts at the end of each cycle inside it, and the [rehydration](#rehydration) (T10c, FR-26) reloads from the database the instances a rolled-back cycle touched, through the [loader](#loading-rows).
 
 ## File format
 
@@ -78,13 +78,13 @@ The SQL type is logical; each backend has its own column type, used by `db-creat
 
 ### Null policies
 
-What a NULL column becomes when a row is loaded into a fact (T10c); for the other direction, what the synchronization writes for `nil`, see the [write rules](#write-rules):
+What a NULL column becomes when a row is [loaded](#loading-rows) into a fact (T10c); for the other direction, what the synchronization writes for `nil`, see the [write rules](#write-rules):
 
 | `null` | Effect |
 |---|---|
 | `nil` | the slot gets the symbol `nil`, so the slot's type constraint must allow SYMBOL |
 | `default` | the slot gets its deftemplate default |
-| `error` | the row is rejected; required for key slots |
+| `error` | the row is rejected (one log line, no fact); required for key slots |
 
 ## Loading
 
@@ -280,7 +280,7 @@ The primary key is the `wf_id` column followed by the local key columns (FR-22).
 
 The facts that exist before the first cycle (the deffacts asserted by `Reset` at startup, facts asserted by a plugin's `init` or `after_load`) are changes since the last commit like any other: the first cycle inserts them. So is a fact asserted between cycles (a plugin's `cycle_end`): the next cycle writes it.
 
-Two facts of one template with the same primary key in working memory (they differ in another slot, so CLIPS keeps both) cannot both be stored: the second `INSERT` is a unique violation (`CLPD_DB_UNIQUE`) and the whole cycle is rolled back. The same holds for a fact whose key matches a row stored by another writer or by an earlier run of the daemon: a deffacts fact of a mapped template is inserted again at every start, so a restart against a database that already holds its row rolls the first cycle back and [isolates](#failures) that instance; the other instances commit on the retry (rehydration at startup comes with T11/T22).
+Two facts of one template with the same primary key in working memory (they differ in another slot, so CLIPS keeps both) cannot both be stored: the second `INSERT` is a unique violation (`CLPD_DB_UNIQUE`) and the whole cycle is rolled back. The same holds for a fact whose key matches a row stored by another writer or by an earlier run of the daemon: a deffacts fact of a mapped template is inserted again at every start, so a restart against a database that already holds its row rolls the first cycle back and [isolates](#failures) that instance, which is then evicted without a reload ([rehydration](#rehydration)); the other instances commit on the retry, unless the first cycle touched them too (rehydration at startup comes with T11/T22).
 
 ### Statements and order
 
@@ -318,11 +318,11 @@ PostgreSQL may still refuse a written value: an integer above 2147483647 for an 
 
 ### Echo suppression
 
-Facts asserted while the daemon loads rows from the database (the rehydration of T10c, `db-load` of T10d) mirror stored rows and must not be written back. Those loaders call `clpd_orm_sync_suspend` before and `clpd_orm_sync_resume` after (the calls nest): while suspended, an assert is not recorded, and a retract drops whatever was recorded for that fact (a rehydration discards it for the stored state). A later modify of a loaded fact is an `UPDATE` against the values it was loaded with.
+Facts asserted while the daemon loads rows from the database (the [rehydration](#rehydration) of T10c, `db-load` of T10d, both through the [loader](#loading-rows)) mirror stored rows and must not be written back. Those loaders call `clpd_orm_sync_suspend` before and `clpd_orm_sync_resume` after (the calls nest): while suspended, an assert is not recorded, and a retract drops whatever was recorded for that fact (a rehydration discards it for the stored state). A later modify of a loaded fact is an `UPDATE` against the values it was loaded with.
 
 ### Failures
 
-A write the database refuses, or a value the [write rules](#write-rules) cannot write, rolls the whole cycle back (the rules' DDL and the rows written before it included) through the [cycle transaction](database.md#cycle-transaction): one line names the write, the cycle transaction line follows, and the cycle is retried after the backoff. The instance (`wf-id`) of that write or value is then isolated: its recorded changes are dropped, later changes of its facts are not recorded, and `clpdaemon: sync: instance '<wf-id>' is no longer synchronized: <reason>` (the same reason) follows the cycle transaction line; the other instances keep their changes, so the retry writes them. The isolation lasts until the daemon restarts (rehydration, T10c/T11, will reload such an instance). A lost connection (`CLPD_DB_LOST`), a failed `begin` or commit, a missing current schema and a failed statement of a rule (its DDL or sequence functions) isolate nothing: the retry writes everything again. When a statement of the cycle already failed (for example a rule's `db-nextval`), the synchronization sends nothing and the commit reports that failure.
+A write the database refuses, or a value the [write rules](#write-rules) cannot write, rolls the whole cycle back (the rules' DDL and the rows written before it included) through the [cycle transaction](database.md#cycle-transaction): one line names the write, the cycle transaction line follows, and the cycle is retried after the backoff. The instance (`wf-id`) of that write or value is then isolated: its recorded changes are dropped, later changes of its facts are not recorded, and `clpdaemon: sync: instance '<wf-id>' is no longer synchronized: <reason>` (the same reason) follows the cycle transaction line. Then the [rehydration](#rehydration) evicts every instance the cycle touched, and the isolated one: their facts are retracted and their changes dropped; the isolated instance is not reloaded. The instances the cycle did not touch keep their changes, so the retry writes them. The isolation lasts until the daemon restarts (T11 may reload such an instance on demand). A lost connection (`CLPD_DB_LOST`), a failed `begin` or commit, a missing current schema and a failed statement of a rule (its DDL or sequence functions) isolate nothing: the retry writes everything again. When a statement of the cycle already failed (for example a rule's `db-nextval`), the synchronization sends nothing and the commit reports that failure.
 
 | Situation | Messages |
 |---|---|
@@ -343,11 +343,99 @@ For example, two facts with one key on SQLite: `clpdaemon: sync: shop@1::order: 
 - A value of another type than the declared CLIPS type is an error (a string and a symbol are interchangeable); a `boolean` column takes only 0 and 1.
 - The timestamps of `workflow_instance` come from the database clock (above).
 - A modify is recorded through the assert and retract hooks (CLIPS 6.4.2 keeps the fact index), so no modify hook is needed; there is no unmapped slot to ignore, since every slot of a mapped template is mapped.
-- After a rolled-back cycle the recorded changes are kept for the retry (T10c will replace this by rehydration), except those of an instance whose write failed for good, which is isolated (user decision "Aislar la instancia", native review R3-001/R4-001): one fact that cannot be written would otherwise roll back every retry forever.
+- After a rolled-back cycle the recorded changes were kept for the retry, except those of an instance whose write failed for good, which is isolated (user decision "Aislar la instancia", native review R3-001/R4-001): one fact that cannot be written would otherwise roll back every retry forever. Since T10c the changes of the instances the cycle touched are dropped with their facts and the instances reloaded ([rehydration](#rehydration)); only the changes of instances it did not touch (for example facts asserted before the first cycle) are kept for the retry.
+
+## Loading rows
+
+The loader (`src/orm_load.h`, T10c) turns stored rows into facts. It is one routine for every caller: the [rehydration](#rehydration) after a rolled-back cycle, and later the on-demand rehydration of idle instances (T11), the failover (T22) and `db-load` (T10d). For one mapped template and a set of equality filters (ANDed; a NULL filter value is `IS NULL`) it sends one parameterized statement, every mapped column in mapping order, in primary key order:
+
+```sql
+SELECT "wf_id", "line_no", "status", "amount", "placed_at" FROM "public"."shop_order" WHERE "wf_id" = $1 ORDER BY "wf_id", "line_no"
+```
+
+The names come from the mapping, quoted and on PostgreSQL qualified with `current_schema()` like the other statements. The rows are read whole first, so a statement that fails asserts nothing. Then each row is asserted as a fact of its template (through a `FactBuilder`, never `Eval`) with the synchronization suspended ([echo suppression](#echo-suppression)): the facts are never written back, and a later change of one is written against the loaded values. Every column goes to its slot by the column's declared CLIPS type and [null policy](#null-policies):
+
+| Stored value | `clips-type` | Slot value |
+|---|---|---|
+| NULL | any, null policy `nil` | the symbol `nil` |
+| NULL | any, null policy `default` | the slot's deftemplate default (a slot declared `(default ?NONE)` has none: the row is rejected) |
+| NULL | any, null policy `error` | the row is rejected |
+| INTEGER (also a PostgreSQL `boolean`, as 0 or 1) | `integer` | INTEGER |
+| FLOAT or INTEGER | `float` | FLOAT |
+| TEXT that is a whole finite number (a PostgreSQL `numeric`, an SQLite `numeric` column) | `float` | FLOAT |
+| TEXT (`text`, `timestamptz`, `jsonb`, `numeric`: as PostgreSQL prints it) | `string` / `symbol` | STRING / SYMBOL |
+| BLOB (`bytea`) without a NUL byte | `string` / `symbol` | STRING / SYMBOL of its bytes |
+| anything else (a TEXT in an `integer` column, possible on SQLite; a BLOB with a NUL byte, which no CLIPS string can hold) | | the row is rejected |
+
+The slot's own constraints apply too (type, range, allowed values): a value they refuse rejects the row. A rejected row is not asserted, the other rows are, and the daemon log stream gets one line per rejected row:
+
+`clpdaemon: load: <pkg>::<template>: table '<table>': instance '<wf-id>': row rejected: <reason>`
+
+`<wf-id>` is the row's `wf_id` value (control characters shown as `?`, at most 200 bytes); when that column is NULL the `instance '<wf-id>': ` part is left out. `<reason>` is one of:
+
+| Reason | When |
+|---|---|
+| `column '<column>' (slot '<slot>') is NULL and its null policy is error` | NULL in a column of null policy `error` |
+| `column '<column>' (slot '<slot>') is NULL and the slot has no default` | NULL with null policy `default` for a slot declared `(default ?NONE)` |
+| `column '<column>' (slot '<slot>'): expected <clips-type>, got <TYPE>` | a value of another type (`<TYPE>` `INTEGER`, `FLOAT`, `TEXT` or `BLOB`) |
+| `column '<column>' (slot '<slot>'): the text is not a number` | TEXT in a `float` column that is no whole finite number |
+| `column '<column>' (slot '<slot>'): the value holds a NUL byte` | a BLOB with a NUL byte for a `string` or `symbol` slot |
+| `column '<column>' (slot '<slot>'): the slot's type constraint does not allow the value` | CLIPS refuses the value for the slot's `type` |
+| `column '<column>' (slot '<slot>'): the value is outside the slot's range` | the slot's `range` |
+| `column '<column>' (slot '<slot>'): the slot's allowed values do not include the value` | the slot's `allowed-...` attribute |
+| `column '<column>' (slot '<slot>'): the slot's cardinality does not allow the value`, `... the slot's allowed classes do not include the value`, `... CLIPS refused the value` | the other refusals CLIPS reports for a slot value (not expected for a mapped single-field slot) |
+| `CLIPS cannot build a fact of the template` | CLIPS cannot create a fact builder for the template (not expected after a clean load) |
+| `CLIPS could not assert the fact` | CLIPS refuses the assert itself |
+
+The columns are checked in mapping order and the first failure is the reason. No reason shows a stored value. For example, with `item.slot.req = req text string error` and a NULL `req`: `clpdaemon: load: shop@1::item: table 'shop_item': instance 'n1': row rejected: column 'req' (slot 'req') is NULL and its null policy is error`.
+
+An instance is loaded per package: every mapped template of the package (`sync = auto` and `manual`, in mapping order), each with the filter `wf_id = <wf-id>` typed per the `wf-id` column's CLIPS type (an `integer` column takes the instance as a decimal integer; an instance that is no such number has no rows there). When versions of one definition share a table and both are reloaded for one instance, the table is read once, for the first of them.
+
+## Rehydration
+
+When the [cycle transaction](database.md#cycle-transaction) is rolled back, the working memory of the instances the cycle touched no longer matches the database: their stored rows are as the last committed cycle left them. The daemon then discards and reloads those instances (T10c, FR-26, D8, L90 "Todos los hechos de las instancias tocadas"):
+
+1. **Touched instances.** While a cycle runs, the daemon notes the instance (the text of the `wf-id` slot, as [`workflow_instance`](#workflow_instance-rows) keys it) of every fact asserted, modified or retracted in it, of any template, mapped or not: the facts drained from the ingest queue at its start, the rules' actions, plugin functions. A fact of a template without a `wf-id` slot belongs to no instance. Rules that fired without changing a fact (for example a rule that only calls `db-nextval`) touch nothing.
+2. **Eviction, at the rollback.** Every fact in working memory carrying the `wf-id` of a touched instance is retracted, whatever its template, mapped or not, and the instance's recorded [changes](#net-changes) are dropped. The instance isolated by a [failed write](#failures) is evicted too, even if the cycle did not touch it. The rules' activations of those facts are gone with them.
+3. **Reload, when the retry starts.** Before the next cycle's `begin` (after the reconnect when the connection was lost), each evicted instance that is still synchronized is reloaded through the [loader](#loading-rows): every mapped template of each package whose templates carried its `wf-id` (the facts retracted at the eviction and the facts the cycle touched), one `SELECT ... WHERE "wf_id" = $1` each, outside the cycle transaction, asserted without echo. Then the cycle runs as usual: the rules see the stored state and fire again.
+
+What this means for each kind of fact of a touched instance:
+
+| Fact | After the rollback |
+|---|---|
+| A mapped fact (`sync = auto` or `manual`) | as stored by the last committed cycle (or by another writer, D22); a modify of the failed cycle is undone, a retract comes back, an assert is gone |
+| An unmapped fact (a template the mapping leaves out, also one asserted before the cycle) | lost: unmapped facts of an instance are **transient**, they live until the instance's next rollback |
+| A fact drained from the ingest queue (admin `inject`, a plugin's `post_fact`) | **lost**, and not queued again: its instance is touched, so it is retracted with it. Durable inputs come through the exchange table (T13), whose rows stay `ASIGNADO` after a rollback |
+| A fact never committed (a deffacts fact of a touched instance before the first commit) | lost, like any unmapped one |
+
+The instances the cycle did not touch keep their facts and their recorded changes, which the retry writes (for example a deffacts fact whose first `INSERT` was part of the failed cycle).
+
+An instance [isolated](#failures) by a write that failed for good is evicted and **not reloaded** (fail-closed: its stored rows cannot take the changes its rules make, so no rule runs on it again until the daemon restarts), and its eviction logs `clpdaemon: rehydrate: instance '<wf-id>' is not reloaded: it is no longer synchronized`. This holds also when a later rolled-back cycle touches an instance isolated earlier (its new facts, from the ingest queue for example, are never written): it is evicted again.
+
+### Reload failures and the retry
+
+The reload belongs to the retry of the [cycle transaction](database.md#cycle-transaction): no cycle runs before every evicted instance is reloaded or isolated.
+
+| Situation | Messages | Then |
+|---|---|---|
+| A `SELECT` the database refuses (a missing table, a permission, a timeout) | `clpdaemon: rehydrate: instance '<wf-id>': <pkg>::<template>: table '<table>': <database message>`, then `clpdaemon: sync: instance '<wf-id>' is no longer synchronized: <database message>` | what that instance loaded is retracted, it is isolated (never reloaded nor written); the other instances are reloaded and the cycle runs |
+| A `SELECT` that lost the connection (`CLPD_DB_LOST`) | the same `rehydrate:` line, then `clpdaemon: cycle transaction failed: <database message>; retrying in <n> ms` | what that instance loaded is retracted, the cycle does not run (no drain, no hooks, no count, like a failed `begin`); after the backoff the connection is reopened and the reload starts again with the instances not reloaded yet |
+| PostgreSQL: `SELECT current_schema()` fails, or no schema of the `search_path` exists | `clpdaemon: rehydrate: <message>`, then the cycle transaction line | the same as a lost connection (nothing reloaded yet; reconnect first only when the connection was lost) |
+| A row the loader rejects | its `load:` line ([above](#loading-rows)) | the other rows are asserted, the instance stays synchronized |
+
+`<wf-id>` in the `rehydrate:` lines is shown with control characters as `?`, at most 200 bytes. For example, a rule that created its table and then failed rolls the creation back too, so the reload of the instance it touched fails with `clpdaemon: rehydrate: instance 'w2': tx@1::order: table 'tx_order': no such table: tx_order` and that instance is isolated.
+
+### Decisions (T10c)
+
+- Touched instances are those of the facts asserted, modified or retracted in the cycle (the ingest drain included), of any template; the instance of a failed write is added. Rules that fired without changing a fact touch nothing (their activations are spent; an open question for the DML functions of T10d and the exchange of T13).
+- The facts are retracted at the rollback, and reloaded when the retry starts, outside the cycle transaction, so the reload shares the retry's backoff and reconnect and no rule runs on an instance that is neither reloaded nor isolated.
+- Conservative interaction with the isolation of T10b: an isolated instance is evicted and never reloaded (fail-closed), rather than reloaded and run without being stored; a reload refused by the database isolates its instance too (it would fail on every retry), while a lost connection only delays the cycle.
+- Changes of the instances the cycle did not touch are kept for the retry (T10b), not reloaded.
+- A NULL in a column of null policy `error`, a value of another type, a value the slot refuses and a BLOB with a NUL byte reject the row (one line each), never the whole load.
 
 ## Interface
 
-`src/orm.h` holds the CLIPS-free model and parser: `CLPD_ORM_SEQUENCE_TABLE` (the reserved `clpd_sequence`), `CLPD_ORM_INSTANCE_TABLE` (the reserved `workflow_instance`), `clpd_orm_sync` and `clpd_orm_sync_name` (each template's `sync`, `CLPD_ORM_SYNC_AUTO` by default), `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of`, `clpd_orm_sequence_of` (T9c) and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register` (all five functions), which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. `src/orm_tx.h` holds the cycle transaction (`clpd_orm_tx_begin` / `clpd_orm_tx_end`, `clpd_orm_tx_abort` for a rollback that is no failed statement, the backoff `clpd_orm_tx_next_delay`), `clpd_orm_tx_current_schema` and `clpd_orm_tx_create_instance_table` ([`database.md`](database.md#cycle-transaction)). `src/orm_sync.h` holds the [automatic synchronization](#automatic-synchronization): `clpd_orm_sync_attach` / `clpd_orm_sync_detach` (the hooks; `main.c` attaches them after the packages load and before `after_load` and `Reset`), `clpd_orm_sync_suspend` / `clpd_orm_sync_resume` / `clpd_orm_sync_suspended` (echo suppression), `clpd_orm_sync_clear` and `clpd_orm_sync_end_cycle` (the flush and the commit, which replaces `clpd_orm_tx_end` at the end of a cycle). After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.
+`src/orm.h` holds the CLIPS-free model and parser: `CLPD_ORM_SEQUENCE_TABLE` (the reserved `clpd_sequence`), `CLPD_ORM_INSTANCE_TABLE` (the reserved `workflow_instance`), `clpd_orm_sync` and `clpd_orm_sync_name` (each template's `sync`, `CLPD_ORM_SYNC_AUTO` by default), `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of`, `clpd_orm_sequence_of` (T9c) and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register` (all five functions), which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. `src/orm_tx.h` holds the cycle transaction (`clpd_orm_tx_begin` / `clpd_orm_tx_end`, `clpd_orm_tx_abort` for a rollback that is no failed statement, the backoff `clpd_orm_tx_next_delay`), `clpd_orm_tx_current_schema` and `clpd_orm_tx_create_instance_table` ([`database.md`](database.md#cycle-transaction)). `src/orm_sync.h` holds the [automatic synchronization](#automatic-synchronization) and the [rehydration](#rehydration): `clpd_orm_sync_attach` / `clpd_orm_sync_detach` (the hooks; `main.c` attaches them after the packages load and before `after_load` and `Reset`), `clpd_orm_sync_suspend` / `clpd_orm_sync_resume` / `clpd_orm_sync_suspended` (echo suppression), `clpd_orm_sync_clear`, `clpd_orm_sync_begin_cycle` (the reload of the evicted instances and the begin, which replaces `clpd_orm_tx_begin` at the start of a cycle) and `clpd_orm_sync_end_cycle` (the flush and the commit, which replaces `clpd_orm_tx_end` at the end of a cycle, and the eviction after a rollback). `src/orm_load.h` holds the [loader](#loading-rows): `clpd_orm_load` (one template, equality filters) and `clpd_orm_load_instance` (every mapped template of a package for one instance). `src/orm_tx.h` also has `clpd_orm_tx_connect` (the reconnect alone), `clpd_orm_tx_fail` (a failed attempt outside the transaction) and `clpd_orm_tx_schema_status` (`clpd_orm_tx_current_schema` with the query's status). After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.
 
 ### Decisions (T10a)
 

@@ -11,13 +11,22 @@
  * row exactly when it changed since the last commit. The flush compares
  * base and cur: none/row INSERT, row/none DELETE, same template and key
  * UPDATE of the columns that differ, otherwise DELETE + INSERT. Values
- * are copied out of the facts, so nothing points into working memory. */
+ * are copied out of the facts, so nothing points into working memory.
+ *
+ * Rehydration (T10c): while a cycle is open the same hooks also note the
+ * instance (the text of the wf-id slot) of every fact asserted or
+ * retracted, of any template, with the package of its template. When the
+ * cycle is rolled back those instances, and the one the failed write
+ * isolated, are evicted: their facts retracted and their recorded changes
+ * dropped; the ones still synchronized wait in `pending` until the next
+ * cycle starts, which reloads them (src/orm_load.h) before its begin. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "orm_sync.h"
 
 #include "log.h"
 #include "orm.h"
+#include "orm_load.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -25,6 +34,19 @@
 
 #define NAME "clpd-orm-sync"
 #define BUCKETS_MIN 64
+#define SHOWN_MAX 200 /* bytes of a wf-id shown in a rehydration line */
+
+/* An instance (wf-id text) with a package whose template carried it (NULL:
+ * a template of no package). */
+typedef struct {
+  char *wf;
+  const clpd_package *pkg;
+} wfpkg;
+
+typedef struct {
+  wfpkg *v;
+  size_t n, cap;
+} wfset;
 
 /* A mapped template whose facts are synchronized (sync = auto). */
 typedef struct {
@@ -69,12 +91,157 @@ struct clpd_orm_syncer {
   char **isolated; /* instances no longer synchronized */
   size_t isolated_n;
   char failed[4096]; /* the instance of the write that failed, or "" */
+  const clpd_packages *p;
+  int cycle_open; /* between a begin and the end of its cycle */
+  wfset touched;  /* what the open cycle asserted or retracted */
+  wfset pending;  /* evicted instances to reload when the next cycle starts */
 };
 
 static void *xrealloc(void *p, size_t n) {
   void *q = realloc(p, n);
   if (q == NULL) clpd_log_die_errno();
   return q;
+}
+
+static char *xstrdup(const char *s);
+
+/* --- instances ---------------------------------------------------------- */
+
+/* Adds (wf, pkg) unless it is there. */
+static void wfset_add(wfset *w, const char *wf, const clpd_package *pkg) {
+  size_t i;
+  for (i = 0; i < w->n; i++)
+    if (w->v[i].pkg == pkg && strcmp(w->v[i].wf, wf) == 0) return;
+  if (w->n == w->cap) {
+    w->cap = w->cap == 0 ? 8 : 2 * w->cap;
+    w->v = xrealloc(w->v, w->cap * sizeof *w->v);
+  }
+  w->v[w->n].wf = xstrdup(wf);
+  w->v[w->n++].pkg = pkg;
+}
+
+/* Removes every pair of instance wf. */
+static void wfset_remove(wfset *w, const char *wf) {
+  size_t i, k = 0;
+  char *drop = NULL;
+  for (i = 0; i < w->n; i++) {
+    if (strcmp(w->v[i].wf, wf) == 0 && w->v[i].wf != wf) {
+      free(w->v[i].wf);
+    } else if (strcmp(w->v[i].wf, wf) == 0) {
+      drop = w->v[i].wf; /* wf itself: freed last */
+    } else {
+      w->v[k++] = w->v[i];
+    }
+  }
+  w->n = k;
+  free(drop);
+}
+
+static void wfset_clear(wfset *w) {
+  while (w->n > 0) free(w->v[--w->n].wf);
+}
+
+static void wfset_free(wfset *w) {
+  wfset_clear(w);
+  free(w->v);
+  w->v = NULL;
+  w->cap = 0;
+}
+
+/* The text of a wf-id value as workflow_instance keys it (wf_text): a
+ * symbol, string or instance name as it is, an integer in decimal, a float
+ * with %.17g; NULL for any other type. */
+static char *value_text(const CLIPSValue *v) {
+  char text[32];
+  switch (v->header->type) {
+  case SYMBOL_TYPE:
+  case STRING_TYPE:
+  case INSTANCE_NAME_TYPE:
+    return xstrdup(v->lexemeValue->contents);
+  case INTEGER_TYPE:
+    snprintf(text, sizeof text, "%lld", v->integerValue->contents);
+    return xstrdup(text);
+  case FLOAT_TYPE:
+    snprintf(text, sizeof text, "%.17g", v->floatValue->contents);
+    return xstrdup(text);
+  default:
+    return NULL;
+  }
+}
+
+/* The instance of f (a new string), or NULL when its template has no
+ * wf-id slot or the value is no instance. */
+static char *fact_wf(Fact *f) {
+  CLIPSValue v;
+  if (!DeftemplateSlotExistP(FactDeftemplate(f), CLPD_ORM_WF_ID) ||
+      GetFactSlot(f, CLPD_ORM_WF_ID, &v) != GSE_NO_ERROR)
+    return NULL;
+  return value_text(&v);
+}
+
+/* The loaded package whose module holds d, or NULL. */
+static const clpd_package *package_of(const clpd_orm_syncer *s,
+                                      Deftemplate *d) {
+  const char *module = DeftemplateModule(d);
+  size_t i;
+  for (i = 0; module != NULL && i < s->p->count; i++)
+    if (s->p->items[i].module != NULL &&
+        strcmp(DefmoduleName(s->p->items[i].module), module) == 0)
+      return &s->p->items[i];
+  return NULL;
+}
+
+/* An open cycle (not loading) asserted or retracted f. */
+static void track(clpd_orm_syncer *s, Fact *f) {
+  char *wf;
+  if (!s->cycle_open || s->suspended) return;
+  if ((wf = fact_wf(f)) == NULL) return;
+  wfset_add(&s->touched, wf, package_of(s, FactDeftemplate(f)));
+  free(wf);
+}
+
+static int cmp_text(const void *a, const void *b) {
+  return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Retracts, with the recording suspended, every fact whose instance is
+ * one of wfs[0..n) (sorted with cmp_text), in one pass over working
+ * memory; with pk, adds the instance and package of each such fact. */
+static void retract_instances(clpd_orm_syncer *s, char **wfs, size_t n,
+                              wfset *pk) {
+  Fact *f, **v = NULL;
+  size_t i, count = 0, cap = 0;
+  if (n == 0) return;
+  for (f = GetNextFact(s->env, NULL); f != NULL;
+       f = GetNextFact(s->env, f)) {
+    char *wf = fact_wf(f), **hit;
+    if (wf == NULL) continue;
+    hit = bsearch(&wf, wfs, n, sizeof *wfs, cmp_text);
+    if (hit != NULL) {
+      if (count == cap) {
+        cap = cap == 0 ? 16 : 2 * cap;
+        v = xrealloc(v, cap * sizeof *v);
+      }
+      RetainFact(f); /* kept valid until every retract is done */
+      v[count++] = f;
+      if (pk != NULL) wfset_add(pk, *hit, package_of(s, FactDeftemplate(f)));
+    }
+    free(wf);
+  }
+  s->suspended++;
+  for (i = 0; i < count; i++) Retract(v[i]);
+  s->suspended--;
+  for (i = 0; i < count; i++) ReleaseFact(v[i]);
+  free(v);
+}
+
+/* wf as a log line shows it: control bytes as '?', at most SHOWN_MAX. */
+static const char *shown(const char *wf, char out[SHOWN_MAX + 1]) {
+  size_t i;
+  for (i = 0; wf[i] != '\0' && i < SHOWN_MAX; i++)
+    out[i] = (unsigned char)wf[i] < 0x20 || wf[i] == 0x7f ? '?' : wf[i];
+  out[i] = '\0';
+  return out;
 }
 
 /* --- recording ---------------------------------------------------------- */
@@ -216,6 +383,7 @@ static void on_assert(Environment *env, void *fact, void *ctx) {
   long long index;
   long pos;
   (void)env;
+  track(s, fact);
   if (m == NULL) return;
   index = FactIndex(fact);
   pos = find(s, index);
@@ -235,6 +403,7 @@ static void on_retract(Environment *env, void *fact, void *ctx) {
   const tmap *m = map_of(s, FactDeftemplate(fact));
   long pos;
   (void)env;
+  track(s, fact);
   if (m == NULL) return;
   pos = find(s, FactIndex(fact));
   if (s->suspended) {
@@ -697,6 +866,7 @@ int clpd_orm_sync_attach(Environment *env, clpd_db *db,
   memset(s, 0, sizeof *s);
   s->env = env;
   s->db = db;
+  s->p = p;
   reset_buckets(s, BUCKETS_MIN);
   for (i = 0; i < p->count; i++) {
     const clpd_package *pkg = &p->items[i];
@@ -750,6 +920,8 @@ void clpd_orm_sync_detach(clpd_orm_syncer *s) {
   clpd_orm_sync_clear(s);
   while (s->isolated_n > 0) free(s->isolated[--s->isolated_n]);
   free(s->isolated);
+  wfset_free(&s->touched);
+  wfset_free(&s->pending);
   free(s->e);
   free(s->buckets);
   free(s->maps);
@@ -768,25 +940,175 @@ int clpd_orm_sync_suspended(const clpd_orm_syncer *s) {
   return s != NULL && s->suspended > 0;
 }
 
-/* After a rolled-back cycle: the instance whose write failed for good, if
- * any, stops being synchronized and its recorded changes are dropped. */
-static void isolate(clpd_orm_syncer *s, const char *why, FILE *log) {
+/* Drops the recorded changes of instance wf. */
+static void drop_instance(clpd_orm_syncer *s, const char *wf) {
   size_t i;
-  if (s == NULL || s->failed[0] == '\0') return;
-  s->isolated = xrealloc(s->isolated, (s->isolated_n + 1) * sizeof(char *));
-  s->isolated[s->isolated_n++] = xstrdup(s->failed);
   for (i = 0; i < s->n; i++) {
     entry *e = &s->e[i];
-    if (!in_instance(&e->base, s->failed) && !in_instance(&e->cur, s->failed))
-      continue;
+    if (!in_instance(&e->base, wf) && !in_instance(&e->cur, wf)) continue;
     row_free(&e->base);
     row_free(&e->cur);
     if (e->linked) unlink_entry(s, (long)i);
   }
+}
+
+static int is_isolated(const clpd_orm_syncer *s, const char *wf) {
+  size_t i;
+  for (i = 0; i < s->isolated_n; i++)
+    if (strcmp(s->isolated[i], wf) == 0) return 1;
+  return 0;
+}
+
+/* Instance wf stops being synchronized: its recorded changes are dropped
+ * and later changes of its facts are not recorded. */
+static void isolate_instance(clpd_orm_syncer *s, const char *wf,
+                             const char *why, FILE *log) {
+  if (!is_isolated(s, wf)) {
+    s->isolated = xrealloc(s->isolated,
+                           (s->isolated_n + 1) * sizeof(char *));
+    s->isolated[s->isolated_n++] = xstrdup(wf);
+  }
+  drop_instance(s, wf);
   fprintf(log, "clpdaemon: sync: instance '%s' is no longer synchronized: "
-               "%s\n", s->failed, why);
+               "%s\n", wf, why);
   fflush(log);
-  s->failed[0] = '\0';
+}
+
+/* After a rolled-back cycle: the instance whose write failed for good, if
+ * any, is isolated; then every instance the cycle touched, and that one,
+ * is evicted (T10c): its facts retracted (mapped or not) and its recorded
+ * changes dropped; an isolated one is not reloaded (logged), the others
+ * wait in pending, with the packages whose templates carried them, for
+ * the next cycle's start. */
+static void rolled_back(clpd_orm_syncer *s, const char *why, FILE *log) {
+  char shown_wf[SHOWN_MAX + 1], **wfs;
+  wfset ev = {NULL, 0, 0}, pk = {NULL, 0, 0};
+  size_t i, n = 0;
+  if (s == NULL) return;
+  s->cycle_open = 0;
+  for (i = 0; i < s->touched.n; i++)
+    wfset_add(&ev, s->touched.v[i].wf, s->touched.v[i].pkg);
+  wfset_clear(&s->touched);
+  if (s->failed[0] != '\0') {
+    wfset_add(&ev, s->failed, NULL);
+    isolate_instance(s, s->failed, why, log);
+    s->failed[0] = '\0';
+  }
+  if (ev.n == 0) return;
+  /* The distinct instances, sorted for one pass over working memory. */
+  wfs = xrealloc(NULL, ev.n * sizeof *wfs);
+  for (i = 0; i < ev.n; i++) {
+    size_t k;
+    for (k = 0; k < n && strcmp(wfs[k], ev.v[i].wf) != 0; k++) {
+    }
+    if (k == n) wfs[n++] = ev.v[i].wf;
+  }
+  qsort(wfs, n, sizeof *wfs, cmp_text);
+  for (i = 0; i < ev.n; i++) wfset_add(&pk, ev.v[i].wf, ev.v[i].pkg);
+  retract_instances(s, wfs, n, &pk);
+  free(wfs);
+  /* In the order the cycle touched them. */
+  for (i = 0; i < ev.n; i++) {
+    const char *wf = ev.v[i].wf;
+    size_t k;
+    for (k = 0; k < i && strcmp(ev.v[k].wf, wf) != 0; k++) {
+    }
+    if (k < i) continue; /* done with its first pair */
+    drop_instance(s, wf);
+    if (is_isolated(s, wf)) {
+      fprintf(log, "clpdaemon: rehydrate: instance '%s' is not reloaded: it "
+                   "is no longer synchronized\n",
+              shown(wf, shown_wf));
+      fflush(log);
+      continue;
+    }
+    for (k = 0; k < pk.n; k++)
+      if (strcmp(pk.v[k].wf, wf) == 0 && pk.v[k].pkg != NULL &&
+          pk.v[k].pkg->orm != NULL && pk.v[k].pkg->orm_templates != NULL)
+        wfset_add(&s->pending, wf, pk.v[k].pkg);
+  }
+  wfset_free(&ev);
+  wfset_free(&pk);
+}
+
+/* Reloads the pending instances, in order, outside the cycle transaction
+ * (autocommit): their facts retracted first, then every mapped template of
+ * each package that carried them (src/orm_load.h). A SELECT that fails
+ * with a lost connection ends the attempt (that instance and the rest stay
+ * pending, nothing of it loaded); any other failure isolates the instance
+ * (its partial load retracted) and the next one goes on. Returns 0, or -1
+ * after the cycle transaction line (clpd_orm_tx_fail). */
+static int rehydrate(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
+  char schema[CLPD_ORM_TX_SCHEMA_SIZE + 2] = "", msg[1024],
+       shown_wf[SHOWN_MAX + 1], **wfs;
+  const clpd_package **done;
+  clpd_db_status st;
+  size_t i, n = 0;
+  if (strcmp(clpd_db_backend(s->db), "postgresql") == 0) {
+    if (clpd_orm_tx_schema_status(s->db, schema, msg, sizeof msg, &st) != 0) {
+      fprintf(log, "clpdaemon: rehydrate: %s\n", msg);
+      fflush(log);
+      return clpd_orm_tx_fail(tx, log, st, msg);
+    }
+    strcat(schema, ".");
+  }
+  /* What was asserted for them since the eviction goes first. */
+  wfs = xrealloc(NULL, s->pending.n * sizeof *wfs);
+  for (i = 0; i < s->pending.n; i++) {
+    size_t k;
+    for (k = 0; k < n && strcmp(wfs[k], s->pending.v[i].wf) != 0; k++) {
+    }
+    if (k == n) wfs[n++] = s->pending.v[i].wf;
+  }
+  qsort(wfs, n, sizeof *wfs, cmp_text);
+  retract_instances(s, wfs, n, NULL);
+  free(wfs);
+  done = xrealloc(NULL, s->pending.n * sizeof *done);
+  while (s->pending.n > 0) {
+    char *wf = s->pending.v[0].wf;
+    size_t nd = 0;
+    for (i = 0; i < s->pending.n; i++) {
+      const clpd_package *pkg = s->pending.v[i].pkg;
+      const clpd_orm_template *t = NULL;
+      size_t loaded;
+      if (strcmp(s->pending.v[i].wf, wf) != 0) continue;
+      st = clpd_orm_load_instance(s->env, s->db, s, pkg, schema, wf, done, nd,
+                                  log, &loaded, &t);
+      if (st == CLPD_DB_OK) {
+        done[nd++] = pkg;
+        continue;
+      }
+      snprintf(msg, sizeof msg, "%s", clpd_db_error(s->db));
+      fprintf(log, "clpdaemon: rehydrate: instance '%s': %s::%s: table "
+                   "'%s': %s\n",
+              shown(wf, shown_wf), pkg->manifest.name, t->name, t->table, msg);
+      fflush(log);
+      retract_instances(s, &wf, 1, NULL);
+      if (st == CLPD_DB_LOST) {
+        free(done);
+        return clpd_orm_tx_fail(tx, log, st, msg);
+      }
+      isolate_instance(s, wf, msg, log);
+      break;
+    }
+    wfset_remove(&s->pending, wf);
+  }
+  free(done);
+  return 0;
+}
+
+int clpd_orm_sync_begin_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx,
+                              FILE *log) {
+  if (s != NULL && s->pending.n > 0) {
+    if (clpd_orm_tx_connect(tx, log) != 0) return -1;
+    if (rehydrate(s, tx, log) != 0) return -1;
+  }
+  if (clpd_orm_tx_begin(tx, log) != 0) return -1;
+  if (s != NULL) {
+    wfset_clear(&s->touched);
+    s->cycle_open = 1;
+  }
+  return 0;
 }
 
 int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
@@ -795,13 +1117,19 @@ int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
   if (s != NULL && tx->db != NULL && !clpd_db_atomic_failed(tx->db) &&
       flush(s, log, why, sizeof why) == F_ABORT) {
     clpd_orm_tx_abort(tx, log, why);
-    isolate(s, why, log);
+    rolled_back(s, why, log);
     return -1;
   }
   /* After a failed statement (the flush's or an earlier one) the commit
    * returns that failure. */
   rc = clpd_orm_tx_end(tx, log);
-  if (rc == 0) clpd_orm_sync_clear(s);
-  else isolate(s, clpd_db_error(tx->db), log);
+  if (rc != 0) {
+    snprintf(why, sizeof why, "%s", clpd_db_error(tx->db));
+    rolled_back(s, why, log);
+  } else if (s != NULL) {
+    clpd_orm_sync_clear(s);
+    wfset_clear(&s->touched);
+    s->cycle_open = 0;
+  }
   return rc;
 }

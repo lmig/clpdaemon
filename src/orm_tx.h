@@ -31,6 +31,13 @@ typedef struct {
 void clpd_orm_tx_init(clpd_orm_tx *tx, clpd_db *db, const char *spec,
                       int initial_ms, int max_ms);
 
+/* Reconnects when the last failure lost the connection (nothing to do
+ * otherwise). Returns 0 (also without a database), or -1 when the
+ * reconnect failed: the line of clpd_orm_tx_begin is logged and retry_ms
+ * set, as for a failed begin. The rehydration of src/orm_sync.h runs
+ * between it and the begin. */
+int clpd_orm_tx_connect(clpd_orm_tx *tx, FILE *log);
+
 /* Opens the cycle transaction, reconnecting first when the last failure
  * lost the connection. Returns 0 (also without a database), or -1 when
  * the reconnect or the begin failed: the cycle must not run, the line
@@ -43,6 +50,14 @@ int clpd_orm_tx_begin(clpd_orm_tx *tx, FILE *log);
  * back: a statement of the cycle failed (<message> is the first failure's)
  * or the commit itself did; the same line is logged and retry_ms set. */
 int clpd_orm_tx_end(clpd_orm_tx *tx, FILE *log);
+
+/* A failed attempt outside the cycle transaction (a rehydration whose
+ * SELECT lost the connection, src/orm_sync.h): the same line as a failed
+ * begin with message as <message>, the same wait, and a reconnect before
+ * the next attempt when st is CLPD_DB_LOST. Returns -1 (0 without a
+ * database). */
+int clpd_orm_tx_fail(clpd_orm_tx *tx, FILE *log, clpd_db_status st,
+                     const char *message);
 
 /* Rolls the open cycle transaction back for a reason that is no failed
  * statement (a value the synchronization cannot write, src/orm_sync.h):
@@ -61,6 +76,11 @@ int clpd_orm_tx_next_delay(int prev, int initial_ms, int max_ms);
  * exists, or the name is too long). */
 #define CLPD_ORM_TX_SCHEMA_SIZE (2 * CLPD_ORM_IDENT_MAX + 3)
 int clpd_orm_tx_current_schema(clpd_db *db, char *out, char *msg, size_t n);
+/* The same, with the status of the query in *st (CLPD_DB_ERROR for a
+ * missing or too long schema name), so a caller can tell a lost
+ * connection. */
+int clpd_orm_tx_schema_status(clpd_db *db, char *out, char *msg, size_t n,
+                              clpd_db_status *st);
 
 /* CREATE TABLE IF NOT EXISTS for workflow_instance (one row per workflow
  * instance, written by the synchronization, src/orm_sync.h), in autocommit; on PostgreSQL qualified

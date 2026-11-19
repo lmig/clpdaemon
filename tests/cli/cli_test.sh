@@ -1806,7 +1806,10 @@ wait_status() {
   done
 }
 # After the failure the retry (100 ms later) commits, which resets the
-# backoff: a later failure waits 100 ms again, not 200.
+# backoff: a later failure waits 100 ms again, not 200. That cycle touched
+# instance w2 (its injected go fact), so the rollback evicts it and the
+# retry reloads it (T10c): the SELECT fails, because the rolled-back cycle
+# also undid the creation of tx_order, which isolates w2.
 rconf txreset.conf "node_id = n1
 tick_interval_ms = 60000
 cycle_min_interval_ms = 10
@@ -1824,6 +1827,8 @@ $TXERR
 clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
 $TXERR
 clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+clpdaemon: rehydrate: instance 'w2': tx@1::order: table 'tx_order': no such table: tx_order
+clpdaemon: sync: instance 'w2' is no longer synchronized: no such table: tx_order
 clpdaemon: received SIGTERM, stopping"
 if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
   fail "cycle tx: a committed cycle resets the backoff" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
@@ -1897,7 +1902,7 @@ fi
 # is an INSERT, a fact of a manual template is not written, two modifies
 # in one cycle (pay, then ship) are one UPDATE; an injected fact with the
 # primary key of a stored row is a unique violation that rolls the cycle
-# back.
+# back, isolates the instance and evicts it without a reload (T10c).
 mkdir syncpkg
 conf syncpkg/package.conf 'definition = sync
 version = 1
@@ -1947,6 +1952,7 @@ want="clpdaemon: n1: running
 clpdaemon: sync: sync@1::order: table 'sync_order': $SYNCDUP
 clpdaemon: cycle transaction failed: $SYNCDUP; retrying in 60000 ms
 clpdaemon: sync: instance 'w1' is no longer synchronized: $SYNCDUP
+clpdaemon: rehydrate: instance 'w1' is not reloaded: it is no longer synchronized
 clpdaemon: received SIGTERM, stopping"
 if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
   fail "sync: a running daemon writes its facts" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
@@ -1959,6 +1965,64 @@ w1|2|new
 0
 w1|sync|1|active|-|1|1'
   [ "$got" = "$want" ] || fail "sync: the rows after the cycles" "got [$got], want [$want]"
+fi
+
+# --- rehydration (T10c, docs/orm.md#rehydration) -----------------------------
+# A rolled-back cycle evicts the instance it touched and the retry reloads
+# it from the database: the stored row comes back as it was committed (the
+# rule's modify is undone), the fact the rule asserted (an unmapped memo)
+# and the injected fact that started the cycle are lost, and the untouched
+# boot fact stays. A later injected fact sees exactly that working memory
+# (the show rule prints it).
+mkdir rhpkg
+conf rhpkg/package.conf 'definition = rh
+version = 1
+files = r.clp
+orm = orm.conf
+ingest = go'
+conf rhpkg/r.clp '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id))
+(deffacts seed (boot (wf-id w0)) (order (wf-id w1) (status new)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))
+(defrule fail (go (wf-id ?w) (act fail)) ?o <- (order (wf-id ?w)) => (modify ?o (status bad)) (assert (memo (wf-id ?w))) (db-nextval missing_no))
+(defrule show (go (wf-id ?w) (act show)) (order (wf-id ?w) (status ?s)) => (printout t "show " ?w " " ?s " memos=" (length$ (find-all-facts ((?m memo)) TRUE)) " gos=" (length$ (find-all-facts ((?g go)) TRUE)) crlf))'
+conf rhpkg/orm.conf 'order.table = rh_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+seq.missing_no = rh_missing_seq
+seq.missing_no.owned = yes'
+rconf rhrun.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 100
+cycle_retry_max_ms = 100
+database = sqlite:$WORK/rhrun.db
+packages = rhpkg"
+cases=$((cases + 1))
+start rhrun.conf admin.sock
+wait_status admin.sock ' cycles=1 ' || ok=0
+acase "rehydrate: inject a failing go" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"fail"}}}\n'
+wait_status admin.sock ' cycles=3 ' || ok=0
+acase "rehydrate: working memory after the retry" "OK node_id=n1 cycles=3 queue=0 facts=2" admin.sock 'status\n'
+acase "rehydrate: inject show" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"show"}}}\n'
+wait_line out.txt 'show w1 new memos=0 gos=1' || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: db-nextval: sequence alias 'missing_no': sequence 'rh_missing_seq': no such table: clpd_sequence
+[PRCCODE4] Execution halted during the actions of defrule 'fail'.
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != 'show w1 new memos=0 gos=1' ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "rehydrate: a rolled-back cycle reloads its instance" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 rhrun.db "SELECT wf_id || '|' || status FROM rh_order" 2>&1)
+  [ "$got" = 'w1|new' ] || fail "rehydrate: the stored row is unchanged" "got [$got]"
 fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"

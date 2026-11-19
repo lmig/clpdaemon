@@ -1,7 +1,8 @@
 /* clpdaemon entry point: command line, configuration (T2), plugins (T6),
  * the database (T8d) and the event loop running engine cycles (T3) inside
  * the cycle transaction (T10a), which ends with the automatic
- * synchronization of the mapped facts (T10b). */
+ * synchronization of the mapped facts (T10b); a rolled-back cycle's
+ * instances are rehydrated when the next one starts (T10c). */
 #include "admin.h"
 #include "clips_trace.h"
 #include "config.h"
@@ -49,7 +50,8 @@ typedef struct {
 } cycle_ctx;
 
 /* One cycle, with a database inside the cycle transaction (T10a,
- * docs/database.md#cycle-transaction): begin, assert the facts queued so
+ * docs/database.md#cycle-transaction): reload the instances a rolled-back
+ * cycle evicted, then begin (src/orm_sync.h, T10c), assert the facts queued so
  * far (docs/ingest.md; a rejected one is logged under the plugin or admin
  * socket that posted it), the plugins' cycle_begin, focus every package
  * module, Run with the rule limit, write the changes of the mapped facts
@@ -60,7 +62,8 @@ typedef struct {
  * set after Run or when the cycle transaction was rolled back; a halt on a
  * stop signal (HaltRules), or a rule's (halt), is not an error and
  * commits. That halt is left to the loop, which reads the signal next.
- * When the begin fails nothing else runs (the queued facts wait) but the
+ * When the reload loses the connection or the begin fails nothing else
+ * runs (the queued facts wait) but the
  * admin listener is resumed, as after every cycle (a failed reconnect may
  * have freed the descriptor it waited for); when the begin or the commit
  * fails, the loop runs the next cycle after the backoff (clpd_loop_defer),
@@ -69,7 +72,7 @@ static void run_cycle(void *ctx) {
   cycle_ctx *c = ctx;
   Environment *env = clpd_engine_env(c->engine);
   int committed;
-  if (clpd_orm_tx_begin(&c->tx, clpd_log()) != 0) {
+  if (clpd_orm_sync_begin_cycle(c->sync, &c->tx, clpd_log()) != 0) {
     clpd_admin_resume(c->admin);
     clpd_loop_defer(c->loop, c->tx.retry_ms);
     return;

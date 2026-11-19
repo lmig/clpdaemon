@@ -35,16 +35,28 @@ static int failed(clpd_orm_tx *tx, FILE *log, clpd_db_status st,
   return -1;
 }
 
-int clpd_orm_tx_begin(clpd_orm_tx *tx, FILE *log) {
-  clpd_db_status st;
+int clpd_orm_tx_fail(clpd_orm_tx *tx, FILE *log, clpd_db_status st,
+                     const char *message) {
+  if (tx->db == NULL) return 0;
+  return failed(tx, log, st, message);
+}
+
+int clpd_orm_tx_connect(clpd_orm_tx *tx, FILE *log) {
   if (tx->db == NULL) return 0;
   if (tx->reconnect) {
     /* The message never holds the spec (src/db.h). */
     char msg[512];
-    st = clpd_db_reconnect(tx->db, tx->spec, msg, sizeof msg);
-    if (st != CLPD_DB_OK) return failed(tx, log, CLPD_DB_LOST, msg);
+    if (clpd_db_reconnect(tx->db, tx->spec, msg, sizeof msg) != CLPD_DB_OK)
+      return failed(tx, log, CLPD_DB_LOST, msg);
     tx->reconnect = 0;
   }
+  return 0;
+}
+
+int clpd_orm_tx_begin(clpd_orm_tx *tx, FILE *log) {
+  clpd_db_status st;
+  if (tx->db == NULL) return 0;
+  if (clpd_orm_tx_connect(tx, log) != 0) return -1;
   st = clpd_db_begin_atomic(tx->db);
   if (st != CLPD_DB_OK) return failed(tx, log, st, clpd_db_error(tx->db));
   return 0;
@@ -92,13 +104,20 @@ static void quote(const char *s, char *out) {
 
 int clpd_orm_tx_current_schema(clpd_db *db, char *out, char *msg,
                                size_t n) {
+  clpd_db_status st;
+  return clpd_orm_tx_schema_status(db, out, msg, n, &st);
+}
+
+int clpd_orm_tx_schema_status(clpd_db *db, char *out, char *msg, size_t n,
+                              clpd_db_status *st) {
   clpd_db_result *r = NULL;
   const clpd_db_value *v;
-  if (clpd_db_exec(db, "SELECT current_schema()", NULL, 0, &r) !=
-      CLPD_DB_OK) {
+  *st = clpd_db_exec(db, "SELECT current_schema()", NULL, 0, &r);
+  if (*st != CLPD_DB_OK) {
     snprintf(msg, n, "%s", clpd_db_error(db));
     return -1;
   }
+  *st = CLPD_DB_ERROR; /* the failures below */
   v = clpd_db_result_rows(r) == 1 ? clpd_db_result_value(r, 0, 0) : NULL;
   if (v == NULL || v->type != CLPD_DB_TEXT) {
     clpd_db_result_free(r);
@@ -115,6 +134,7 @@ int clpd_orm_tx_current_schema(clpd_db *db, char *out, char *msg,
   }
   quote(v->data, out);
   clpd_db_result_free(r);
+  *st = CLPD_DB_OK;
   return 0;
 }
 

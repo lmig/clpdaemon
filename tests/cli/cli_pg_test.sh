@@ -8,6 +8,9 @@
 # admin socket is still served, also when its listener was paused because
 # the daemon ran out of descriptors (the failed begin/reconnect path
 # resumes it, L91 R3-003); after the server is back the cycles commit.
+# Then a rolled-back cycle (a rule's db-nextval of a missing sequence)
+# evicts the instance it touched and the retry reloads it from PostgreSQL
+# (T10c): the rule's modify is undone, its injected fact is lost.
 set -u
 
 U='usage: cli_pg_test.sh <clpdaemon> <admin-client> <conninfo> <password>'
@@ -61,15 +64,19 @@ files = r.clp
 orm = orm.conf
 ingest = go' >pkg/package.conf
 printf '%s\n' '(deftemplate boot (slot wf-id))
-(deftemplate go (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
 (deftemplate item (slot wf-id) (slot status (type SYMBOL)))
 (deffacts seed (boot (wf-id w0)) (item (wf-id w1) (status new)))
 (defrule boot (boot (wf-id ?w)) => (db-create-table item))
-(defrule done (go (wf-id ?w)) ?i <- (item (wf-id ?w) (status new)) => (modify ?i (status done)))' >pkg/r.clp
+(defrule done (go (wf-id ?w)) ?i <- (item (wf-id ?w) (status new)) => (modify ?i (status done)))
+(defrule fail (go (wf-id ?w) (act fail)) ?i <- (item (wf-id ?w)) => (modify ?i (status bad)) (db-nextval missing_no))
+(defrule show (go (wf-id ?w) (act show)) (item (wf-id ?w) (status ?s)) => (printout t "show " ?w " " ?s " gos=" (length$ (find-all-facts ((?g go)) TRUE)) crlf))' >pkg/r.clp
 printf '%s\n' 'item.table = pg_item
 item.owned = yes
 item.slot.wf-id = wf_id text symbol error
-item.slot.status = status text symbol default' >pkg/orm.conf
+item.slot.status = status text symbol default
+seq.missing_no = pg_missing_seq
+seq.missing_no.owned = yes' >pkg/orm.conf
 printf '%s\n' "node_id = n1
 tick_interval_ms = 50
 cycle_min_interval_ms = 10
@@ -105,7 +112,10 @@ free=0
 for fd in $(ls /proc/"$pid"/fd | sort -n); do
   [ "$fd" = "$free" ] && free=$((free + 1))
 done
-prlimit --pid "$pid" --nofile="$free:$free" 2>/dev/null || free=
+# Only the soft limit is lowered, so the restore below can raise it again
+# for a runner that is not root (the hard limit stays).
+soft=$(prlimit --pid "$pid" --nofile --output SOFT --noheadings 2>/dev/null | tr -d ' ')
+prlimit --pid "$pid" --nofile="$free:" 2>/dev/null || free=
 qa "ALTER DATABASE clpd_test CONNECTION LIMIT 0" >/dev/null
 "$ADMIN" admin.sock 'status\n' >status.txt 2>&1 &
 cpid=$!
@@ -127,7 +137,7 @@ else
   *) fail "pg sync: admin status during the backoff" "got [$(cat status.txt)]" ;;
   esac
 fi
-[ -n "$free" ] && prlimit --pid "$pid" --nofile=1024:1024 2>/dev/null
+[ -n "$free" ] && prlimit --pid "$pid" --nofile="${soft:-1024}:" 2>/dev/null
 cases=$((cases + 1))
 grep -q '^clpdaemon: cycle transaction failed: .*; retrying in 200 ms$' err.txt ||
   fail "pg sync: the failure line" "stderr [$(cat err.txt)]"
@@ -144,6 +154,22 @@ wait_q "SELECT status FROM pg_item WHERE wf_id = 'w1'" 'done' ||
 cases=$((cases + 1))
 got=$(q "SELECT (updated_at > created_at)::int FROM workflow_instance WHERE wf_id = 'w1'")
 [ "$got" = 1 ] || fail "pg sync: updated_at moved" "got [$got]"
+
+# Rehydration: the failing cycle modifies the row's fact, then fails; the
+# retry reloads the stored row (done), and the injected go facts are lost.
+FAILMSG='clpdaemon: cycle transaction failed: relation "public.pg_missing_seq" does not exist (SQLSTATE 42P01); retrying in 200 ms'
+cases=$((cases + 1))
+"$ADMIN" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"fail"}}}\n' >inject.txt 2>&1
+wait_has err.txt "$FAILMSG" || fail "pg rehydrate: the cycle is rolled back" "stderr [$(cat err.txt)]"
+sleep 0.5
+"$ADMIN" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"show"}}}\n' >>inject.txt 2>&1
+wait_has out.txt 'show w1' || true
+[ "$(cat out.txt)" = 'show w1 done gos=1' ] && [ "$(cat inject.txt)" = "OK queued${NL}OK queued" ] ||
+  fail "pg rehydrate: the instance is reloaded" "stdout [$(cat out.txt)], inject [$(cat inject.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+got=$(q "SELECT status FROM pg_item WHERE wf_id = 'w1'")
+[ "$got" = done ] || fail "pg rehydrate: the stored row is unchanged" "got [$got]"
+: >out.txt
 
 kill -TERM "$pid" 2>/dev/null
 n=0
