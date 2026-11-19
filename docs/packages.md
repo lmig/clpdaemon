@@ -13,6 +13,7 @@ version     = v3
 files       = templates.clp, rules.clp, functions.clp
 lint_exempt = template:catalog, rule:load-catalog
 ingest      = order, payment
+orm         = orm.conf
 ```
 
 | Key | Type | Default |
@@ -22,6 +23,7 @@ ingest      = order, payment
 | `files` | non-empty list of paths relative to the package directory, loaded in order | required |
 | `lint_exempt` | list of `template:<name>` and `rule:<name>` excluded from the `wf-id` lint | empty |
 | `ingest` | list of deftemplate names of the package that facts from outside may assert ([`ingest.md`](ingest.md)) | empty |
+| `orm` | path of the ORM mapping file, relative to the package directory (one path: a comma is part of it); needs `database` in the daemon configuration ([`orm.md`](orm.md)) | absent (no mapping) |
 
 The package is identified as `definition@version` (for example `fibre-installation@v3`).
 
@@ -33,8 +35,9 @@ At startup (FR-2), after the configuration and the CLIPS environment, the daemon
 2. It loads `files` in order into that module. Loading a package stops at its first failed file.
 3. It runs the `wf-id` lint on the package (FR-7, see below).
 4. It checks the `ingest` list: every name must be a deftemplate of the package (not an implied one), and not listed by an earlier package (also one that failed to load).
+5. When `orm` is set, it reads and checks the mapping file against the package's deftemplates and the mappings of earlier packages ([`orm.md`](orm.md#loading)).
 
-Every package is checked even when an earlier one failed, so one run reports all errors; any error makes the daemon exit 1. With `--check`, the daemon stops after loading and linting. Otherwise it calls `Reset` once and enters the event loop.
+Every package is checked even when an earlier one failed, so one run reports all errors; any error makes the daemon exit 1. With `--check`, the daemon stops after loading, linting and checking the mappings. Otherwise it calls `Reset` once and enters the event loop.
 
 Before each cycle the daemon replaces the focus stack with MAIN under every package module, the first package on top, so one `Run` fires the rules of all packages (a rule of a non-MAIN module only fires with focus).
 
@@ -66,6 +69,8 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Empty `files` | `clpdaemon: <file>:<line>: files: expected at least one file` |
 | Absolute path in `files` | `clpdaemon: <file>:<line>: files: '<path>' must be relative to the package directory` |
 | Empty list item | `clpdaemon: <file>:<line>: <key>: empty list item` |
+| Empty `orm` | `clpdaemon: <file>:<line>: orm: expected a file` |
+| Absolute path in `orm` | `clpdaemon: <file>:<line>: orm: '<path>' must be relative to the package directory` |
 | Name repeated in `ingest` | `clpdaemon: <file>:<line>: ingest: '<name>' listed more than once` |
 | Bad exemption | `clpdaemon: <file>:<line>: lint_exempt: expected template:<name> or rule:<name>, got '<item>'` |
 | Required key absent | `clpdaemon: <file>: missing required key '<key>'` |
@@ -82,4 +87,4 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | `ingest` names no deftemplate of the package | `clpdaemon: <pkg>: ingest names unknown template '<t>'` |
 | `ingest` names a template an earlier package lists | `clpdaemon: <pkg>: ingest names template '<t>', already listed by <first pkg>` |
 
-Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come last, in list order.
+Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come next, in list order, then the mapping messages ([`orm.md`](orm.md#messages)).

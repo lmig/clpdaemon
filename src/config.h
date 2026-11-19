@@ -32,6 +32,7 @@ typedef struct {
   int watch_facts;
   int watch_rules;
   char *database; /* NULL = no database; checked by clpd_db_check_spec */
+  int orm_allow_drop; /* 1: db-drop-table may drop owned tables (T9b) */
   clpd_list packages;
   clpd_list plugins;
 } clpd_config;

@@ -10,12 +10,12 @@ usage: clpdaemon --config <file> [--foreground] [--check]
 |---|---|
 | `--config <file>` | Configuration file. Required. |
 | `--foreground` | Run in the foreground. This is the default (systemd `Type=notify`); the daemon never double-forks. |
-| `--check` | Validate the configuration, open the trace files and the database, load and initialize the plugins, load and lint the rule packages, shut the plugins down, and exit. It never creates the admin socket. |
+| `--check` | Validate the configuration, open the trace files and the database, load and initialize the plugins, load and lint the rule packages and check their ORM mappings, shut the plugins down, and exit. It never creates the admin socket. |
 | `--help` | Print the usage line on stdout and exit 0. |
 
 Exit codes: `0` success, `1` invalid configuration or a startup failure (trace files, database, plugins, rule packages, admin socket), `2` command-line error.
 
-With `--check`, the daemon validates the configuration, opens the trace files ([`trace.md`](trace.md)) and the database when `database` is set ([`database.md`](database.md)), loads the plugins and calls their `init` ([`plugins.md`](plugins.md)), loads and lints the rule packages ([`packages.md`](packages.md)), so package files may call plugin functions, then calls the plugins' `shutdown` and exits. Plugin log lines (`clpdaemon: <plugin>: <message>`) go to stderr, also under `--check`. Without `--check`, it does the same, creates the admin socket ([`admin-socket.md`](admin-socket.md)), and then runs until it receives `SIGTERM` or `SIGINT`. It always stays in the foreground, with or without `--foreground`; there is no detached mode (systemd supervises it, T17).
+With `--check`, the daemon validates the configuration, opens the trace files ([`trace.md`](trace.md)) and the database when `database` is set ([`database.md`](database.md)), loads the plugins and calls their `init` ([`plugins.md`](plugins.md)), loads and lints the rule packages and checks their ORM mappings ([`packages.md`](packages.md), [`orm.md`](orm.md)), so package files may call plugin functions, then calls the plugins' `shutdown` and exits. Plugin log lines (`clpdaemon: <plugin>: <message>`) go to stderr, also under `--check`. Without `--check`, it does the same, creates the admin socket ([`admin-socket.md`](admin-socket.md)), and then runs until it receives `SIGTERM` or `SIGINT`. It always stays in the foreground, with or without `--foreground`; there is no detached mode (systemd supervises it, T17).
 
 ## Running
 
@@ -48,6 +48,7 @@ One `key = value` per line; lines may end in LF or CRLF, and spaces and tabs cou
 | `packages` | list of paths | empty |
 | `plugins` | list of paths, each containing a `/`, loaded in order ([`plugins.md`](plugins.md)) | empty |
 | `database` | connection string: `sqlite:<path>` (tests only) or a PostgreSQL conninfo (`key=value` pairs or a `postgresql://` / `postgres://` URI) without a password ([`database.md`](database.md)); never echoed in messages | absent (no database) |
+| `orm_allow_drop` | `yes` or `no`: whether `(db-drop-table <template>)` may drop a table the mapping marks as owned ([`orm.md`](orm.md)); a table that is not owned is never dropped | `no` |
 
 Integers are decimal and must not exceed 2147483647.
 
@@ -81,6 +82,7 @@ All messages go to stderr, except `--check` success and `--help`, which go to st
 | `database = sqlite:` without a path (or `sqlite` alone) | `clpdaemon: <file>:<line>: database: expected sqlite:<path>` |
 | `database` that libpq cannot parse | `clpdaemon: <file>:<line>: database: invalid PostgreSQL connection string` |
 | `database` with `password=`, `sslpassword=` or a password in the URI | `clpdaemon: <file>:<line>: database: the connection string must not contain a password (use a password file, see PGPASSFILE)` |
+| Bad `orm_allow_drop` | `clpdaemon: <file>:<line>: orm_allow_drop: expected yes or no, got '<value>'` |
 | `node_id` absent | `clpdaemon: <file>: missing required key 'node_id'` |
 | Interval order | `clpdaemon: <file>: cycle_min_interval_ms (<a>) must not exceed tick_interval_ms (<b>)` |
 

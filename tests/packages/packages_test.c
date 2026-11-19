@@ -42,7 +42,8 @@ typedef struct {
   int rc;
 } run;
 
-static void load(run *r, const char *const *dirs, size_t n) {
+/* have_db < 0: the plain clpd_packages_load (no database). */
+static void load_db(run *r, const char *const *dirs, size_t n, int have_db) {
   clpd_list list;
   FILE *err = tmpfile();
   size_t len;
@@ -50,11 +51,17 @@ static void load(run *r, const char *const *dirs, size_t n) {
   list.items = (char **)dirs;
   list.count = n;
   r->env = CreateEnvironment();
-  r->rc = clpd_packages_load(r->env, &list, &r->pkgs, err);
+  r->rc = have_db < 0 ? clpd_packages_load(r->env, &list, &r->pkgs, err)
+                      : clpd_packages_load_ex(r->env, &list, have_db,
+                                              &r->pkgs, err);
   rewind(err);
   len = fread(r->err, 1, sizeof r->err - 1, err);
   r->err[len] = '\0';
   fclose(err);
+}
+
+static void load(run *r, const char *const *dirs, size_t n) {
+  load_db(r, dirs, n, -1);
 }
 
 static void done(run *r) {
@@ -269,6 +276,286 @@ static void test_ingest(void) {
   done(&r);
 }
 
+static int err_matches(const run *r, const char *want) {
+  if (strcmp(r->err, want) != 0) {
+    fprintf(stderr, "  got:  [%s]\n  want: [%s]\n", r->err, want);
+    return 0;
+  }
+  return 1;
+}
+
+static const char *orm_tmpl =
+    "(deftemplate order (slot wf-id) (slot line-no (type INTEGER))\n"
+    "  (slot status (type SYMBOL)) (slot note))\n";
+static const char *orm_map =
+    "order.table = shop_order\n"
+    "order.owned = yes\n"
+    "order.key = line-no\n"
+    "order.slot.wf-id = wf_id text string error\n"
+    "order.slot.line-no = line_no bigint integer error\n"
+    "order.slot.status = status text symbol default\n"
+    "order.slot.note = note text string nil\n"
+    "seq.order_no = shop_order_no\n"
+    "seq.order_no.owned = yes\n";
+
+/* T9a: a package without `orm` loads as before, with or without a
+ * database, and has no mapping. */
+static void test_no_orm_unchanged(void) {
+  const char *dirs[1];
+  run r;
+  int db;
+  const char *a = package("noorm", "definition = noorm\nversion = 1\n"
+                                   "files = t.clp\ningest = ev\n");
+  write_file(a, "t.clp", tmpl);
+  dirs[0] = a;
+  for (db = -1; db <= 1; db++) {
+    load_db(&r, dirs, 1, db);
+    EXPECT(r.rc == 0 && strcmp(r.err, "") == 0);
+    EXPECT(r.pkgs.count == 1 && r.pkgs.items[0].manifest.orm == NULL &&
+           r.pkgs.items[0].orm == NULL && r.pkgs.items[0].orm_templates == NULL);
+    EXPECT(r.pkgs.count == 1 && r.pkgs.items[0].ingest != NULL);
+    done(&r);
+  }
+}
+
+/* A valid mapping binds to the package's own deftemplates. */
+static void test_orm_valid(void) {
+  const char *dirs[1];
+  char want[512];
+  run r;
+  const clpd_orm *m;
+  const char *a = package("orm", "definition = shop\nversion = 1\n"
+                                 "files = t.clp\norm = map/orm.conf\n");
+  char sub[300];
+  snprintf(sub, sizeof sub, "%s/map", a);
+  mkdir(sub, 0700);
+  write_file(a, "t.clp", orm_tmpl);
+  write_file(sub, "orm.conf", orm_map);
+  dirs[0] = a;
+  load_db(&r, dirs, 1, 1);
+  EXPECT(r.rc == 0 && err_matches(&r, ""));
+  EXPECT(r.pkgs.count == 1 && r.pkgs.items[0].orm != NULL);
+  if (r.pkgs.count == 1 && r.pkgs.items[0].orm != NULL) {
+    m = r.pkgs.items[0].orm;
+    snprintf(want, sizeof want, "%s/map/orm.conf", a);
+    EXPECT(strcmp(r.pkgs.items[0].manifest.orm, want) == 0);
+    EXPECT(strcmp(m->path, want) == 0);
+    EXPECT(m->template_count == 1 && m->sequence_count == 1);
+    EXPECT(r.pkgs.items[0].orm_templates != NULL &&
+           r.pkgs.items[0].orm_templates[0] ==
+               FindDeftemplate(r.env, "shop@1::order"));
+    EXPECT(m->templates[0].key_columns != NULL &&
+           m->templates[0].key_columns[0] == 0 &&
+           m->templates[0].key_columns[1] == 1);
+    EXPECT(strcmp(m->sequences[0].name, "shop_order_no") == 0);
+  }
+  EXPECT(strcmp(DefmoduleName(GetCurrentModule(r.env)), "MAIN") == 0);
+  done(&r);
+}
+
+/* Without a database a mapping is an error, also through the plain
+ * loader; the mapping is still checked. */
+static void test_orm_needs_database(void) {
+  const char *dirs[1];
+  run r;
+  int db;
+  const char *a = package("ormnodb", "definition = nodb\nversion = 1\n"
+                                     "files = t.clp\norm = orm.conf\n");
+  write_file(a, "t.clp", orm_tmpl);
+  write_file(a, "orm.conf", orm_map);
+  dirs[0] = a;
+  for (db = -1; db <= 0; db++) {
+    load_db(&r, dirs, 1, db);
+    EXPECT(r.rc != 0);
+    EXPECT(err_matches(&r, "clpdaemon: nodb@1: orm: a mapping needs a "
+                           "database (the configuration sets no database)\n"));
+    done(&r);
+  }
+}
+
+/* Mapping file errors keep the kvfile format, with the mapping path. */
+static void test_orm_file_errors(void) {
+  const char *dirs[2];
+  char want[1024];
+  run r;
+  const char *a = package("ormsyn", "definition = syn\nversion = 1\n"
+                                    "files = t.clp\norm = orm.conf\n");
+  const char *b = package("ormgone", "definition = gone\nversion = 1\n"
+                                     "files = t.clp\norm = none.conf\n");
+  write_file(a, "t.clp", orm_tmpl);
+  write_file(a, "orm.conf", "order.table = shop_order\norder.owned = maybe\n"
+                            "order.slot.wf-id = wf_id text string\n");
+  write_file(b, "t.clp", orm_tmpl);
+  dirs[0] = a;
+  dirs[1] = b;
+  load_db(&r, dirs, 2, 0);
+  EXPECT(r.rc != 0);
+  snprintf(want, sizeof want,
+           "clpdaemon: %s/orm.conf:2: order.owned: expected yes or no, got "
+           "'maybe'\n"
+           "clpdaemon: %s/orm.conf:3: order.slot.wf-id: expected '<column> "
+           "<sql-type> <clips-type> <null>', got 'wf_id text string'\n"
+           "clpdaemon: syn@1: orm: a mapping needs a database (the "
+           "configuration sets no database)\n"
+           "clpdaemon: %s/none.conf: cannot open: No such file or directory\n"
+           "clpdaemon: gone@1: orm: a mapping needs a database (the "
+           "configuration sets no database)\n",
+           a, a, b);
+  EXPECT(err_matches(&r, want));
+  EXPECT(r.pkgs.count == 2 && r.pkgs.items[0].orm == NULL &&
+         r.pkgs.items[1].orm == NULL);
+  done(&r);
+}
+
+/* Checks against the package's deftemplates, in this order per template:
+ * no wf-id, the slot lines (unknown slot, clips type its type constraint
+ * does not allow), unknown key slots, then the template's slots
+ * (multislot, unmapped). */
+static void test_orm_bind_errors(void) {
+  const char *dirs[1];
+  run r;
+  const char *a = package("ormbind", "definition = bind\nversion = 1\n"
+                                     "files = t.clp\norm = orm.conf\n"
+                                     "lint_exempt = template:ref, "
+                                     "template:implied-fact\n");
+  write_file(a, "t.clp",
+             "(deftemplate order (slot wf-id) (slot n (type INTEGER))\n"
+             "  (slot f (type FLOAT)) (slot s (type STRING))\n"
+             "  (slot y (type SYMBOL)) (slot lex (type LEXEME))\n"
+             "  (slot num (type NUMBER)) (slot any) (multislot tags)\n"
+             "  (slot gone))\n"
+             "(deftemplate ref (slot code))\n"
+             "(deftemplate ok (slot wf-id) (slot lex (type LEXEME))\n"
+             "  (slot num (type NUMBER)) (slot any) (slot n (type INTEGER))\n"
+             "  (slot y (type SYMBOL STRING)))\n"
+             "(defrule r (order (wf-id ?w)) => (assert (implied-fact)))\n");
+  write_file(a, "orm.conf",
+             "order.table = o\norder.owned = yes\norder.key = n, nope, tags\n"
+             "order.slot.wf-id = wf_id text string error\n"
+             "order.slot.n = n bigint string error\n"
+             "order.slot.f = f double integer nil\n"
+             "order.slot.s = s text symbol nil\n"
+             "order.slot.y = y text string nil\n"
+             "order.slot.lex = lex text integer nil\n"
+             "order.slot.num = num numeric symbol nil\n"
+             "order.slot.any = any text symbol nil\n"
+             "order.slot.tags = tags text string error\n"
+             "order.slot.extra = extra text string nil\n"
+             "ref.table = ref\nref.owned = no\n"
+             "ref.slot.wf-id = wf_id text string error\n"
+             "ref.slot.code = code text string nil\n"
+             "nope.table = nope\nnope.owned = no\n"
+             "implied-fact.table = imp\nimplied-fact.owned = no\n"
+             "ok.table = ok\nok.owned = no\nok.key = n\n"
+             "ok.slot.wf-id = wf_id text symbol error\n"
+             "ok.slot.lex = lex text symbol nil\n"
+             "ok.slot.num = num numeric integer nil\n"
+             "ok.slot.any = any jsonb string nil\n"
+             "ok.slot.n = n bigint integer error\n"
+             "ok.slot.y = y text string default\n");
+  dirs[0] = a;
+  load_db(&r, dirs, 1, 1);
+  EXPECT(r.rc != 0);
+  EXPECT(err_matches(&r,
+      "clpdaemon: bind@1: orm: template 'order': slot 'n' is mapped as "
+      "string, which its type constraint does not allow\n"
+      "clpdaemon: bind@1: orm: template 'order': slot 'f' is mapped as "
+      "integer, which its type constraint does not allow\n"
+      "clpdaemon: bind@1: orm: template 'order': slot 's' is mapped as "
+      "symbol, which its type constraint does not allow\n"
+      "clpdaemon: bind@1: orm: template 'order': slot 'y' is mapped as "
+      "string, which its type constraint does not allow\n"
+      "clpdaemon: bind@1: orm: template 'order': slot 'lex' is mapped as "
+      "integer, which its type constraint does not allow\n"
+      "clpdaemon: bind@1: orm: template 'order': slot 'num' is mapped as "
+      "symbol, which its type constraint does not allow\n"
+      "clpdaemon: bind@1: orm: template 'order' has no slot 'extra'\n"
+      "clpdaemon: bind@1: orm: template 'order' has no slot 'nope'\n"
+      "clpdaemon: bind@1: orm: template 'order': slot 'tags' is a "
+      "multislot, which cannot be mapped\n"
+      "clpdaemon: bind@1: orm: template 'order': slot 'gone' is not "
+      "mapped\n"
+      "clpdaemon: bind@1: orm: template 'ref' has no wf-id slot\n"
+      "clpdaemon: bind@1: orm: unknown template 'nope'\n"
+      "clpdaemon: bind@1: orm: unknown template 'implied-fact'\n"));
+  EXPECT(r.pkgs.count == 1 && r.pkgs.items[0].orm_templates == NULL);
+  done(&r);
+}
+
+/* A template of another package (or of MAIN) is not the package's own. */
+static void test_orm_other_module(void) {
+  const char *dirs[2];
+  run r;
+  const char *a = package("ormown1", "definition = own1\nversion = 1\n"
+                                     "files = t.clp\n");
+  const char *b = package("ormown2", "definition = own2\nversion = 1\n"
+                                     "files = t.clp\norm = orm.conf\n");
+  write_file(a, "t.clp", orm_tmpl);
+  write_file(b, "t.clp", "(deftemplate other (slot wf-id))\n");
+  write_file(b, "orm.conf", orm_map);
+  dirs[0] = a;
+  dirs[1] = b;
+  load_db(&r, dirs, 2, 1);
+  EXPECT(r.rc != 0);
+  EXPECT(err_matches(&r, "clpdaemon: own2@1: orm: unknown template "
+                         "'order'\n"));
+  done(&r);
+}
+
+/* Tables and sequences belong to one definition: its versions may share
+ * them, another definition may not (also after a failed check). */
+static void test_orm_ownership(void) {
+  const char *dirs[4];
+  run r;
+  const char *v1 = package("shop1", "definition = shop\nversion = 1\n"
+                                    "files = t.clp\norm = orm.conf\n");
+  const char *v2 = package("shop2", "definition = shop\nversion = 2\n"
+                                    "files = t.clp\norm = orm.conf\n");
+  const char *bad = package("crm1", "definition = crm\nversion = 1\n"
+                                    "files = t.clp\norm = orm.conf\n");
+  const char *late = package("crm2", "definition = billing\nversion = 1\n"
+                                     "files = t.clp\norm = orm.conf\n");
+  write_file(v1, "t.clp", orm_tmpl);
+  write_file(v1, "orm.conf", orm_map);
+  write_file(v2, "t.clp", orm_tmpl);
+  write_file(v2, "orm.conf", orm_map);
+  write_file(bad, "t.clp", "(deftemplate order (slot wf-id))\n"
+                           "(deftemplate item (slot wf-id))\n");
+  write_file(bad, "orm.conf",
+             "order.table = crm_order\norder.owned = no\n"
+             "order.slot.wf-id = wf_id text string error\n"
+             "item.table = shop_order\nitem.owned = no\n"
+             "item.slot.wf-id = wf_id text string error\n"
+             "seq.n = shop_order_no\nseq.n.owned = no\n"
+             "seq.m = crm_seq\nseq.m.owned = yes\n");
+  write_file(late, "t.clp", "(deftemplate order (slot wf-id) (multislot x))\n");
+  write_file(late, "orm.conf",
+             "order.table = crm_order\norder.owned = no\n"
+             "order.slot.wf-id = wf_id text string error\n"
+             "seq.m = crm_seq\nseq.m.owned = yes\n");
+  dirs[0] = v1;
+  dirs[1] = v2;
+  load_db(&r, dirs, 2, 1);
+  EXPECT(r.rc == 0 && err_matches(&r, ""));
+  done(&r);
+  dirs[2] = bad;
+  dirs[3] = late;
+  load_db(&r, dirs, 4, 1);
+  EXPECT(r.rc != 0);
+  EXPECT(err_matches(&r,
+      "clpdaemon: crm@1: orm: table 'shop_order' is already mapped by "
+      "shop@1\n"
+      "clpdaemon: crm@1: orm: sequence 'shop_order_no' is already mapped by "
+      "shop@1\n"
+      "clpdaemon: billing@1: orm: template 'order': slot 'x' is a "
+      "multislot, which cannot be mapped\n"
+      "clpdaemon: billing@1: orm: table 'crm_order' is already mapped by "
+      "crm@1\n"
+      "clpdaemon: billing@1: orm: sequence 'crm_seq' is already mapped by "
+      "crm@1\n"));
+  done(&r);
+}
+
 int main(void) {
   if (mkdtemp(root) == NULL) {
     perror("packages_test");
@@ -283,6 +570,13 @@ int main(void) {
   test_duplicate_package();
   test_manifest_error();
   test_ingest();
+  test_no_orm_unchanged();
+  test_orm_valid();
+  test_orm_needs_database();
+  test_orm_file_errors();
+  test_orm_bind_errors();
+  test_orm_other_module();
+  test_orm_ownership();
   if (failures != 0) {
     fprintf(stderr, "%d package checks failed (fixtures in %s)\n", failures, root);
     return 1;

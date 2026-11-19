@@ -160,8 +160,178 @@ static int check_ingest(Environment *env, clpd_packages *out, FILE *err) {
   return errors;
 }
 
+#define ORM_PREFIX "clpdaemon: %s: orm: "
+
+static TemplateSlot *slot_of(Deftemplate *t, const char *name) {
+  TemplateSlot *s;
+  for (s = t->slotList; s != NULL; s = s->next)
+    if (strcmp(s->slotName->contents, name) == 0) return s;
+  return NULL;
+}
+
+/* 1 when the slot's type constraint allows the CLIPS type (an
+ * unconstrained slot allows every type). */
+static int type_allowed(Deftemplate *t, const char *slot,
+                        clpd_orm_clips_type type) {
+  static const char *const symbols[CLPD_ORM_CLIPS_TYPE_COUNT] = {
+      "INTEGER", "FLOAT", "STRING", "SYMBOL"};
+  CLIPSValue v;
+  size_t i;
+  if (!DeftemplateSlotTypes(t, slot, &v)) return 0;
+  for (i = 0; i < v.multifieldValue->length; i++) {
+    CLIPSValue *e = &v.multifieldValue->contents[i];
+    if (e->header->type == SYMBOL_TYPE &&
+        strcmp(e->lexemeValue->contents, symbols[type]) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+/* Checks one mapped template against its deftemplate, in this order: no
+ * wf-id, the slot lines in file order (unknown slot, a clips type the
+ * slot does not allow), key slots that are no slot of the template, then
+ * the template's slots (multislot, unmapped). Returns the error count. */
+static int bind_template(Deftemplate *d, clpd_orm_template *t,
+                         const char *pkg, FILE *err) {
+  TemplateSlot *s;
+  size_t i;
+  int errors = 0, has_wf_id = slot_of(d, CLPD_ORM_WF_ID) != NULL;
+
+  if (!has_wf_id) {
+    fprintf(err, ORM_PREFIX "template '%s' has no wf-id slot\n", pkg, t->name);
+    errors++;
+  }
+  for (i = 0; i < t->column_count; i++) {
+    const clpd_orm_column *c = &t->columns[i];
+    if ((s = slot_of(d, c->slot)) == NULL) {
+      if (has_wf_id || strcmp(c->slot, CLPD_ORM_WF_ID) != 0) {
+        fprintf(err, ORM_PREFIX "template '%s' has no slot '%s'\n", pkg,
+                t->name, c->slot);
+        errors++;
+      }
+    } else if (!s->multislot && !type_allowed(d, c->slot, c->clips_type)) {
+      fprintf(err, ORM_PREFIX "template '%s': slot '%s' is mapped as %s, "
+                   "which its type constraint does not allow\n", pkg, t->name,
+              c->slot, clpd_orm_clips_type_name(c->clips_type));
+      errors++;
+    }
+  }
+  for (i = 0; i < t->key.count; i++) {
+    if (clpd_orm_column_of(t, t->key.items[i]) == NULL &&
+        slot_of(d, t->key.items[i]) == NULL) {
+      fprintf(err, ORM_PREFIX "template '%s' has no slot '%s'\n", pkg,
+              t->name, t->key.items[i]);
+      errors++;
+    }
+  }
+  for (s = d->slotList; s != NULL; s = s->next) {
+    if (s->multislot) {
+      fprintf(err, ORM_PREFIX "template '%s': slot '%s' is a multislot, "
+                   "which cannot be mapped\n", pkg, t->name,
+              s->slotName->contents);
+      errors++;
+    } else if (clpd_orm_column_of(t, s->slotName->contents) == NULL) {
+      fprintf(err, ORM_PREFIX "template '%s': slot '%s' is not mapped\n", pkg,
+              t->name, s->slotName->contents);
+      errors++;
+    }
+  }
+  /* Cannot fail here: wf-id and every key slot are mapped slots. */
+  if (errors == 0 && clpd_orm_resolve_key(t) != 0) errors++;
+  return errors;
+}
+
+/* The first earlier package of another definition whose mapping names
+ * the table (or, with seq, the sequence) `name`, or NULL. */
+static const char *mapped_by(const clpd_packages *out, const char *name,
+                             int seq) {
+  const clpd_package *pkg = &out->items[out->count - 1];
+  size_t i, j;
+  for (i = 0; i + 1 < out->count; i++) {
+    const clpd_package *o = &out->items[i];
+    if (o->orm == NULL ||
+        strcmp(o->manifest.definition, pkg->manifest.definition) == 0)
+      continue;
+    if (seq) {
+      for (j = 0; j < o->orm->sequence_count; j++)
+        if (strcmp(o->orm->sequences[j].name, name) == 0)
+          return o->manifest.name;
+    } else {
+      for (j = 0; j < o->orm->template_count; j++)
+        if (strcmp(o->orm->templates[j].table, name) == 0)
+          return o->manifest.name;
+    }
+  }
+  return NULL;
+}
+
+/* Reads the mapping file of the last package of out and checks it (T9a,
+ * docs/orm.md): the file, a configured database, the package's own
+ * deftemplates, then tables and sequences an earlier package of another
+ * definition maps. Sets pkg->orm when the file is valid (so later packages
+ * see its tables) and pkg->orm_templates when every check passed. Returns
+ * the error count. */
+static int check_orm(Environment *env, clpd_packages *out, int have_database,
+                     FILE *err) {
+  clpd_package *pkg = &out->items[out->count - 1];
+  const char *name = pkg->manifest.name, *other;
+  clpd_orm *orm;
+  Deftemplate **found;
+  size_t i;
+  int errors = 0;
+
+  if (pkg->manifest.orm == NULL) return 0;
+  orm = malloc(sizeof *orm);
+  if (orm == NULL) clpd_log_die_errno();
+  if (clpd_orm_parse(pkg->manifest.orm, orm, err) != 0) {
+    clpd_orm_free(orm);
+    free(orm);
+    orm = NULL;
+    errors++;
+  }
+  if (!have_database) {
+    fprintf(err, ORM_PREFIX "a mapping needs a database (the configuration "
+                 "sets no database)\n", name);
+    errors++;
+  }
+  if (orm == NULL) return errors;
+  pkg->orm = orm;
+  found = calloc(orm->template_count + 1, sizeof *found);
+  if (found == NULL) clpd_log_die_errno();
+  SetCurrentModule(env, pkg->module);
+  for (i = 0; i < orm->template_count; i++) {
+    clpd_orm_template *t = &orm->templates[i];
+    if ((found[i] = own_template(env, t->name)) == NULL) {
+      fprintf(err, ORM_PREFIX "unknown template '%s'\n", name, t->name);
+      errors++;
+    } else {
+      errors += bind_template(found[i], t, name, err);
+    }
+  }
+  for (i = 0; i < orm->template_count; i++) {
+    if ((other = mapped_by(out, orm->templates[i].table, 0)) != NULL) {
+      fprintf(err, ORM_PREFIX "table '%s' is already mapped by %s\n", name,
+              orm->templates[i].table, other);
+      errors++;
+    }
+  }
+  for (i = 0; i < orm->sequence_count; i++) {
+    if ((other = mapped_by(out, orm->sequences[i].name, 1)) != NULL) {
+      fprintf(err, ORM_PREFIX "sequence '%s' is already mapped by %s\n", name,
+              orm->sequences[i].name, other);
+      errors++;
+    }
+  }
+  if (errors == 0)
+    pkg->orm_templates = found;
+  else
+    free(found);
+  return errors;
+}
+
 /* Loads one package already appended to out; returns its error count. */
-static int load_package(Environment *env, clpd_packages *out, FILE *err) {
+static int load_package(Environment *env, clpd_packages *out,
+                        int have_database, FILE *err) {
   clpd_package *pkg = &out->items[out->count - 1];
   char build[CLPD_PACKAGE_NAME_MAX * 2 + 16];
   clpd_lint_exempt exempt;
@@ -191,11 +361,12 @@ static int load_package(Environment *env, clpd_packages *out, FILE *err) {
   exempt.rules = (const char *const *)pkg->manifest.exempt_rules.items;
   exempt.rule_count = pkg->manifest.exempt_rules.count;
   errors = clpd_lint_package(env, pkg->module, pkg->manifest.name, &exempt, err);
-  return errors + check_ingest(env, out, err);
+  errors += check_ingest(env, out, err);
+  return errors + check_orm(env, out, have_database, err);
 }
 
-int clpd_packages_load(Environment *env, const clpd_list *dirs,
-                       clpd_packages *out, FILE *err) {
+int clpd_packages_load_ex(Environment *env, const clpd_list *dirs,
+                          int have_database, clpd_packages *out, FILE *err) {
   Defmodule *main_module = FindDefmodule(env, "MAIN");
   size_t i;
   int errors = 0;
@@ -219,11 +390,18 @@ int clpd_packages_load(Environment *env, const clpd_list *dirs,
     out->items[out->count].manifest = m;
     out->items[out->count].module = NULL;
     out->items[out->count].ingest = NULL;
+    out->items[out->count].orm = NULL;
+    out->items[out->count].orm_templates = NULL;
     out->count++;
-    errors += load_package(env, out, err);
+    errors += load_package(env, out, have_database, err);
     SetCurrentModule(env, main_module);
   }
   return errors != 0;
+}
+
+int clpd_packages_load(Environment *env, const clpd_list *dirs,
+                       clpd_packages *out, FILE *err) {
+  return clpd_packages_load_ex(env, dirs, 0, out, err);
 }
 
 void clpd_packages_focus(Environment *env, const clpd_packages *p) {
@@ -239,6 +417,9 @@ void clpd_packages_free(clpd_packages *p) {
   for (i = 0; i < p->count; i++) {
     free(p->items[i].dir);
     free(p->items[i].ingest);
+    free(p->items[i].orm_templates);
+    if (p->items[i].orm != NULL) clpd_orm_free(p->items[i].orm);
+    free(p->items[i].orm);
     clpd_manifest_free(&p->items[i].manifest);
   }
   free(p->items);

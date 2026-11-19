@@ -1396,5 +1396,87 @@ clpdaemon: received SIGTERM, stopping"
 cases=$((cases + 1))
 [ -f dbrun.db ] || fail "database: the daemon creates the sqlite file" "$(ls -l)"
 
+# --- ORM mapping (T9a, docs/orm.md) -------------------------------------------
+# The mapping is read and checked at package load, also under --check; it
+# needs a database.
+mkdir ormpkg
+conf ormpkg/package.conf 'definition = shop
+version = 1
+files = shop.clp
+orm = orm.conf'
+conf ormpkg/shop.clp '(deftemplate order (slot wf-id) (slot line-no (type INTEGER)) (slot status (type SYMBOL)))
+(defrule start ?o <- (order (wf-id ?w) (status new)) => (modify ?o (status started)))'
+conf ormpkg/orm.conf '# shop orders
+order.table = shop_order
+order.owned = yes
+order.key = line-no
+order.slot.wf-id = wf_id text string error
+order.slot.line-no = line_no bigint integer error
+order.slot.status = status text symbol default
+seq.order_no = shop_order_no
+seq.order_no.owned = yes'
+conf orm.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+orm_allow_drop = yes
+packages = ormpkg"
+check "orm: valid mapping under --check" 0 "clpdaemon: orm.conf: configuration OK" "" -- --config orm.conf --check
+conf ormnodb.conf 'node_id = n1
+packages = ormpkg'
+check "orm: mapping without a database" 1 "" \
+  "clpdaemon: shop@1: orm: a mapping needs a database (the configuration sets no database)" -- --config ormnodb.conf --check
+conf ormdrop.conf 'node_id = n1
+orm_allow_drop = true'
+check "orm: bad orm_allow_drop" 1 "" \
+  "clpdaemon: ormdrop.conf:2: orm_allow_drop: expected yes or no, got 'true'" -- --config ormdrop.conf --check
+# A package without orm loads unchanged with a database.
+conf ormplain.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+orm_allow_drop = no
+packages = pkg"
+check "orm: package without a mapping" 0 "clpdaemon: ormplain.conf: configuration OK" "" -- --config ormplain.conf --check
+mkdir ormbad
+conf ormbad/package.conf 'definition = bad
+version = 1
+files = bad.clp
+orm = orm.conf'
+conf ormbad/bad.clp '(deftemplate order (slot wf-id) (slot n (type INTEGER)) (slot note) (multislot tags))'
+conf ormbad/orm.conf 'order.table = shop_order
+order.owned = no
+order.key = n
+order.slot.wf-id = wf_id text string error
+order.slot.n = n bigint string error
+order.slot.extra = extra text string nil
+seq.order_no = shop_order_no
+seq.order_no.owned = maybe'
+conf ormbad.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+packages = ormbad"
+check "orm: mapping file error" 1 "" \
+  "clpdaemon: ormbad/orm.conf:8: seq.order_no.owned: expected yes or no, got 'maybe'" -- --config ormbad.conf --check
+conf ormbad/orm.conf 'order.table = shop_order
+order.owned = no
+order.key = n
+order.slot.wf-id = wf_id text string error
+order.slot.n = n bigint string error
+order.slot.extra = extra text string nil
+seq.order_no = shop_order_no
+seq.order_no.owned = no'
+conf ormtwo.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+packages = ormpkg, ormbad"
+check "orm: checks against the templates and another definition" 1 "" \
+  "clpdaemon: bad@1: orm: template 'order': slot 'n' is mapped as string, which its type constraint does not allow
+clpdaemon: bad@1: orm: template 'order' has no slot 'extra'
+clpdaemon: bad@1: orm: template 'order': slot 'note' is not mapped
+clpdaemon: bad@1: orm: template 'order': slot 'tags' is a multislot, which cannot be mapped
+clpdaemon: bad@1: orm: table 'shop_order' is already mapped by shop@1
+clpdaemon: bad@1: orm: sequence 'shop_order_no' is already mapped by shop@1" -- --config ormtwo.conf --check
+conf ormbad/package.conf 'definition = bad
+version = 1
+files = bad.clp
+orm = /etc/clpdaemon/orm.conf'
+check "orm: absolute mapping path" 1 "" \
+  "clpdaemon: ormbad/package.conf:4: orm: '/etc/clpdaemon/orm.conf' must be relative to the package directory" -- --config ormbad.conf --check
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

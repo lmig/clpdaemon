@@ -169,6 +169,40 @@ static void test_admin_socket_mode(void) {
   }
 }
 
+/* orm_allow_drop (T9a): yes or no, default no. */
+static void test_orm_allow_drop(void) {
+  static const char *const bad[] = {"", "true", "1", "Yes", "NO", "y"};
+  clpd_config cfg;
+  char text[128], eb[512], expect[sizeof path + 128];
+  size_t i;
+  EXPECT(LOAD("drop0.conf", "node_id = n1\n", &cfg, eb) == 0);
+  EXPECT(cfg.orm_allow_drop == 0);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("drop1.conf", "node_id = n1\norm_allow_drop = yes\n", &cfg, eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && cfg.orm_allow_drop == 1);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("drop2.conf", "node_id = n1\norm_allow_drop = no\n", &cfg, eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && cfg.orm_allow_drop == 0);
+  clpd_config_free(&cfg);
+  for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    snprintf(text, sizeof text, "node_id = n1\norm_allow_drop = %s\n", bad[i]);
+    EXPECT(load("drop.conf", text, strlen(text), &cfg, eb, sizeof eb) == 1);
+    snprintf(expect, sizeof expect,
+             "clpdaemon: %s:2: orm_allow_drop: expected yes or no, got '%s'\n",
+             path, bad[i]);
+    EXPECT(strcmp(eb, expect) == 0);
+    EXPECT(cfg.orm_allow_drop == 0);
+    clpd_config_free(&cfg);
+  }
+  EXPECT(LOAD("drop3.conf", "node_id = n1\norm_allow_drop = yes\n"
+                            "orm_allow_drop = no\n", &cfg, eb) == 1);
+  snprintf(expect, sizeof expect,
+           "clpdaemon: %s:3: duplicate key 'orm_allow_drop' (first set on "
+           "line 2)\n", path);
+  EXPECT(strcmp(eb, expect) == 0 && cfg.orm_allow_drop == 1);
+  clpd_config_free(&cfg);
+}
+
 /* admin_socket = none disables the admin socket (L71); any other value,
  * ./none included, is a path. */
 static void test_admin_socket_none(void) {
@@ -263,6 +297,7 @@ int main(void) {
   test_crlf_and_tabs();
   test_nul_byte_rejected();
   test_admin_socket_mode();
+  test_orm_allow_drop();
   test_admin_socket_none();
   test_database();
   rmdir(dir);

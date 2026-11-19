@@ -22,7 +22,7 @@ target_compile_options(config_test PRIVATE ${CLPD_WARNINGS})
 
 add_test(NAME clpdaemon_config COMMAND config_test)
 
-foreach(t scheduler engine loop lint manifest packages trace clips_trace fdcapture plugins json ingest admin)
+foreach(t scheduler engine loop lint manifest packages trace clips_trace fdcapture plugins json ingest admin orm)
   add_executable(${t}_test ${t}/${t}_test.c)
   target_link_libraries(${t}_test PRIVATE clpd_core)
   target_compile_options(${t}_test PRIVATE ${CLPD_WARNINGS})
@@ -75,5 +75,5 @@ add_test(NAME clpdaemon_plugins_test_exports
 
 # A lost stop signal must fail a test, not hang it until the default timeout.
 set_tests_properties(clpdaemon_scheduler clpdaemon_engine clpdaemon_loop
-  clpdaemon_lint clpdaemon_manifest clpdaemon_packages clpdaemon_trace clpdaemon_clips_trace clpdaemon_fdcapture clpdaemon_plugins clpdaemon_json clpdaemon_ingest clpdaemon_admin clpdaemon_config PROPERTIES TIMEOUT 30)
+  clpdaemon_lint clpdaemon_manifest clpdaemon_packages clpdaemon_trace clpdaemon_clips_trace clpdaemon_fdcapture clpdaemon_plugins clpdaemon_json clpdaemon_ingest clpdaemon_admin clpdaemon_config clpdaemon_orm PROPERTIES TIMEOUT 30)
 set_tests_properties(clpdaemon_cli PROPERTIES TIMEOUT 120)

@@ -17,7 +17,8 @@ typedef enum {
   K_OPTIONAL_PATH,
   K_WATCH,
   K_PATH_LIST,
-  K_DATABASE
+  K_DATABASE,
+  K_YES_NO
 } key_kind;
 
 enum {
@@ -35,6 +36,7 @@ enum {
   KEY_PACKAGES,
   KEY_PLUGINS,
   KEY_DATABASE,
+  KEY_ORM_ALLOW_DROP,
   KEY_COUNT
 };
 
@@ -46,14 +48,14 @@ static const char *const key_names[KEY_COUNT] = {
     "admin_socket",     "admin_socket_mode",       "trace_text",
     "trace_jsonl",
     "watch",            "packages",                "plugins",
-    "database",
+    "database",         "orm_allow_drop",
 };
 
 static const key_kind key_kinds[KEY_COUNT] = {
     K_NODE_ID,     K_POSITIVE,      K_NON_NEGATIVE,  K_MAX_RULES,
     K_POSITIVE,    K_DURATION,      K_PATH,          K_MODE,
     K_OPTIONAL_PATH, K_OPTIONAL_PATH, K_WATCH,       K_PATH_LIST,
-    K_PATH_LIST,   K_DATABASE,
+    K_PATH_LIST,   K_DATABASE,      K_YES_NO,
 };
 
 typedef struct {
@@ -220,6 +222,13 @@ static int apply(clpd_kv *kv, int key, char *value, clpd_config *cfg) {
     cfg->database = clpd_strdup(value);
     return 1;
   }
+  case K_YES_NO:
+    if (strcmp(value, "yes") != 0 && strcmp(value, "no") != 0) {
+      clpd_kv_error(kv, "%s: expected yes or no, got '%s'", name, value);
+      return 0;
+    }
+    cfg->orm_allow_drop = strcmp(value, "yes") == 0;
+    return 1;
   }
 
   switch (key) {

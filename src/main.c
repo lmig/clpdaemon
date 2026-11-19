@@ -177,8 +177,8 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   rc = clpd_plugins_load(clpd_engine_env(engine), &cfg->plugins, cfg->node_id,
                          &plugins, clpd_log());
   if (rc == 0)
-    rc = clpd_packages_load(clpd_engine_env(engine), &cfg->packages,
-                            &packages, clpd_log());
+    rc = clpd_packages_load_ex(clpd_engine_env(engine), &cfg->packages,
+                               cfg->database != NULL, &packages, clpd_log());
   if (rc != 0) {
     rc = 1;
   } else if (check) {
