@@ -84,11 +84,21 @@ clpd_db_value clpd_db_blob(const void *data, size_t size) {
 
 /* Spec. */
 
+/* libpq's test for a dbname that is itself a connection string. */
+static int is_conninfo(const char *s) {
+  return strchr(s, '=') != NULL || strncmp(s, "postgresql://", 13) == 0 ||
+         strncmp(s, "postgres://", 11) == 0;
+}
+
+/* Nesting bound for dbname values that are connection strings: deeper
+ * values are reported as invalid. */
+#define SPEC_NESTING_MAX 8
+
 /* Messages never include the value: it may hold credentials (NFR-2). */
 int clpd_db_check_spec(const char *value, char *msg, size_t n) {
   PQconninfoOption *opts, *o;
-  char *perr = NULL;
-  int password = 0;
+  char *perr = NULL, *cur = NULL, *next;
+  int password = 0, depth;
 
   if (value == NULL || *value == '\0') {
     copy_msg(msg, n, "database: expected a connection string");
@@ -102,18 +112,36 @@ int clpd_db_check_spec(const char *value, char *msg, size_t n) {
     }
     return 1;
   }
-  opts = PQconninfoParse(value, &perr);
-  if (perr != NULL) PQfreemem(perr); /* may quote the value: not shown */
-  if (opts == NULL) {
-    copy_msg(msg, n, "database: invalid PostgreSQL connection string");
-    return 0;
+  /* A dbname that is a connection string can carry a password too (it is
+   * echoed by "database does not exist"): check every nested level. */
+  for (depth = 0;; depth++) {
+    opts = depth > SPEC_NESTING_MAX
+               ? NULL
+               : PQconninfoParse(cur != NULL ? cur : value, &perr);
+    if (perr != NULL) PQfreemem(perr); /* may quote the value: not shown */
+    perr = NULL;
+    free(cur);
+    cur = NULL;
+    if (opts == NULL) {
+      copy_msg(msg, n, "database: invalid PostgreSQL connection string");
+      return 0;
+    }
+    next = NULL;
+    for (o = opts; o->keyword != NULL; o++) {
+      if (o->val == NULL || o->val[0] == '\0') continue;
+      if (strcmp(o->keyword, "password") == 0 ||
+          strcmp(o->keyword, "sslpassword") == 0)
+        password = 1;
+      else if (strcmp(o->keyword, "dbname") == 0 && is_conninfo(o->val))
+        next = o->val;
+    }
+    if (next != NULL && !password) {
+      cur = xrealloc(NULL, strlen(next) + 1);
+      strcpy(cur, next);
+    }
+    PQconninfoFree(opts);
+    if (cur == NULL) break;
   }
-  for (o = opts; o->keyword != NULL; o++)
-    if ((strcmp(o->keyword, "password") == 0 ||
-         strcmp(o->keyword, "sslpassword") == 0) &&
-        o->val != NULL && o->val[0] != '\0')
-      password = 1;
-  PQconninfoFree(opts);
   if (password) {
     copy_msg(msg, n, "database: the connection string must not contain a "
                      "password (use a password file, see PGPASSFILE)");
@@ -171,7 +199,7 @@ static int check_sql(clpd_db *db, const char *sql, size_t n) {
       continue;
     }
     if (c == '-' && p[1] == '-') {
-      while (*p != '\0' && *p != '\n') p++;
+      while (*p != '\0' && *p != '\n' && *p != '\r') p++;
       continue;
     }
     if (c == '/' && p[1] == '*') {

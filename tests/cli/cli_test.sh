@@ -258,6 +258,10 @@ wait_exit() {
 daemon() {
   name=$1 dconf=$2 sigs=$3 want_err=$4 mode=${5:-}
   cases=$((cases + 1))
+  # Truncated here, not only by the background child's redirection, so the
+  # wait below never reads a stale running line from the previous case.
+  : >out.txt
+  : >err.txt
   if [ "$mode" = ignore-int ]; then
     sh -c 'trap "" INT; exec "$0" --config "$1"' "$BIN" "$dconf" >out.txt 2>err.txt &
   else
@@ -676,6 +680,8 @@ RUN='timeout 10' check "plugin error aborts a run too" 1 "" \
 # expects exit 0, empty stdout and the exact stderr.
 plugdaemon() {
   cases=$((cases + 1))
+  : >out.txt # truncated before the start, as in daemon()
+  : >err.txt
   "$BIN" --config "$2" >out.txt 2>err.txt &
   pid=$!
   ok=1
@@ -1102,6 +1108,8 @@ wait_reply() {
 # start <conf> <socket>: starts the daemon in the background (pid) and waits
 # for its running line and its socket; ok=0 when either is missing.
 start() {
+  : >out.txt # truncated before the start, as in daemon()
+  : >err.txt
   "$BIN" --config "$1" >out.txt 2>err.txt &
   pid=$!
   ok=1
@@ -1368,6 +1376,15 @@ dberr dbbad 'not a s3cr3t conninfo' 'invalid PostgreSQL connection string'
 dberr dbpw 'host=/tmp password=s3cr3t' "$PWMSG"
 dberr dbsslpw 'host=/tmp sslpassword=s3cr3t' "$PWMSG"
 dberr dburipw 'postgresql://clpd:s3cr3t@localhost/clpd' "$PWMSG"
+# A password inside a dbname that is itself a connection string (L78).
+for v in "dbnamepw host=/tmp dbname='postgresql://u:s3cr3t@h/d'" \
+    "dbnamekvpw host=/tmp dbname='host=h password=s3cr3t'"; do
+  dberr "${v%% *}" "${v#* }" "$PWMSG"
+  cases=$((cases + 1))
+  if grep -q s3cr3t err.txt; then
+    fail "database: a nested password is not echoed" "stderr [$(cat err.txt)]"
+  fi
+done
 
 # A running daemon with a sqlite database starts and stops gracefully.
 rconf dbrun.conf "node_id = n1

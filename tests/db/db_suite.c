@@ -335,6 +335,9 @@ static void test_rejected_sql(void) {
   CHECK(count(db, "clpd_suite_tx") == 1);
   CHECK(run(db, "SELECT 1;") == CLPD_DB_OK);
   CHECK(run(db, "SELECT 1 ;  -- trailing comment\n") == CLPD_DB_OK);
+  /* A carriage return ends a -- comment too, as on the PostgreSQL server. */
+  CHECK(run(db, "SELECT 1 --\r; SELECT 2") == CLPD_DB_ERROR);
+  CHECK(run(db, "SELECT 1 --\r") == CLPD_DB_OK);
 
   /* Placeholder forms and counts. */
   for (i = 0; i < sizeof bad_one / sizeof bad_one[0]; i++) {

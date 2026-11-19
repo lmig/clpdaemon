@@ -26,7 +26,11 @@ static void test_check_spec(void) {
       "host=/tmp dbname=clpd", "dbname=clpd user=clpd sslmode=disable",
       "host=/tmp password=", /* an empty password is no password */
       "postgresql://clpd@localhost/clpd", "postgres://localhost:5432/clpd",
-      "postgresql:///clpd?host=/tmp"};
+      "postgresql:///clpd?host=/tmp",
+      /* A dbname that is itself a connection string, without a password. */
+      "host=/tmp dbname='host=h dbname=clpd'",
+      "host=/tmp dbname='postgresql://u@h/d'",
+      "postgresql:///?dbname=host%3Dh%20dbname%3Dclpd"};
   static const struct {
     const char *value, *message;
   } bad[] = {
@@ -43,6 +47,19 @@ static void test_check_spec(void) {
       {"postgresql://clpd:s3cr3t@localhost/clpd", PASSWORD_MSG},
       {"postgres://localhost/clpd?password=s3cr3t", PASSWORD_MSG},
       {"postgresql://localhost/clpd?sslpassword=s3cr3t", PASSWORD_MSG},
+      /* A password inside a dbname that is a connection string (L78). */
+      {"host=/tmp dbname='postgresql://u:s3cr3t@h/d'", PASSWORD_MSG},
+      {"host=/tmp dbname='host=h password=s3cr3t'", PASSWORD_MSG},
+      {"host=/tmp dbname=postgres://u:s3cr3t@h/d", PASSWORD_MSG},
+      {"host=/tmp dbname='host=h sslpassword=s3cr3t'", PASSWORD_MSG},
+      {"postgresql:///?dbname=host%3Dh%20password%3Ds3cr3t", PASSWORD_MSG},
+      {"postgresql:///?dbname=postgresql%3A%2F%2Fu%3As3cr3t%40h%2Fd",
+       PASSWORD_MSG},
+      {"dbname='dbname=password=s3cr3t'", PASSWORD_MSG}, /* two levels */
+      {"host=/tmp dbname='s3cr3t=1'",
+       "database: invalid PostgreSQL connection string"},
+      {"host=/tmp dbname='postgresql://[::1'",
+       "database: invalid PostgreSQL connection string"},
   };
   char msg[256];
   size_t i;
@@ -62,6 +79,20 @@ static void test_check_spec(void) {
       EXPECT(0);
     }
     EXPECT(strstr(msg, "s3cr3t") == NULL);
+  }
+  /* Nested dbname connection strings are followed up to a bound. */
+  {
+    char deep[256] = "";
+    int k;
+    for (k = 0; k < 8; k++) strcat(deep, "dbname=");
+    strcat(deep, "x");
+    EXPECT(clpd_db_check_spec(deep, msg, sizeof msg) == 1);
+    deep[0] = '\0';
+    for (k = 0; k < 20; k++) strcat(deep, "dbname=");
+    strcat(deep, "x");
+    EXPECT(clpd_db_check_spec(deep, msg, sizeof msg) == 0);
+    EXPECT(strcmp(msg, "database: invalid PostgreSQL connection string") ==
+           0);
   }
   /* A short buffer is truncated, not overrun. */
   memset(msg, 'X', sizeof msg);

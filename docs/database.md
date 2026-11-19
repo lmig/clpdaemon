@@ -20,7 +20,7 @@ The PostgreSQL forms are parsed with libpq's own parser (`PQconninfoParse`), so 
 
 ### Password
 
-The connection string must not contain a password: a `password=` or `sslpassword=` option, or a password in the URI (`postgresql://user:secret@host/db` or `?password=...`), is rejected when the configuration loads. Supply the password through a password file: `~/.pgpass`, or the file named by `PGPASSFILE` (mode `0600`, one `host:port:database:user:password` line per server; see the libpq documentation). The configuration file can then be readable by operators without exposing a credential. (libpq would also take `PGPASSWORD` from the environment; do not use it, since the environment of a process is visible to other tools.)
+The connection string must not contain a password: a `password=` or `sslpassword=` option, or a password in the URI (`postgresql://user:secret@host/db` or `?password=...`), is rejected when the configuration loads. A `dbname` value that is itself a connection string (it contains `=` or starts with `postgresql://` or `postgres://`) is checked the same way, up to 8 levels deep; a nested value that libpq cannot parse, or a deeper one, is an invalid connection string. Supply the password through a password file: `~/.pgpass`, or the file named by `PGPASSFILE` (mode `0600`, one `host:port:database:user:password` line per server; see the libpq documentation). The configuration file can then be readable by operators without exposing a credential. (libpq would also take `PGPASSWORD` from the environment; do not use it, since the environment of a process is visible to other tools.)
 
 ### Never echoed
 
@@ -72,7 +72,7 @@ An INTEGER parameter is sent to PostgreSQL as `int8`: a function that takes `int
 
 ### Status
 
-`CLPD_DB_OK`, `CLPD_DB_ERROR` (see `clpd_db_error`, one line), `CLPD_DB_UNIQUE` (unique or primary-key violation), `CLPD_DB_LOST` (connection lost; any open transaction is over, and retrying belongs to the caller, FR-26). `clpd_db_begin` inside a transaction and `clpd_db_commit` or `clpd_db_rollback` outside one are `CLPD_DB_ERROR`.
+`CLPD_DB_OK`, `CLPD_DB_ERROR` (see `clpd_db_error`, one line), `CLPD_DB_UNIQUE` (unique or primary-key violation), `CLPD_DB_LOST` (connection lost; any open transaction is over, and retrying belongs to the caller, FR-26). `clpd_db_begin` inside a transaction and `clpd_db_commit` or `clpd_db_rollback` outside one are `CLPD_DB_ERROR`. On PostgreSQL a failed statement aborts the open transaction, so the next `clpd_db_commit` returns `CLPD_DB_ERROR` and nothing in it is kept; SQLite does not abort the transaction on an error, so `clpd_db_commit` there returns `CLPD_DB_OK` and keeps the statements that succeeded.
 
 ## SQLite stand-ins
 
