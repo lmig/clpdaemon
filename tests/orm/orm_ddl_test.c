@@ -1227,14 +1227,28 @@ static void test_sequence_followups(void) {
  * another definition are refused by every function that changes the
  * database, which stays as it was. */
 static void test_cross_definition_sweep(void) {
-  static const char *const names[] = {"\"shop@1::order \"", "\"::order\"",
-                                      "\"shop@1::\"", "shop@1::no",
-                                      "shop@1::order", "order"};
-  static const char *const shown_names[] = {"shop@1::order ", "::order",
-                                            "shop@1::", "shop@1::no",
-                                            "shop@1::order", "order"};
-  static const char *const udfs[] = {"db-create-table", "db-drop-table",
-                                     "db-create-sequence", "db-nextval"};
+  /* mapped_by: NULL when no loaded package maps the name as a template,
+   * else the packages the refusal names. */
+  static const struct {
+    const char *arg, *shown, *mapped_by;
+  } names[] = {
+      {"\"shop@1::order \"", "shop@1::order ", NULL},
+      {"\"::order\"", "::order", NULL},
+      {"\"shop@1::\"", "shop@1::", NULL},
+      {"shop@1::no", "shop@1::no", NULL},
+      {"shop@1::order", "shop@1::order", "shop@1"},
+      {"order", "order", "shop@1, shop@2"},
+  };
+  /* table: the function takes a template, else a sequence alias. */
+  static const struct {
+    const char *name;
+    int table;
+  } udfs[] = {
+      {"db-create-table", 1},
+      {"db-drop-table", 1},
+      {"db-create-sequence", 0},
+      {"db-nextval", 0},
+  };
   char before[8192], after[8192];
   size_t i, j;
   ddl.allow_drop = 1;
@@ -1245,17 +1259,16 @@ static void test_cross_definition_sweep(void) {
   for (i = 0; i < sizeof names / sizeof names[0]; i++) {
     for (j = 0; j < sizeof udfs / sizeof udfs[0]; j++) {
       char expr[128], line[512];
-      int table = j < 2, mapped = i >= 4;
-      snprintf(expr, sizeof expr, "(%s %s)", udfs[j], names[i]);
-      if (mapped && table)
+      snprintf(expr, sizeof expr, "(%s %s)", udfs[j].name, names[i].arg);
+      if (names[i].mapped_by != NULL && udfs[j].table)
         snprintf(line, sizeof line, "clpdaemon: %s: template '%s' is not "
                  "mapped by definition solo of the calling rule (mapped by "
-                 "shop@1%s)", udfs[j], shown_names[i],
-                 i == 5 ? ", shop@2" : "");
+                 "%s)", udfs[j].name, names[i].shown, names[i].mapped_by);
       else
         snprintf(line, sizeof line, "clpdaemon: %s: unknown %s '%s' (no "
-                 "loaded package maps it)", udfs[j],
-                 table ? "template" : "sequence alias", shown_names[i]);
+                 "loaded package maps it)", udfs[j].name,
+                 udfs[j].table ? "template" : "sequence alias",
+                 names[i].shown);
       EXPECT(fails_in("solo@1", expr, line));
     }
   }

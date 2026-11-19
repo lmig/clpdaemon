@@ -54,6 +54,10 @@ The check runs for every construct as CLIPS defines it, not only on the current 
 
 Constructs in a module the file creates with `defmodule` are not reported: the `defmodule` message covers them.
 
+A file that ends with another module current although no line above was written (only a statement that names a module and defines nothing does that: `(defglobal MAIN)`) is also rejected (T9f, L88).
+
+The `defglobal` check does not use the watch flags of the globals, so loading leaves them, and the `:==` lines on stdout, exactly as plain CLIPS (also with `(watch globals)` on). Still, a `defglobal` initial value that runs `watch` or `unwatch` on `globals` or `all` (also for single globals, or with an item computed at run time), or that leaves global watching changed, rejects the file with one line and the globals the file defined in another module are still reported; watching other items (`(watch facts)`) is allowed. A value that makes CLIPS recompute the scope of the globals (a plugin function calling `GetNextDefglobalInScope`) cannot be checked and rejects the file.
+
 ## wf-id lint
 
 Every deftemplate of a package must have a `wf-id` slot, and every rule must bind the `wf-id` slot of all its patterns to one shared variable, so a rule only joins facts of the same workflow instance (FR-7):
@@ -92,7 +96,9 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Package file failed to load | `clpdaemon: <file>: load failed`, after the CLIPS lines |
 | `defmodule` in a package file | `clpdaemon: <file>: defmodule is not allowed in package files` |
 | A construct outside the package module ([above](#package-module)) | `clpdaemon: <file>: <construct> '<module>::<name>' is outside the package module <definition@version>`, `<construct>` one of `deftemplate`, `defrule`, `deffacts`, `defglobal`, `deffunction`, `defgeneric`, `defmethod`, `defclass`, `definstances`, `defmessage-handler`; `<name>` is `?*<global>*` for a defglobal, the defgeneric for a defmethod, and `<class> <handler> <type>` for a message-handler (`'MAIN::USER hello primary'`) |
-| The constructs of a file cannot be checked (a construct type the loader cannot inspect, for example one a plugin added) | `clpdaemon: <file>: cannot check the modules of its constructs` |
+| The constructs of a file cannot be checked (a construct type the loader cannot inspect, for example one a plugin added, or a defglobal value that recomputed the scope of the globals) | `clpdaemon: <file>: cannot check the modules of its constructs` |
+| A defglobal value changed the watch state of globals ([above](#package-module)) | `clpdaemon: <file>: cannot check the modules of its constructs (a defglobal value changed the watch state of globals)` |
+| A file ends in another module and no construct was reported ([above](#package-module)) | `clpdaemon: <file>: the file ends in module <module>, not the package module <definition@version>` |
 | Same `definition@version` twice | `clpdaemon: <dir>: package <definition@version> is already loaded from <first dir>` |
 | Exemption names an unknown construct | `clpdaemon: <pkg>: lint: lint_exempt names unknown template '<t>'` (or `unknown rule '<r>'`) |
 | Template without `wf-id` | `clpdaemon: <pkg>: lint: template '<t>' has no wf-id slot` |
@@ -102,4 +108,4 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | `ingest` names no deftemplate of the package | `clpdaemon: <pkg>: ingest names unknown template '<t>'` |
 | `ingest` names a template an earlier package lists | `clpdaemon: <pkg>: ingest names template '<t>', already listed by <first pkg>` |
 
-A file's messages come in this order: the CLIPS lines, then `load failed` or the `defmodule` message, then the constructs outside the package module. Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come next, in list order, then the mapping messages ([`orm.md`](orm.md#messages)).
+A file's messages come in this order: the CLIPS lines, then `load failed`, the `defmodule` message or the end-module message, then the constructs outside the package module (the watch-state and cannot-check lines in definition order with them, before the globals of the same statement). Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come next, in list order, then the mapping messages ([`orm.md`](orm.md#messages)).

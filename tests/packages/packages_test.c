@@ -42,6 +42,9 @@ typedef struct {
   int rc;
 } run;
 
+/* Called on every new environment before the packages load (NULL: none). */
+static void (*load_setup)(Environment *env);
+
 /* have_db < 0: the plain clpd_packages_load (no database). */
 static void load_db(run *r, const char *const *dirs, size_t n, int have_db) {
   clpd_list list;
@@ -51,6 +54,7 @@ static void load_db(run *r, const char *const *dirs, size_t n, int have_db) {
   list.items = (char **)dirs;
   list.count = n;
   r->env = CreateEnvironment();
+  if (load_setup != NULL) load_setup(r->env);
   r->rc = have_db < 0 ? clpd_packages_load(r->env, &list, &r->pkgs, err)
                       : clpd_packages_load_ex(r->env, &list, have_db,
                                               &r->pkgs, err);
@@ -287,6 +291,268 @@ static void test_construct_in_other_module(void) {
   EXPECT(FindDeftemplate(r.env, "b@1::never") == NULL);
   EXPECT(FindDeftemplate(r.env, "b@1::last") != NULL);
   EXPECT(strcmp(DefmoduleName(GetCurrentModule(r.env)), "MAIN") == 0);
+  done(&r);
+}
+
+/* T9e review follow-ups: a defglobal whose value switches the current
+ * module lands in that module, so the guard reports it; and an initial
+ * value that turns global watching off cannot hide a defglobal of
+ * another module: the file is rejected (fail closed) and the global is
+ * still reported. */
+static void test_module_guard_review(void) {
+  const char *dirs[2];
+  char want[2048];
+  run r;
+  const char *a = package("gshop", "definition = shop\nversion = 1\n"
+                                   "files = s.clp\n");
+  const char *b = package("gend", "definition = b\nversion = 1\n"
+                                  "files = f.clp\n");
+  const char *c = package("gunw", "definition = c\nversion = 1\n"
+                                  "files = f.clp\n");
+  write_file(a, "s.clp", "(deftemplate ev (slot wf-id))\n");
+  write_file(b, "f.clp",
+             "(deftemplate own (slot wf-id))\n"
+             "(defglobal b@1 ?*a* = (set-current-module MAIN))\n");
+  write_file(c, "f.clp",
+             "(deftemplate own (slot wf-id))\n"
+             "(defglobal shop@1 ?*u* = (unwatch globals))\n"
+             "(deftemplate c@1::last (slot wf-id))\n");
+  dirs[0] = a;
+  dirs[1] = b;
+  load(&r, dirs, 2);
+  EXPECT(r.rc != 0);
+  snprintf(want, sizeof want,
+           "clpdaemon: %s/f.clp: defglobal 'MAIN::?*a*' is outside the "
+           "package module b@1\n", b);
+  EXPECT(err_matches(&r, want));
+  done(&r);
+  dirs[1] = c;
+  load(&r, dirs, 2);
+  EXPECT(r.rc != 0);
+  snprintf(want, sizeof want,
+           "clpdaemon: %s/f.clp: cannot check the modules of its constructs"
+           " (a defglobal value changed the watch state of globals)\n"
+           "clpdaemon: %s/f.clp: defglobal 'shop@1::?*u*' is outside the "
+           "package module c@1\n", c, c);
+  EXPECT(err_matches(&r, want));
+  done(&r);
+}
+
+/* T9f (L88): a defglobal value that changes the watch state of globals
+ * (watch or unwatch of globals or all, also of one global or with a
+ * computed item) rejects the file with one line, and the guard neither
+ * reports untouched globals of other modules nor misses the one whose
+ * flag the value cleared; watching another item is allowed. */
+static void test_watch_state_in_values(void) {
+  static const struct {
+    const char *name, *text, *defined; /* defined: NULL, or the line */
+  } cases[] = {
+      {"wwatch", "(defglobal ?*w* = (watch globals))\n", NULL},
+      {"wone",
+       "(defglobal shop@1 ?*u* = 1 ?*v* = (progn (unwatch globals u)\n"
+       "  (set-current-module wone@1)))\n",
+       "defglobal 'shop@1::?*u*' is outside the package module wone@1"},
+      {"wall", "(defglobal ?*w* = (unwatch all))\n", NULL},
+      {"wcomp", "(defglobal ?*w* = (watch (sym-cat glob als)))\n", NULL},
+  };
+  const char *dirs[2];
+  char want[2048], manifest[128];
+  size_t i, n;
+  run r;
+  dirs[0] = package("wshop", "definition = shop\nversion = 1\n"
+                              "files = s.clp\n");
+  write_file(dirs[0], "s.clp", "(defglobal ?*s* = 1 ?*t* = 2)\n");
+  for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    snprintf(manifest, sizeof manifest,
+             "definition = %s\nversion = 1\nfiles = f.clp\n", cases[i].name);
+    dirs[1] = package(cases[i].name, manifest);
+    write_file(dirs[1], "f.clp", cases[i].text);
+    load(&r, dirs, 2);
+    EXPECT(r.rc != 0);
+    n = (size_t)snprintf(want, sizeof want,
+                         "clpdaemon: %s/f.clp: cannot check the modules of "
+                         "its constructs (a defglobal value changed the "
+                         "watch state of globals)\n", dirs[1]);
+    if (cases[i].defined != NULL)
+      snprintf(want + n, sizeof want - n, "clpdaemon: %s/f.clp: %s\n",
+               dirs[1], cases[i].defined);
+    EXPECT(err_matches(&r, want));
+    done(&r);
+  }
+  dirs[1] = package("wfacts", "definition = wfacts\nversion = 1\n"
+                              "files = f.clp\n");
+  write_file(dirs[1], "f.clp", "(defglobal ?*w* = (watch facts))\n");
+  load(&r, dirs, 2);
+  EXPECT(r.rc == 0);
+  EXPECT(err_matches(&r, ""));
+  done(&r);
+}
+
+/* T9f (L88): redefining a message-handler of another module's class is
+ * reported also when its body is empty. */
+static void test_empty_handler_redefined(void) {
+  const char *dirs[2];
+  char want[1024];
+  run r;
+  dirs[0] = package("hshop", "definition = shop\nversion = 1\n"
+                              "files = s.clp\n");
+  write_file(dirs[0], "s.clp", "(defclass A (is-a USER)\n"
+                               "  (message-handler d))\n"
+                               "(defmessage-handler A e ())\n");
+  dirs[1] = package("hempty", "definition = h\nversion = 1\n"
+                              "files = f.clp\n");
+  write_file(dirs[1], "f.clp", "(defmessage-handler shop@1::A e ())\n"
+                               "(defmessage-handler shop@1::A d ())\n");
+  load(&r, dirs, 2);
+  EXPECT(r.rc != 0);
+  snprintf(want, sizeof want, "clpdaemon: %s/f.clp: defmessage-handler "
+           "'shop@1::A e primary' is outside the package module h@1\n"
+           "clpdaemon: %s/f.clp: defmessage-handler 'shop@1::A d primary' "
+           "is outside the package module h@1\n", dirs[1], dirs[1]);
+  EXPECT(err_matches(&r, want));
+  done(&r);
+}
+
+/* A plugin-like function that makes CLIPS recompute the scope of the
+ * globals (GetNextDefglobalInScope). */
+static void scan_globals(Environment *env, UDFContext *ctx, UDFValue *ret) {
+  (void)ctx;
+  (void)ret;
+  GetNextDefglobalInScope(env, NULL);
+}
+
+static void scan_setup(Environment *env) {
+  AddUDF(env, "scan-globals", "v", 0, 0, NULL, scan_globals, "scan_globals",
+         NULL);
+}
+
+/* T9f (L88): a defglobal value that makes CLIPS recompute the scope of
+ * the globals defeats the defglobal check: the file is rejected (fail
+ * closed) without reporting the untouched globals. */
+static void test_scope_recomputed(void) {
+  const char *dirs[2];
+  char want[1024];
+  run r;
+  dirs[0] = package("sshop", "definition = shop\nversion = 1\n"
+                              "files = s.clp\n");
+  write_file(dirs[0], "s.clp", "(defglobal ?*s* = 1)\n");
+  dirs[1] = package("scan", "definition = scan\nversion = 1\n"
+                            "files = f.clp\n");
+  write_file(dirs[1], "f.clp",
+             "(defglobal ?*x* = (progn (set-current-module MAIN)\n"
+             "  (set-current-module scan@1) (scan-globals)))\n");
+  load_setup = scan_setup;
+  load(&r, dirs, 2);
+  load_setup = NULL;
+  EXPECT(r.rc != 0);
+  snprintf(want, sizeof want, "clpdaemon: %s/f.clp: cannot check the "
+           "modules of its constructs\n", dirs[1]);
+  EXPECT(err_matches(&r, want));
+  done(&r);
+}
+
+/* What a test router collected from STDOUT. */
+static char out_text[4096];
+static size_t out_len;
+
+static bool out_query(Environment *env, const char *name, void *ctx) {
+  (void)env;
+  (void)ctx;
+  return strcmp(name, STDOUT) == 0;
+}
+
+static void out_write(Environment *env, const char *name, const char *str,
+                      void *ctx) {
+  size_t n = strlen(str);
+  (void)env;
+  (void)name;
+  (void)ctx;
+  if (n > sizeof out_text - 1 - out_len) n = sizeof out_text - 1 - out_len;
+  memcpy(out_text + out_len, str, n);
+  out_len += n;
+  out_text[out_len] = '\0';
+}
+
+static bool watch_on;
+
+static void watch_setup(Environment *env) {
+  out_len = 0;
+  out_text[0] = '\0';
+  AddRouter(env, "test-stdout", 60, out_query, out_write, NULL, NULL, NULL,
+            NULL);
+  if (watch_on) Watch(env, GLOBALS);
+}
+
+/* T9f (L88): with global watching off or on, the guarded load leaves the
+ * watch flags as plain CLIPS sets them for the same text and writes to
+ * STDOUT exactly what plain CLIPS writes (nothing with watching off: the
+ * guard prints no ":==" lines of its own). */
+static void test_watch_flags_and_stdout(void) {
+  static const char *const names[] = {"a", "b", "c"};
+  static const char *const text =
+      "(defglobal ?*a* = 1 ?*b* = (bind ?*a* 2))\n"
+      "(defglobal ?*c* = 3)\n"
+      "(defglobal ?*a* = 4)\n";
+  const char *dirs[1];
+  char file[512], plain_out[4096];
+  int on, plain_flag[3];
+  size_t i;
+  run r;
+  dirs[0] = package("wflags", "definition = wflags\nversion = 1\n"
+                              "files = f.clp\n");
+  write_file(dirs[0], "f.clp", text);
+  snprintf(file, sizeof file, "%s/f.clp", dirs[0]);
+  for (on = 0; on < 2; on++) {
+    Environment *plain = CreateEnvironment();
+    watch_on = on;
+    watch_setup(plain);
+    EXPECT(Load(plain, file) == LE_NO_ERROR);
+    for (i = 0; i < sizeof names / sizeof names[0]; i++)
+      plain_flag[i] = DefglobalGetWatch(FindDefglobal(plain, names[i]));
+    memcpy(plain_out, out_text, out_len + 1);
+    DestroyEnvironment(plain);
+    EXPECT(on ? strstr(plain_out, ":== ?*a*") != NULL
+              : strcmp(plain_out, "") == 0);
+    load_setup = watch_setup;
+    load(&r, dirs, 1);
+    load_setup = NULL;
+    EXPECT(r.rc == 0);
+    EXPECT(err_matches(&r, ""));
+    if (strcmp(out_text, plain_out) != 0)
+      fprintf(stderr, "  stdout: [%s]\n  plain:  [%s]\n", out_text,
+              plain_out);
+    EXPECT(strcmp(out_text, plain_out) == 0);
+    for (i = 0; i < sizeof names / sizeof names[0]; i++) {
+      char qualified[32];
+      Defglobal *g;
+      snprintf(qualified, sizeof qualified, "wflags@1::%s", names[i]);
+      g = FindDefglobal(r.env, qualified);
+      EXPECT(g != NULL && DefglobalGetWatch(g) == (bool)plain_flag[i]);
+      EXPECT(plain_flag[i] == on);
+    }
+    done(&r);
+  }
+  watch_on = false;
+}
+
+/* T9f (L88): a file that leaves another module current although it
+ * defined nothing there (a defglobal naming only a module) is an
+ * error. */
+static void test_file_ends_in_other_module(void) {
+  const char *dirs[1];
+  char want[1024];
+  run r;
+  dirs[0] = package("gends", "definition = e\nversion = 1\n"
+                             "files = f.clp, never.clp\n");
+  write_file(dirs[0], "f.clp", "(deftemplate own (slot wf-id))\n"
+                               "(defglobal MAIN)\n");
+  write_file(dirs[0], "never.clp", "(deftemplate never (slot wf-id))\n");
+  load(&r, dirs, 1);
+  EXPECT(r.rc != 0);
+  snprintf(want, sizeof want, "clpdaemon: %s/f.clp: the file ends in module "
+           "MAIN, not the package module e@1\n", dirs[0]);
+  EXPECT(err_matches(&r, want));
+  EXPECT(FindDeftemplate(r.env, "e@1::never") == NULL);
   done(&r);
 }
 
@@ -831,6 +1097,12 @@ int main(void) {
   test_directory_in_files();
   test_defmodule_rejected();
   test_construct_in_other_module();
+  test_module_guard_review();
+  test_watch_state_in_values();
+  test_empty_handler_redefined();
+  test_scope_recomputed();
+  test_watch_flags_and_stdout();
+  test_file_ends_in_other_module();
   test_constructs_in_own_module();
   test_duplicate_package();
   test_manifest_error();
