@@ -1946,6 +1946,7 @@ wait_exit "$pid"
 want="clpdaemon: n1: running
 clpdaemon: sync: sync@1::order: table 'sync_order': $SYNCDUP
 clpdaemon: cycle transaction failed: $SYNCDUP; retrying in 60000 ms
+clpdaemon: sync: instance 'w1' is no longer synchronized: $SYNCDUP
 clpdaemon: received SIGTERM, stopping"
 if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
   fail "sync: a running daemon writes its facts" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"

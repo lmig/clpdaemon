@@ -376,6 +376,19 @@ static void refused(char *out, size_t cap, const char *what,
            what, message, message);
 }
 
+static void actf(size_t pkg, const char *fmt, int k) {
+  char e[256];
+  snprintf(e, sizeof e, fmt, k);
+  act(pkg, e);
+}
+
+/* Appends the line of an instance no longer synchronized. */
+static void isolated(char *out, size_t cap, const char *wf, const char *why) {
+  size_t len = strlen(out);
+  snprintf(out + len, cap - len, "clpdaemon: sync: instance '%s' is no "
+           "longer synchronized: %s\n", wf, why);
+}
+
 /* --- setup ------------------------------------------------------------ */
 
 static void package(const char *name, const char *conf, const char *clp,
@@ -691,7 +704,7 @@ static void test_suspend(void) {
 
 /* Two facts with one primary key: the second INSERT is a unique violation
  * and the cycle is rolled back, the database unchanged; the changes are
- * kept, so the retry after the cause is gone writes the rest. */
+ * dropped and the instance isolated: the retry writes only the other. */
 static void test_duplicate_key(void) {
   char log[4096], want[4096], got[8192], before[16384], after[16384];
   const char *unique =
@@ -700,9 +713,11 @@ static void test_duplicate_key(void) {
          : "UNIQUE constraint failed: shop_order.wf_id, shop_order.line_no";
   fingerprint(before, sizeof before);
   EXPECT(cycle("(progn (assert (order (wf-id w4) (line-no 1) (status a))) "
-               "(assert (order (wf-id w4) (line-no 1) (status b))))",
+               "(assert (order (wf-id w4) (line-no 1) (status b))) "
+               "(assert (order (wf-id w4x) (line-no 1))))",
                log, sizeof log) == 1);
   refused(want, sizeof want, "shop@1::order: table 'shop_order'", unique);
+  isolated(want, sizeof want, "w4", unique);
   EXPECT(same("duplicate log", log, want));
   fingerprint(after, sizeof after);
   EXPECT(same("unchanged after the unique violation", after, before));
@@ -711,8 +726,9 @@ static void test_duplicate_key(void) {
                log, sizeof log) == 0);
   EXPECT(same("retry log", log, ""));
   EXPECT(same("retry", stmts, expect_sql(INS_ORDER INSTANCE)));
-  query("SELECT status FROM shop_order WHERE wf_id = 'w4'", got, sizeof got);
-  EXPECT(same("first kept", got, "'a'"));
+  query("SELECT wf_id FROM shop_order WHERE wf_id IN ('w4', 'w4x')", got,
+        sizeof got);
+  EXPECT(same("only the other instance", got, "'w4x'"));
   EXPECT(tx.retry_ms == 0);
 }
 
@@ -720,17 +736,17 @@ static void test_duplicate_key(void) {
  * of it is committed (statements sent earlier included). */
 static void test_value_errors(void) {
   static const struct {
-    const char *expr, *reason;
+    const char *expr, *wf, *reason;
   } cases[] = {
-      {"(assert (order (wf-id w5) (line-no 1) (amount \"x\")))",
+      {"(assert (order (wf-id w51) (line-no 1) (amount \"x\")))", "w51",
        "slot 'amount' (column 'amount'): expected float, got STRING"},
-      {"(assert (order (wf-id w5) (line-no 1) (amount 3)))",
+      {"(assert (order (wf-id w52) (line-no 1) (amount 3)))", "w52",
        "slot 'amount' (column 'amount'): expected float, got INTEGER"},
-      {"(assert (order (wf-id w5) (line-no 1) (paid 2)))",
+      {"(assert (order (wf-id w53) (line-no 1) (paid 2)))", "w53",
        "slot 'paid' (column 'paid'): a boolean column takes 0 or 1"},
-      {"(assert (order (wf-id 5) (line-no 1)))",
+      {"(assert (order (wf-id 5) (line-no 1)))", "5",
        "slot 'wf-id' (column 'wf_id'): expected string, got INTEGER"},
-      {"(assert (order (wf-id w5) (line-no 1) (note 1.5)))",
+      {"(assert (order (wf-id w55) (line-no 1) (note 1.5)))", "w55",
        "slot 'note' (column 'note'): expected string, got FLOAT"},
   };
   char log[4096], want[4096], expr[512], before[16384], after[16384];
@@ -739,23 +755,22 @@ static void test_value_errors(void) {
     fingerprint(before, sizeof before);
     /* A valid change first: its INSERT goes out, then is rolled back. */
     snprintf(expr, sizeof expr,
-             "(progn (assert (order (wf-id w5) (line-no 2))) %s)",
+             "(progn (assert (order (wf-id v5) (line-no %zu))) %s)", i + 1,
              cases[i].expr);
     EXPECT(cycle(expr, log, sizeof log) == 1);
     snprintf(want, sizeof want,
              "clpdaemon: sync: shop@1::order: table 'shop_order': %s\n"
              "clpdaemon: cycle transaction failed: %s; retrying in 100 ms\n",
              cases[i].reason, cases[i].reason);
+    isolated(want, sizeof want, cases[i].wf, cases[i].reason);
     EXPECT(same(cases[i].expr, log, want));
     EXPECT(strstr(stmts, "INSERT INTO") != NULL);
     fingerprint(after, sizeof after);
     EXPECT(same("unchanged after a value error", after, before));
     EXPECT(clpd_db_in_transaction(db) == 0);
-    /* Gone again: the retry writes nothing. */
-    act(SHOP, "(do-for-all-facts ((?f order)) (or (eq ?f:wf-id w5) "
-              "(eq ?f:wf-id 5)) (retract ?f))");
     EXPECT(cycle(NULL, log, sizeof log) == 0);
-    EXPECT(same("retry after a value error", stmts, ""));
+    EXPECT(same("retry after a value error", stmts,
+                expect_sql(INS_ORDER INSTANCE)));
   }
 }
 
@@ -765,14 +780,15 @@ static void test_int4_overflow(void) {
   char log[4096], want[4096], got[8192], before[16384], after[16384];
   fingerprint(before, sizeof before);
   if (pg) {
-    EXPECT(cycle("(assert (small (wf-id w6) (n 3000000000)))", log,
+    EXPECT(cycle("(assert (small (wf-id w6o) (n 3000000000)))", log,
                  sizeof log) == 1);
     refused(want, sizeof want, "shop@1::small: table 'shop_small'",
             "integer out of range (SQLSTATE 22003)");
+    isolated(want, sizeof want, "w6o", "integer out of range (SQLSTATE 22003)");
     EXPECT(same("int4 overflow", log, want));
     fingerprint(after, sizeof after);
     EXPECT(same("unchanged after the overflow", after, before));
-    act(SHOP, "(do-for-fact ((?f small)) TRUE (modify ?f (n 7)))");
+    act(SHOP, "(assert (small (wf-id w6) (n 7)))");
     EXPECT(cycle(NULL, log, sizeof log) == 0);
     rows_of("shop_small", got, sizeof got);
     EXPECT(same("int4 row", got, "'w6' 7"));
@@ -783,8 +799,8 @@ static void test_int4_overflow(void) {
     EXPECT(same("sqlite 64 bits", got, "'w6' 3000000000"));
   }
   /* nil in a null nil column of a template without a local key. */
-  EXPECT(cycle("(do-for-fact ((?f small)) TRUE (modify ?f (n nil)))", log,
-               sizeof log) == 0);
+  EXPECT(cycle("(do-for-fact ((?f small)) (eq ?f:wf-id w6) "
+               "(modify ?f (n nil)))", log, sizeof log) == 0);
   EXPECT(same("small update", stmts,
               expect_sql("UPDATE @\"shop_small\" SET \"n\" = $1 WHERE "
                          "\"wf_id\" = $2\n" INSTANCE)));
@@ -794,9 +810,9 @@ static void test_int4_overflow(void) {
 
 /* Any statement of the flush that fails rolls the whole cycle back (the
  * mapped rows written before it, other aggregates included); the retry
- * writes everything. */
+ * writes the other instance. */
 static void test_failed_flush(void) {
-  char log[4096], want[4096], got[8192], before[16384], after[16384];
+  char log[4096], want[4096], got[8192], before[16384], after[16384], e[128];
   const char *injected =
       pg ? "relation \"clpd_injected_failure\" does not exist (SQLSTATE "
            "42P01)"
@@ -809,16 +825,18 @@ static void test_failed_flush(void) {
     fingerprint(before, sizeof before);
     begin_cycle();
     fail_at = k;
-    act(SHOP, "(assert (order (wf-id w7) (line-no 1)))");
-    act(CRM, "(assert (party (wf-id c7)))");
+    actf(SHOP, "(assert (order (wf-id w7%d) (line-no 1)))", k);
+    actf(CRM, "(assert (party (wf-id c7%d)))", k);
     EXPECT(end_cycle(log, sizeof log) == 1);
     refused(want, sizeof want, what[k - 1], injected);
+    snprintf(e, sizeof e, "%c7%d", k <= 2 ? 'w' : 'c', k);
+    isolated(want, sizeof want, e, injected);
     EXPECT(same("injected failure", log, want));
     fingerprint(after, sizeof after);
     EXPECT(same("unchanged after a failed flush", after, before));
     /* Undo the facts: the next attempt starts from the same state. */
-    act(SHOP, "(do-for-fact ((?f order)) (eq ?f:wf-id w7) (retract ?f))");
-    act(CRM, "(do-for-fact ((?f party)) (eq ?f:wf-id c7) (retract ?f))");
+    actf(SHOP, "(do-for-fact ((?f order)) (eq ?f:wf-id w7%d) (retract ?f))", k);
+    actf(CRM, "(do-for-fact ((?f party)) (eq ?f:wf-id c7%d) (retract ?f))", k);
     EXPECT(cycle(NULL, log, sizeof log) == 0);
     EXPECT(same("nothing pending", stmts, ""));
   }
@@ -828,12 +846,12 @@ static void test_failed_flush(void) {
   act(CRM, "(assert (party (wf-id c7)))");
   EXPECT(end_cycle(log, sizeof log) == 1);
   EXPECT(cycle(NULL, log, sizeof log) == 0);
-  EXPECT(same("retry writes all", stmts,
-              expect_sql(INS_ORDER INSTANCE INS_PARTY INSTANCE)));
+  EXPECT(same("retry writes the other instance", stmts,
+              expect_sql(INS_ORDER INSTANCE)));
   query("SELECT wf_id FROM workflow_instance WHERE wf_id IN ('w7', 'c7') "
         "ORDER BY 1",
         got, sizeof got);
-  EXPECT(same("both instances", got, "'c7'; 'w7'"));
+  EXPECT(same("only w7", got, "'w7'"));
 }
 
 /* After a statement of the cycle failed (a rule's db-nextval), the flush

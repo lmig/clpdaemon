@@ -66,6 +66,9 @@ struct clpd_orm_syncer {
   size_t nb; /* a power of two */
   int suspended;
   int installed; /* 1: assert hook, 2: retract hook */
+  char **isolated; /* instances no longer synchronized */
+  size_t isolated_n;
+  char failed[4096]; /* the instance of the write that failed, or "" */
 };
 
 static void *xrealloc(void *p, size_t n) {
@@ -184,6 +187,29 @@ static void snapshot(row *r, const tmap *m, Fact *f) {
   }
 }
 
+static void wf_text(const row *r, char *out, size_t n);
+
+/* 1 when the wf-id of r is wf. */
+static int in_instance(const row *r, const char *wf) {
+  char text[4096];
+  if (r->m == NULL) return 0;
+  wf_text(r, text, sizeof text);
+  return strcmp(text, wf) == 0;
+}
+
+/* 1 when f belongs to an instance no longer synchronized. */
+static int isolated(const clpd_orm_syncer *s, const tmap *m, Fact *f) {
+  row r = {NULL, NULL};
+  size_t i;
+  int hit = 0;
+  if (s->isolated_n == 0) return 0;
+  snapshot(&r, m, f);
+  for (i = 0; !hit && i < s->isolated_n; i++)
+    hit = in_instance(&r, s->isolated[i]);
+  row_free(&r);
+  return hit;
+}
+
 static void on_assert(Environment *env, void *fact, void *ctx) {
   clpd_orm_syncer *s = ctx;
   const tmap *m = map_of(s, FactDeftemplate(fact));
@@ -199,6 +225,7 @@ static void on_assert(Environment *env, void *fact, void *ctx) {
     if (pos >= 0) unlink_entry(s, pos);
     return;
   }
+  if (isolated(s, m, fact)) return;
   if (pos < 0) pos = add_entry(s, index);
   snapshot(&s->e[pos].cur, m, fact);
 }
@@ -219,6 +246,7 @@ static void on_retract(Environment *env, void *fact, void *ctx) {
     }
     return;
   }
+  if (isolated(s, m, fact)) return;
   if (pos >= 0) {
     row_free(&s->e[pos].cur); /* stays linked: a modify asserts it next */
     return;
@@ -379,6 +407,7 @@ typedef struct {
   size_t np, cap;
   char *why; /* the reason of a value that cannot be written */
   size_t why_n;
+  const char *wf; /* the instance of the workflow_instance write */
 } flush_ctx;
 
 /* Outcome of a flush step. */
@@ -412,6 +441,12 @@ static void report(flush_ctx *fc, const row *r, const char *message) {
   fflush(fc->log);
 }
 
+/* The instance of r (NULL: of the instance row) failed for good. */
+static void mark(flush_ctx *fc, const row *r) {
+  if (r != NULL) wf_text(r, fc->s->failed, sizeof fc->s->failed);
+  else snprintf(fc->s->failed, sizeof fc->s->failed, "%s", fc->wf);
+}
+
 /* Adds the parameter of column col of r; F_ABORT (reported) when the value
  * cannot be written. */
 static int value_param(flush_ctx *fc, const row *r, size_t col) {
@@ -419,6 +454,7 @@ static int value_param(flush_ctx *fc, const row *r, size_t col) {
   if (to_param(&r->v[col], &r->m->t->columns[col], &v, fc->why, fc->why_n) !=
       0) {
     report(fc, r, fc->why);
+    mark(fc, r);
     return F_ABORT;
   }
   add_param(fc, v);
@@ -429,9 +465,11 @@ static int value_param(flush_ctx *fc, const row *r, size_t col) {
  * affected, the number of rows it changed. */
 static int run(flush_ctx *fc, const row *r, int64_t *affected) {
   clpd_db_result *res = NULL;
-  if (clpd_db_exec(fc->s->db, fc->sql.s, fc->params, fc->np,
-                   affected != NULL ? &res : NULL) != CLPD_DB_OK) {
+  clpd_db_status st = clpd_db_exec(fc->s->db, fc->sql.s, fc->params, fc->np,
+                                   affected != NULL ? &res : NULL);
+  if (st != CLPD_DB_OK) {
     report(fc, r, clpd_db_error(fc->s->db));
+    if (st != CLPD_DB_LOST) mark(fc, r);
     return F_DB;
   }
   if (affected != NULL) *affected = clpd_db_result_affected(res);
@@ -566,6 +604,7 @@ static int write_instance(flush_ctx *fc, const char *wf,
   add_param(fc, clpd_db_text(wf));
   add_param(fc, clpd_db_text(pkg->manifest.definition));
   add_param(fc, clpd_db_text(pkg->manifest.version));
+  fc->wf = wf;
   return run(fc, NULL, NULL);
 }
 
@@ -613,6 +652,7 @@ static int flush(clpd_orm_syncer *s, FILE *log, char *why, size_t n) {
   flush_ctx fc;
   size_t i, a;
   int rc = F_OK;
+  s->failed[0] = '\0';
   for (i = 0; i < s->n && writes(&s->e[i]) == W_NONE; i++) {
   }
   if (i == s->n) return F_OK;
@@ -708,6 +748,8 @@ void clpd_orm_sync_detach(clpd_orm_syncer *s) {
   if (s->installed & 1) RemoveAssertFunction(s->env, NAME);
   if (s->installed & 2) RemoveRetractFunction(s->env, NAME);
   clpd_orm_sync_clear(s);
+  while (s->isolated_n > 0) free(s->isolated[--s->isolated_n]);
+  free(s->isolated);
   free(s->e);
   free(s->buckets);
   free(s->maps);
@@ -726,17 +768,40 @@ int clpd_orm_sync_suspended(const clpd_orm_syncer *s) {
   return s != NULL && s->suspended > 0;
 }
 
+/* After a rolled-back cycle: the instance whose write failed for good, if
+ * any, stops being synchronized and its recorded changes are dropped. */
+static void isolate(clpd_orm_syncer *s, const char *why, FILE *log) {
+  size_t i;
+  if (s == NULL || s->failed[0] == '\0') return;
+  s->isolated = xrealloc(s->isolated, (s->isolated_n + 1) * sizeof(char *));
+  s->isolated[s->isolated_n++] = xstrdup(s->failed);
+  for (i = 0; i < s->n; i++) {
+    entry *e = &s->e[i];
+    if (!in_instance(&e->base, s->failed) && !in_instance(&e->cur, s->failed))
+      continue;
+    row_free(&e->base);
+    row_free(&e->cur);
+    if (e->linked) unlink_entry(s, (long)i);
+  }
+  fprintf(log, "clpdaemon: sync: instance '%s' is no longer synchronized: "
+               "%s\n", s->failed, why);
+  fflush(log);
+  s->failed[0] = '\0';
+}
+
 int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
   char why[1024];
   int rc;
   if (s != NULL && tx->db != NULL && !clpd_db_atomic_failed(tx->db) &&
       flush(s, log, why, sizeof why) == F_ABORT) {
     clpd_orm_tx_abort(tx, log, why);
+    isolate(s, why, log);
     return -1;
   }
   /* After a failed statement (the flush's or an earlier one) the commit
    * returns that failure. */
   rc = clpd_orm_tx_end(tx, log);
   if (rc == 0) clpd_orm_sync_clear(s);
+  else isolate(s, clpd_db_error(tx->db), log);
   return rc;
 }

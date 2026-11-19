@@ -12,7 +12,8 @@
  * DELETEs, UPDATEs and INSERTs, then the workflow_instance row of each
  * instance written (inserted on its first write with status active, its
  * updated_at set on every write). A committed cycle forgets the changes;
- * a rolled-back one keeps them for the retry.
+ * a rolled-back one keeps them for the retry, except those of an instance
+ * whose write failed for good (clpd_orm_sync_end_cycle).
  *
  * Facts asserted or retracted while the recording is suspended (loading
  * from the database: db-load, rehydration; T10c, T10d) are not recorded,
@@ -60,9 +61,12 @@ void clpd_orm_sync_clear(clpd_orm_syncer *s);
  * the cycle back; a value that cannot be written (docs/orm.md) logs the
  * same line with its reason instead of <message> and rolls the cycle back
  * through clpd_orm_tx_abort. Either way the cycle transaction line of
- * src/orm_tx.h follows. Returns 0 when the cycle committed (the changes
- * are forgotten), -1 when it was rolled back (they are kept). s may be
- * NULL (only the commit). */
+ * src/orm_tx.h follows. When the refused write (not CLPD_DB_LOST) or the
+ * value belongs to instance <wf-id>, its changes are dropped, its facts are
+ * no longer recorded until the syncer is detached, and
+ *   clpdaemon: sync: instance '<wf-id>' is no longer synchronized: <reason>
+ * follows. Returns 0 when the cycle committed (the changes are forgotten),
+ * -1 when it was rolled back (the others are kept). s may be NULL. */
 int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
 
 #endif

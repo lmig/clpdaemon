@@ -280,7 +280,7 @@ The primary key is the `wf_id` column followed by the local key columns (FR-22).
 
 The facts that exist before the first cycle (the deffacts asserted by `Reset` at startup, facts asserted by a plugin's `init` or `after_load`) are changes since the last commit like any other: the first cycle inserts them. So is a fact asserted between cycles (a plugin's `cycle_end`): the next cycle writes it.
 
-Two facts of one template with the same primary key in working memory (they differ in another slot, so CLIPS keeps both) cannot both be stored: the second `INSERT` is a unique violation (`CLPD_DB_UNIQUE`) and the whole cycle is rolled back. The same holds for a fact whose key matches a row stored by another writer or by an earlier run of the daemon: a deffacts fact of a mapped template is inserted again at every start, so a restart against a database that already holds its row rolls the first cycle back (and retries it) until the fact or the row is gone (rehydration at startup comes with T11/T22).
+Two facts of one template with the same primary key in working memory (they differ in another slot, so CLIPS keeps both) cannot both be stored: the second `INSERT` is a unique violation (`CLPD_DB_UNIQUE`) and the whole cycle is rolled back. The same holds for a fact whose key matches a row stored by another writer or by an earlier run of the daemon: a deffacts fact of a mapped template is inserted again at every start, so a restart against a database that already holds its row rolls the first cycle back and [isolates](#failures) that instance; the other instances commit on the retry (rehydration at startup comes with T11/T22).
 
 ### Statements and order
 
@@ -322,7 +322,7 @@ Facts asserted while the daemon loads rows from the database (the rehydration of
 
 ### Failures
 
-A write the database refuses, or a value the [write rules](#write-rules) cannot write, rolls the whole cycle back (the rules' DDL and the rows written before it included) through the [cycle transaction](database.md#cycle-transaction): one line names the write, the cycle transaction line follows, and the cycle is retried after the backoff. The recorded changes are kept, so the retry writes them again with whatever the next cycle adds (until T10c rehydrates the instances). When a statement of the cycle already failed (for example a rule's `db-nextval`), the synchronization sends nothing and the commit reports that failure.
+A write the database refuses, or a value the [write rules](#write-rules) cannot write, rolls the whole cycle back (the rules' DDL and the rows written before it included) through the [cycle transaction](database.md#cycle-transaction): one line names the write, the cycle transaction line follows, and the cycle is retried after the backoff. The instance (`wf-id`) of that write or value is then isolated: its recorded changes are dropped, later changes of its facts are not recorded, and `clpdaemon: sync: instance '<wf-id>' is no longer synchronized: <reason>` (the same reason) follows the cycle transaction line; the other instances keep their changes, so the retry writes them. The isolation lasts until the daemon restarts (rehydration, T10c/T11, will reload such an instance). A lost connection (`CLPD_DB_LOST`), a failed `begin` or commit, a missing current schema and a failed statement of a rule (its DDL or sequence functions) isolate nothing: the retry writes everything again. When a statement of the cycle already failed (for example a rule's `db-nextval`), the synchronization sends nothing and the commit reports that failure.
 
 | Situation | Messages |
 |---|---|
@@ -338,12 +338,12 @@ For example, two facts with one key on SQLite: `clpdaemon: sync: shop@1::order: 
 
 - The facts before the first cycle (deffacts at `Reset`, startup) are written by the first cycle, like any change since the last commit (tested).
 - A fact asserted and modified in one cycle is one `INSERT` with the final values; asserted and retracted, nothing; several modifies, one `UPDATE` of the changed columns; a key change, `DELETE` + `INSERT`.
-- Two facts with one primary key: the second `INSERT` fails with a unique violation and the cycle is rolled back (documented above, tested); the same for a restart that inserts its deffacts again.
+- Two facts with one primary key: the second `INSERT` fails with a unique violation, the cycle is rolled back and the instance isolated (documented above, tested); the same for a restart that inserts its deffacts again.
 - An `UPDATE` that finds no row inserts it; a `DELETE` that finds none is not an error.
 - A value of another type than the declared CLIPS type is an error (a string and a symbol are interchangeable); a `boolean` column takes only 0 and 1.
 - The timestamps of `workflow_instance` come from the database clock (above).
 - A modify is recorded through the assert and retract hooks (CLIPS 6.4.2 keeps the fact index), so no modify hook is needed; there is no unmapped slot to ignore, since every slot of a mapped template is mapped.
-- After a rolled-back cycle the recorded changes are kept for the retry (T10c will replace this by rehydration).
+- After a rolled-back cycle the recorded changes are kept for the retry (T10c will replace this by rehydration), except those of an instance whose write failed for good, which is isolated (user decision "Aislar la instancia", native review R3-001/R4-001): one fact that cannot be written would otherwise roll back every retry forever.
 
 ## Interface
 
