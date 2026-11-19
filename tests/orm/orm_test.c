@@ -158,6 +158,25 @@ static void test_cannot_open(void) {
   clpd_orm_free(&m);
 }
 
+/* A repeated slot line is a duplicate even when its first line was
+ * rejected (review advisory R3 of T9a). */
+static void test_duplicate_slot_after_invalid(void) {
+  clpd_orm m;
+  char eb[2048];
+  EXPECT(parse("order.table = t\n"
+               "order.owned = no\n"
+               "order.slot.wf-id = wf_id text string bogus\n"
+               "order.slot.wf-id = wf_id text string error\n",
+               &m, eb, sizeof eb) != 0);
+  EXPECT(err_is(eb,
+                "clpdaemon: %s:3: order.slot.wf-id: unknown null policy "
+                "'bogus' (expected nil, default, error)\n"
+                "clpdaemon: %s:4: duplicate key 'order.slot.wf-id' (first set "
+                "on line 3)\n"));
+  EXPECT(m.template_count == 1 && m.templates[0].column_count == 0);
+  clpd_orm_free(&m);
+}
+
 static void test_unknown_and_duplicate_keys(void) {
   clpd_orm m;
   char eb[4096];
@@ -472,6 +491,7 @@ int main(void) {
   test_empty();
   test_cannot_open();
   test_unknown_and_duplicate_keys();
+  test_duplicate_slot_after_invalid();
   test_identifiers();
   test_values();
   test_keys();

@@ -249,6 +249,9 @@ static const char *mapped_by(const clpd_packages *out, const char *name,
   size_t i, j;
   for (i = 0; i + 1 < out->count; i++) {
     const clpd_package *o = &out->items[i];
+    /* check_orm stores o->orm only after clpd_orm_parse succeeded, and a
+     * valid mapping has a table for every template and a name for every
+     * sequence, so neither strcmp below sees NULL. */
     if (o->orm == NULL ||
         strcmp(o->manifest.definition, pkg->manifest.definition) == 0)
       continue;

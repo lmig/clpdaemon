@@ -184,13 +184,18 @@ static void on_slot(clpd_kv *kv, clpd_orm_template *t,
   size_t i;
   clpd_orm_column *c;
 
-  for (i = 0; i < t->column_count; i++) {
-    if (strcmp(t->columns[i].slot, slot) == 0) {
+  for (i = 0; i < t->slot_line_count; i++) {
+    if (strcmp(t->slot_lines[i].slot, slot) == 0) {
       clpd_kv_error(kv, "duplicate key '%s' (first set on line %ld)", key,
-                    t->columns[i].line);
+                    t->slot_lines[i].line);
       return;
     }
   }
+  /* Recorded before validation: a repeat of a rejected line is still a
+   * duplicate, like the other keys (duplicate() runs first there too). */
+  t->slot_lines = grow(t->slot_lines, t->slot_line_count, sizeof *t->slot_lines);
+  t->slot_lines[t->slot_line_count].slot = clpd_strdup(slot);
+  t->slot_lines[t->slot_line_count++].line = kv->line;
   {
     /* fields() writes NULs into value: keep the text for the message. */
     char *copy = clpd_strdup(value);
@@ -415,6 +420,8 @@ void clpd_orm_free(clpd_orm *orm) {
       free(t->columns[j].column);
     }
     free(t->columns);
+    for (j = 0; j < t->slot_line_count; j++) free(t->slot_lines[j].slot);
+    free(t->slot_lines);
     free(t->key_columns);
     clpd_list_free(&t->key);
     free(t->name);

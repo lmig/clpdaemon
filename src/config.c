@@ -227,8 +227,8 @@ static int apply(clpd_kv *kv, int key, char *value, clpd_config *cfg) {
       clpd_kv_error(kv, "%s: expected yes or no, got '%s'", name, value);
       return 0;
     }
-    cfg->orm_allow_drop = strcmp(value, "yes") == 0;
-    return 1;
+    v = strcmp(value, "yes") == 0;
+    break; /* stored by the per-key switch below */
   }
 
   switch (key) {
@@ -236,6 +236,7 @@ static int apply(clpd_kv *kv, int key, char *value, clpd_config *cfg) {
   case KEY_CYCLE_MIN: cfg->cycle_min_interval_ms = (int)v; break;
   case KEY_MAX_RULES: cfg->max_rules_per_cycle = (int)v; break;
   case KEY_SAFETY_POLL: cfg->safety_poll_interval_ms = (int)v; break;
+  case KEY_ORM_ALLOW_DROP: cfg->orm_allow_drop = (int)v; break;
   default: break;
   }
   return 1;

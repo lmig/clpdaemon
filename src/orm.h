@@ -52,6 +52,13 @@ typedef struct {
   long line;
 } clpd_orm_column;
 
+/* A `<tpl>.slot.<slot>` line seen in the file, valid or not, so a repeat
+ * is always a duplicate key. */
+typedef struct {
+  char *slot;
+  long line;
+} clpd_orm_slot_line;
+
 typedef struct {
   char *name;  /* deftemplate name, unqualified */
   char *table; /* identifier */
@@ -64,6 +71,8 @@ typedef struct {
   size_t *key_columns;
   long line;                              /* first line naming it */
   long table_line, owned_line, key_line;  /* 0 = not set */
+  clpd_orm_slot_line *slot_lines; /* every slot line, in file order */
+  size_t slot_line_count;
 } clpd_orm_template;
 
 /* `seq.<alias> = <name>` and `seq.<alias>.owned = yes|no`. */
