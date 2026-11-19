@@ -485,6 +485,15 @@ const clpd_orm_template *clpd_orm_template_of(const clpd_orm *orm,
   return NULL;
 }
 
+const clpd_orm_sequence *clpd_orm_sequence_of(const clpd_orm *orm,
+                                              const char *alias) {
+  size_t i;
+  for (i = 0; i < orm->sequence_count; i++)
+    if (strcmp(orm->sequences[i].alias, alias) == 0)
+      return &orm->sequences[i];
+  return NULL;
+}
+
 /* Column of key position i of t (0: wf-id), or NULL when that slot has no
  * column line. */
 static const char *key_column(const clpd_orm_template *t, size_t i) {

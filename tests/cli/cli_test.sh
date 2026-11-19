@@ -1634,6 +1634,41 @@ clpdaemon: db-drop-table: template 'own@1::item' is not mapped by definition for
   cases=$((cases + 1))
   got=$(sqlite3 foreign.db "SELECT wf_id || ' ' || note FROM own_item" 2>&1)
   [ "$got" = "w1 kept" ] || fail "orm ddl: the other definition's row is kept" "got [$got]"
+  # Sequences (T9c): a rule creates the owned sequence (the SQLite counter
+  # row) and draws values; an unknown alias is one log line and halts the
+  # rule. A second run continues from the stored value.
+  mkdir ormseq
+  conf ormseq/package.conf 'definition = seq
+version = 1
+files = seq.clp
+orm = orm.conf'
+  conf ormseq/seq.clp '(deftemplate go (slot wf-id))
+(defrule r (go (wf-id ?w)) =>
+  (printout t "create " (db-create-sequence order_no) crlf)
+  (bind ?a (db-nextval order_no))
+  (printout t "next " ?a " " (db-nextval order_no) " " (integerp ?a) crlf)
+  (db-nextval nope)
+  (printout t "not reached" crlf))
+(deffacts seed (go (wf-id w1)))'
+  conf ormseq/orm.conf 'seq.order_no = seq_order_no
+seq.order_no.owned = yes'
+  rconf seq.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/seq.db
+packages = ormseq"
+  seqerr="clpdaemon: n1: running
+clpdaemon: db-nextval: unknown sequence alias 'nope' (no loaded package maps it)
+[PRCCODE4] Execution halted during the actions of defrule 'r'."
+  ddlrun "orm seq: create and nextval" seq.conf 'create TRUE
+next 1 2 TRUE' "$seqerr"
+  ddlrun "orm seq: values continue in a second run" seq.conf 'create TRUE
+next 3 4 TRUE' "$seqerr"
+  cases=$((cases + 1))
+  got=$(sqlite3 seq.db "SELECT name || ' ' || value FROM clpd_sequence; SELECT sql FROM sqlite_master WHERE name = 'clpd_sequence'" 2>&1)
+  want='seq_order_no 4
+CREATE TABLE "clpd_sequence" ("name" TEXT PRIMARY KEY, "value" INTEGER NOT NULL)'
+  [ "$got" = "$want" ] || fail "orm seq: the counter row" "got [$got], want [$want]"
 else
   echo "cli_test.sh: sqlite3 not found; the orm ddl catalog cases are skipped" >&2
 fi

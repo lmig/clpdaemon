@@ -2,7 +2,7 @@
 
 A rule package can map its deftemplates to database tables and name the database sequences its rules use (S7, S11, FR-22). The mapping lives in a separate file named by the manifest key `orm` ([`packages.md`](packages.md#manifest)). Nothing in it is implicit: every slot of a mapped template gets its own line with the column, the SQL type, the CLIPS type and what a NULL becomes.
 
-The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b) and the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23). `db-nextval` (T9c) and the per-cycle synchronization (T10) build on this model.
+The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b) the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23) and the [sequence functions](#sequence-functions) `db-create-sequence` and `db-nextval` (T9c). The per-cycle synchronization (T10) builds on this model.
 
 ## File format
 
@@ -47,8 +47,8 @@ The primary key of a table is `wf-id` followed by the local key (FR-22). Every s
 
 | Key | Value | Default |
 |---|---|---|
-| `seq.<alias>` | name of the database sequence, an [identifier](#identifiers); `<alias>` is the name rules use (`(db-nextval order_no)`, T9c) and is an identifier too | required |
-| `seq.<alias>.owned` | `yes`: the daemon may create the sequence; `no`: an existing sequence | required |
+| `seq.<alias>` | name of the database sequence, an [identifier](#identifiers); `<alias>` is the name rules use (`(db-nextval order_no)`, [below](#sequence-functions)) and is an identifier too | required |
+| `seq.<alias>.owned` | `yes`: the sequence belongs to the daemon (`db-create-sequence` may create it); `no`: an existing sequence, never created | required |
 
 Two aliases of one file cannot name the same sequence.
 
@@ -141,9 +141,9 @@ Any error makes the daemon exit 1, like other package errors. Nothing is read fr
 
 ## DDL functions
 
-With a `database` in the configuration the core defines three CLIPS functions (FR-23, D9) before the plugins and packages load; without one they do not exist, so a package calling them fails to load (`Missing function declaration for 'db-create-table'`). Every statement they send runs in autocommit through the database interface, at most one `CREATE` or `DROP` per call ([`database.md`](database.md)): the functions never send `BEGIN` or `COMMIT` and never `ALTER` a table. The SQL holds only the table, column and type names of the mapping and, on PostgreSQL, the name of the current schema, always quoted (`"public"."shop_order"`); the catalog lookups pass the table name as a parameter (`= $1`).
+With a `database` in the configuration the core defines five CLIPS functions (FR-23, D9): the three table functions below and the two [sequence functions](#sequence-functions), before the plugins and packages load; without one they do not exist, so a package calling them fails to load (`Missing function declaration for 'db-create-table'`). Every statement they send runs in autocommit through the database interface, at most one `CREATE` or `DROP` per call ([`database.md`](database.md)): the functions never send `BEGIN` or `COMMIT` and never `ALTER` a table. The SQL holds only the table, column and type names of the mapping and, on PostgreSQL, the name of the current schema, always quoted (`"public"."shop_order"`); the catalog lookups pass the table name as a parameter (`= $1`).
 
-`db-create-table` and `db-drop-table` change the database, so only a rule may call them, and only for its own workflow definition (L84): the call must come from the actions of a rule of a loaded package, and the template must be mapped by a package of the same definition as that rule's package (any version: a rule of `shop@2` may create the table of `shop@1::order`). Called anywhere else (the top level, a deffacts evaluated at `Reset`, a plugin hook such as `after_load`, a rule of a module that is no package) they fail and touch nothing. `db-check-schema` only reads the catalog and may be called from anywhere, for the template of any loaded package.
+`db-create-table`, `db-drop-table`, `db-create-sequence` and `db-nextval` change the database, so only a rule may call them, and only for its own workflow definition (L84, T9c): the call must come from the actions of a rule of a loaded package, and the template or sequence alias must be mapped by a package of the same definition as that rule's package (any version: a rule of `shop@2` may create the table of `shop@1::order`). Called anywhere else (the top level, a deffacts evaluated at `Reset`, a plugin hook such as `after_load`, a rule of a module that is no package) they fail and touch nothing. `db-check-schema` only reads the catalog and may be called from anywhere, for the template of any loaded package.
 
 | Function | Returns | Effect |
 |---|---|---|
@@ -186,8 +186,8 @@ An error writes one line to the daemon log stream (stderr, or the original stder
 
 | Situation | Message |
 |---|---|
-| `db-create-table` or `db-drop-table` outside the actions of a rule | `clpdaemon: <udf>: only a rule of a rule package may call it (no rule is executing)` |
-| `db-create-table` or `db-drop-table` from a rule of a module that is no package | `clpdaemon: <udf>: only a rule of a rule package may call it (rule '<rule>' is in module '<module>')` |
+| `db-create-table`, `db-drop-table`, `db-create-sequence` or `db-nextval` outside the actions of a rule (also a deffacts evaluated at `Reset`, or an `Eval` after a rule has run) | `clpdaemon: <udf>: only a rule of a rule package may call it (no rule is executing)` |
+| The same functions from a rule of a module that is no package | `clpdaemon: <udf>: only a rule of a rule package may call it (rule '<rule>' is in module '<module>')` |
 | No loaded package maps the template | `clpdaemon: <udf>: unknown template '<template>' (no loaded package maps it)` |
 | `db-create-table` or `db-drop-table` on a template only other definitions map | `clpdaemon: <udf>: template '<template>' is not mapped by definition <definition> of the calling rule (mapped by <pkg>[, <pkg>...])`, the packages of other definitions that map it (for a qualified name, the package named) |
 | Unqualified name mapped by several packages | `clpdaemon: <udf>: template '<template>' is mapped by <pkg>, <pkg>[, ...]: qualify it as <package>::<template>` (for `db-create-table` and `db-drop-table`, only versions of the calling rule's definition) |
@@ -199,6 +199,52 @@ An error writes one line to the daemon log stream (stderr, or the original stder
 
 `<udf>` is the function name, `<template>` the argument as given, `<rule>` and `<module>` the calling rule and its module (all three with control characters shown as `?`, at most 200 bytes). The checks run in the order of the table: for `db-create-table` and `db-drop-table` the caller first, then the name, then for `db-drop-table` the configuration key, then ownership, then the current schema and the statement.
 
+## Sequence functions
+
+A rule draws numbers from the database sequences its package maps (`seq.<alias>`, [above](#sequences)) by alias (T9c, L82). Both functions follow the rules of the [DDL functions](#ddl-functions): they exist only with a `database`, only a rule of a rule package may call them, only for the aliases of its own definition, and every statement runs in autocommit.
+
+| Function | Returns | Effect |
+|---|---|---|
+| `(db-create-sequence <alias>)` | `TRUE`, or `FALSE` on error | Creates an owned sequence (`seq.<alias>.owned = yes`) when it does not exist; an existing sequence keeps its value (`TRUE`). A sequence that is not owned is never created. |
+| `(db-nextval <alias>)` | the next value, an INTEGER (`1`, `2`, `3`, ... for a sequence the daemon created); `FALSE` on error | Advances the sequence in one statement and returns the new value. The sequence is shared: versions of one definition that map the same sequence, and other daemons or connections on the same database, never get the same value. A value drawn is used up even when the rule's later actions fail (the statement runs in autocommit, and PostgreSQL sequences are not transactional anyway). |
+
+`<alias>` is a symbol or a string, resolved like a template name for `db-create-table` ([template names](#template-names)): `<package>::<alias>` names the alias of that package, which must be a version of the calling rule's definition; an unqualified alias is the calling rule's package's alias when that package maps it, otherwise the alias of the only version of the definition that maps it; several versions mapping it (even to the same sequence) ask to qualify it.
+
+### Generated SQL
+
+| | PostgreSQL | SQLite |
+|---|---|---|
+| `db-create-sequence` | `SELECT current_schema()`, then `CREATE SEQUENCE IF NOT EXISTS "<schema>"."<name>"` (PostgreSQL's defaults: `bigint`, start 1, increment 1) | `CREATE TABLE IF NOT EXISTS "clpd_sequence" ("name" TEXT PRIMARY KEY, "value" INTEGER NOT NULL)`, then `INSERT INTO "clpd_sequence" ("name", "value") VALUES ($1, 0) ON CONFLICT ("name") DO NOTHING` |
+| `db-nextval` | `SELECT current_schema()`, then `SELECT nextval($1)` with `"<schema>"."<name>"` as the TEXT parameter (no cast in the SQL text) | `UPDATE "clpd_sequence" SET "value" = "value" + 1 WHERE "name" = $1 AND "value" < 9223372036854775807 RETURNING "value"` |
+
+On PostgreSQL the sequence lives in `current_schema()`, like the tables: a same-named sequence of a later `search_path` schema is never created over or advanced. SQLite has no sequences, so the counter table `clpd_sequence` stands in for them (tests only, [`database.md`](database.md#sqlite-stand-ins)): one row per sequence name, `value` the last value returned (0 before the first), advanced by one `UPDATE ... RETURNING` statement (SQLite 3.35 or later). Do not map a table named `clpd_sequence` on SQLite. When a call fails or returns no value, the function looks the sequence up (PostgreSQL: a relation of that name in `current_schema()` in `pg_catalog.pg_class`; SQLite: the counter table and the row) to tell a missing sequence from another error. The largest value is 9223372036854775807 (INT64): on SQLite the guard leaves a row at the maximum unchanged and the call is an error; on PostgreSQL the sequence's own `MAXVALUE` applies and the call fails with PostgreSQL's message.
+
+### Sequence errors
+
+The same log line, CLIPS evaluation error and `FALSE` as the [DDL errors](#errors); nothing is created or advanced.
+
+| Situation | Message |
+|---|---|
+| Not called from the actions of a rule of a rule package | the two `only a rule of a rule package may call it` messages of the [DDL errors](#errors) |
+| No loaded package maps the alias | `clpdaemon: <udf>: unknown sequence alias '<alias>' (no loaded package maps it)` |
+| An alias only other definitions map (for a qualified alias, the package named) | `clpdaemon: <udf>: sequence alias '<alias>' is not mapped by definition <definition> of the calling rule (mapped by <pkg>[, <pkg>...])` |
+| Unqualified alias mapped by several versions of the calling rule's definition | `clpdaemon: <udf>: sequence alias '<alias>' is mapped by <pkg>, <pkg>[, ...]: qualify it as <package>::<alias>` |
+| `db-create-sequence` on a sequence that is not owned | `clpdaemon: db-create-sequence: sequence alias '<alias>': sequence '<name>' is not owned (owned = no), so it is never created` |
+| `db-nextval` on a sequence that does not exist (SQLite: no counter table or no row) | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>' does not exist` |
+| SQLite: the counter is at 9223372036854775807 | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>' has reached its maximum value` |
+| PostgreSQL: no schema of the `search_path` exists | `clpdaemon: <udf>: sequence alias '<alias>': sequence '<name>': no current schema (the search_path names no existing schema)` |
+| The database refuses a statement (PostgreSQL's maximum included: `nextval: reached maximum value of sequence "?" (9223372036854775807) (SQLSTATE 2200H)`, the name hidden like every data exception, [`database.md`](database.md#status)) | `clpdaemon: <udf>: sequence alias '<alias>': sequence '<name>': <database message>` |
+| SQLite: the counter row holds no INTEGER (written by someone else) | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>': the database returned no INTEGER` |
+
+`<alias>` is the argument as given (control characters shown as `?`, at most 200 bytes). The checks run in the order of the table: the caller, the alias, ownership, then the statements.
+
+### Decisions (T9c)
+
+- `db-nextval` returns an INTEGER and takes an alias of the calling rule's own definition, any version, resolved like `db-create-table`; it is refused outside a rule (fail-closed).
+- Owned sequences are created by the separate `db-create-sequence`, not by `db-create-table`, with the same caller scope; a sequence that is not owned is never created.
+- PostgreSQL: `CREATE SEQUENCE IF NOT EXISTS` and `nextval($1)` on the name qualified with `current_schema()`, the name passed as a TEXT parameter; SQLite: the counter table `clpd_sequence(name TEXT PRIMARY KEY, value INTEGER NOT NULL)` with one row per name, starting so that the first value is 1, like PostgreSQL.
+- Errors as the other DDL functions; a missing sequence and an INT64 overflow are errors (SQLite guards in the statement, so the row is not changed; PostgreSQL reports its own error); error messages never show a value from the database.
+
 ## Interface
 
-`src/orm.h` holds the CLIPS-free model and parser: `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of` and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register`, which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.
+`src/orm.h` holds the CLIPS-free model and parser: `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of`, `clpd_orm_sequence_of` (T9c) and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register`, (all five functions), which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.

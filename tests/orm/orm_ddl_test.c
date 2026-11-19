@@ -1,5 +1,6 @@
 /* Tests for the ORM DDL functions db-create-table, db-check-schema and
- * db-drop-table (T9b, docs/orm.md#ddl-functions).
+ * db-drop-table (T9b, T9d) and the sequence functions db-create-sequence
+ * and db-nextval (T9c, docs/orm.md#ddl-functions).
  * usage: orm_ddl_test                         (a temporary SQLite file)
  *        orm_ddl_test <conninfo> <password>   (PostgreSQL, run by
  *                                              tests/db/pg_cluster.sh)
@@ -16,6 +17,7 @@
 #include "orm_ddl.h"
 #include "packages.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +32,7 @@ static clpd_packages pkgs;
 static clpd_orm_ddl ddl;
 static clpd_db *db;
 static int pg; /* 1 on PostgreSQL */
+static char db_spec[512]; /* the spec db was opened with */
 static const char *password; /* PostgreSQL: the role's password, never logged */
 
 clpd_db_status __real_clpd_db_exec(clpd_db *db, const char *sql,
@@ -109,7 +112,11 @@ static const char *shop_orm =
     "customer.slot.name = full_name text string default\n"
     "customer.slot.score = score bigint integer default\n"
     "customer.slot.note = note text string nil\n"
-    "customer.slot.seen = seen_at timestamptz string nil\n";
+    "customer.slot.seen = seen_at timestamptz string nil\n"
+    "seq.order_no = shop_order_no_seq\n"
+    "seq.order_no.owned = yes\n"
+    "seq.legacy = crm_legacy_seq\n"
+    "seq.legacy.owned = no\n";
 /* shop@3 maps only the customer table, like the other versions. */
 static const char *shop3_orm =
     "customer.table = crm_customer\n"
@@ -121,10 +128,11 @@ static const char *shop3_orm =
     "customer.slot.seen = seen_at timestamptz string nil\n";
 
 /* The result of one call: kind 'T' (TRUE), 'F' (FALSE), 'M' (multifield,
- * items joined with '|'), '?' otherwise; log is what the call wrote to the
+ * items joined with '|'), 'I' (INTEGER, in integer), '?' otherwise; log is what the call wrote to the
  * daemon log stream; ran is 0 when the calling rule never fired. */
 typedef struct {
   char kind;
+  long long integer;
   size_t count;
   char items[4096];
   char log[4096];
@@ -142,6 +150,9 @@ static void result_of(const CLIPSValue *v, call_result *c) {
   } else if (v->header->type == SYMBOL_TYPE &&
              v->lexemeValue == FalseSymbol(env)) {
     c->kind = 'F';
+  } else if (v->header->type == INTEGER_TYPE) {
+    c->kind = 'I';
+    c->integer = v->integerValue->contents;
   } else if (v->header->type == MULTIFIELD_TYPE) {
     c->kind = 'M';
     c->count = v->multifieldValue->length;
@@ -261,6 +272,21 @@ static int fails(const char *expr, const char *line) {
   return fails_in(NULL, expr, line);
 }
 
+/* A call from a rule of `module` that returned the INTEGER want and logged
+ * nothing. */
+static int int_in(const char *module, const char *expr, long long want) {
+  call_result c;
+  call_in(module, expr, &c);
+  if (!c.ran || c.kind != 'I' || c.integer != want || c.log[0] != '\0' ||
+      c.rc != EE_NO_ERROR) {
+    fprintf(stderr, "  %s (%s): ran %d kind %c value %lld (want %lld) rc %d "
+            "log [%s]\n", expr, module, c.ran, c.kind, c.integer, want,
+            (int)c.rc, c.log);
+    return 0;
+  }
+  return 1;
+}
+
 /* A call that failed with a database error: `prefix` followed by the
  * database's last message (the injected query on MISSING_TABLE). */
 static int fails_db(const char *module, const char *expr, const char *prefix) {
@@ -268,6 +294,10 @@ static int fails_db(const char *module, const char *expr, const char *prefix) {
   const char *msg;
   call_result c;
   call_in(module, expr, &c);
+  /* The function may run more statements after the failure (db-nextval
+   * looks the sequence up), so the expected message comes from the same
+   * query run again. */
+  __real_clpd_db_exec(db, "SELECT 1 FROM " MISSING_TABLE, NULL, 0, NULL);
   msg = clpd_db_error(db);
   snprintf(line, sizeof line, "%s%s\n", prefix, msg);
   if (fail_sql != NULL) {
@@ -385,6 +415,39 @@ static long long rows_in(const char *schema, const char *table) {
   return n;
 }
 
+/* The state of sequence `name`: -1 when it does not exist (SQLite: no
+ * clpd_sequence table or no row), else the last value db-nextval returned
+ * (0 before the first). */
+static long long seq_state(const char *name) {
+  static const char *const pg_exists =
+      "SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON "
+      "n.oid = c.relnamespace WHERE n.nspname = current_schema() AND "
+      "c.relname = $1 AND c.relkind = 'S'";
+  clpd_db_value p = clpd_db_text(name);
+  clpd_db_result *r = NULL;
+  char text[256];
+  long long v = -1;
+  if (pg) {
+    if (clpd_db_exec(db, pg_exists, &p, 1, &r) != CLPD_DB_OK ||
+        clpd_db_result_rows(r) == 0) {
+      clpd_db_result_free(r);
+      return -1;
+    }
+    clpd_db_result_free(r);
+    r = NULL;
+    snprintf(text, sizeof text, "SELECT CASE WHEN is_called THEN last_value "
+             "ELSE 0 END FROM \"%s\"", name);
+    if (clpd_db_exec(db, text, NULL, 0, &r) == CLPD_DB_OK)
+      v = (long long)clpd_db_result_value(r, 0, 0)->integer;
+  } else if (clpd_db_exec(db, "SELECT value FROM clpd_sequence WHERE name = "
+                              "$1", &p, 1, &r) == CLPD_DB_OK &&
+             clpd_db_result_rows(r) == 1) {
+    v = (long long)clpd_db_result_value(r, 0, 0)->integer;
+  }
+  clpd_db_result_free(r);
+  return v;
+}
+
 static void setup(const char *spec) {
   const char *dirs[4];
   char msg[512];
@@ -413,14 +476,24 @@ static void setup(const char *spec) {
   write_file(dirs[2], "orm.conf",
              "ticket.table = solo_ticket\nticket.owned = yes\n"
              "ticket.slot.wf-id = wf_id text string error\n"
-             "ticket.slot.title = title text string nil\n");
+             "ticket.slot.title = title text string nil\n"
+             "seq.ticket_no = solo_ticket_no_seq\n"
+             "seq.ticket_no.owned = yes\n");
   write_file(dirs[3], "shop.clp", shop_clp);
   write_file(dirs[3], "orm.conf", shop3_orm);
   if (clpd_db_open(spec, &db, msg, sizeof msg) != CLPD_DB_OK) {
     fprintf(stderr, "orm_ddl_test: cannot open the database: %s\n", msg);
     exit(2);
   }
+  snprintf(db_spec, sizeof db_spec, "%s", spec);
   pg = strcmp(clpd_db_backend(db), "postgresql") == 0;
+  if (pg) {
+    sql("DROP SEQUENCE IF EXISTS shop_order_no_seq");
+    sql("DROP SEQUENCE IF EXISTS crm_legacy_seq");
+    sql("DROP SEQUENCE IF EXISTS solo_ticket_no_seq");
+  } else {
+    sql("DROP TABLE IF EXISTS clpd_sequence");
+  }
   sql("DROP VIEW IF EXISTS solo_ticket");
   sql("DROP TABLE IF EXISTS shop_order");
   sql("DROP TABLE IF EXISTS crm_customer");
@@ -431,14 +504,18 @@ static void setup(const char *spec) {
    * functions. */
   EXPECT(FindFunction(env, "db-create-table") == NULL &&
          FindFunction(env, "db-check-schema") == NULL &&
-         FindFunction(env, "db-drop-table") == NULL);
+         FindFunction(env, "db-drop-table") == NULL &&
+         FindFunction(env, "db-create-sequence") == NULL &&
+         FindFunction(env, "db-nextval") == NULL);
   ddl.db = db;
   ddl.packages = &pkgs;
   ddl.allow_drop = 0;
   EXPECT(clpd_orm_ddl_register(env, &ddl) == 0);
   EXPECT(FindFunction(env, "db-create-table") != NULL &&
          FindFunction(env, "db-check-schema") != NULL &&
-         FindFunction(env, "db-drop-table") != NULL);
+         FindFunction(env, "db-drop-table") != NULL &&
+         FindFunction(env, "db-create-sequence") != NULL &&
+         FindFunction(env, "db-nextval") != NULL);
   if (AddUDF(env, "test-eval", "b", 1, 1, "s", test_eval, "test_eval",
              NULL) != AUE_NO_ERROR)
     exit(2);
@@ -793,6 +870,318 @@ static void test_search_path(void) {
   sql("DROP SCHEMA ddl_second CASCADE");
 }
 
+#define NO_RULE(udf)                                                       \
+  "clpdaemon: " udf ": only a rule of a rule package may call it (no rule " \
+  "is executing)"
+
+/* db-create-sequence and db-nextval (T9c): only a rule of a rule package,
+ * only the aliases its definition maps (any version); owned sequences
+ * only are created; values 1, 2, 3 ... shared by the versions that map
+ * the sequence; a refused call leaves the sequence as it is. */
+static void test_sequences(void) {
+  static const char *const order_missing =
+      "clpdaemon: db-nextval: sequence alias 'order_no': sequence "
+      "'shop_order_no_seq' does not exist";
+  /* Outside a rule, or from a module that is no package. */
+  EXPECT(fails("(db-create-sequence shop@1::order_no)",
+               NO_RULE("db-create-sequence")));
+  EXPECT(fails("(db-nextval shop@1::order_no)", NO_RULE("db-nextval")));
+  SetCurrentModule(env, FindDefmodule(env, "shop@1"));
+  EXPECT(fails("(db-nextval order_no)", NO_RULE("db-nextval")));
+  SetCurrentModule(env, FindDefmodule(env, "MAIN"));
+  EXPECT(fails_in("notpkg", "(db-create-sequence shop@1::order_no)",
+                  "clpdaemon: db-create-sequence: only a rule of a rule "
+                  "package may call it (rule 'ddl-call' is in module "
+                  "'notpkg')"));
+  EXPECT(fails_in("notpkg", "(db-nextval shop@1::order_no)",
+                  "clpdaemon: db-nextval: only a rule of a rule package may "
+                  "call it (rule 'ddl-call' is in module 'notpkg')"));
+  EXPECT(seq_state("shop_order_no_seq") == -1);
+  /* Not created yet (SQLite: not even the counter table). */
+  EXPECT(fails_in("shop@1", "(db-nextval order_no)", order_missing));
+  /* Alias resolution. */
+  EXPECT(fails_in("shop@3", "(db-nextval order_no)",
+                  "clpdaemon: db-nextval: sequence alias 'order_no' is "
+                  "mapped by shop@1, shop@2: qualify it as "
+                  "<package>::order_no"));
+  EXPECT(fails_in("shop@3", "(db-create-sequence order_no)",
+                  "clpdaemon: db-create-sequence: sequence alias 'order_no' "
+                  "is mapped by shop@1, shop@2: qualify it as "
+                  "<package>::order_no"));
+  EXPECT(fails_in("solo@1", "(db-nextval order_no)",
+                  "clpdaemon: db-nextval: sequence alias 'order_no' is not "
+                  "mapped by definition solo of the calling rule (mapped by "
+                  "shop@1, shop@2)"));
+  EXPECT(fails_in("solo@1", "(db-create-sequence shop@2::order_no)",
+                  "clpdaemon: db-create-sequence: sequence alias "
+                  "'shop@2::order_no' is not mapped by definition solo of "
+                  "the calling rule (mapped by shop@2)"));
+  EXPECT(fails_in("shop@1", "(db-nextval solo@1::ticket_no)",
+                  "clpdaemon: db-nextval: sequence alias 'solo@1::ticket_no' "
+                  "is not mapped by definition shop of the calling rule "
+                  "(mapped by solo@1)"));
+  EXPECT(fails_in("shop@1", "(db-nextval nothing)",
+                  "clpdaemon: db-nextval: unknown sequence alias 'nothing' "
+                  "(no loaded package maps it)"));
+  EXPECT(fails_in("shop@1", "(db-nextval shop@3::order_no)",
+                  "clpdaemon: db-nextval: unknown sequence alias "
+                  "'shop@3::order_no' (no loaded package maps it)"));
+  /* A template name is no sequence alias, and an alias no template. */
+  EXPECT(fails_in("shop@1", "(db-create-sequence order)",
+                  "clpdaemon: db-create-sequence: unknown sequence alias "
+                  "'order' (no loaded package maps it)"));
+  EXPECT(fails_in("shop@1", "(db-create-table order_no)",
+                  "clpdaemon: db-create-table: unknown template 'order_no' "
+                  "(no loaded package maps it)"));
+  EXPECT(fails("(db-check-schema shop@1::order_no)",
+               "clpdaemon: db-check-schema: unknown template "
+               "'shop@1::order_no' (no loaded package maps it)"));
+  /* A sequence that is not owned is never created. */
+  EXPECT(fails_in("shop@1", "(db-create-sequence legacy)",
+                  "clpdaemon: db-create-sequence: sequence alias 'legacy': "
+                  "sequence 'crm_legacy_seq' is not owned (owned = no), so "
+                  "it is never created"));
+  EXPECT(seq_state("shop_order_no_seq") == -1 &&
+         seq_state("crm_legacy_seq") == -1);
+  /* Created once; IF NOT EXISTS from any version. */
+  EXPECT(ok_true_in("shop@1", "(db-create-sequence order_no)"));
+  EXPECT(seq_state("shop_order_no_seq") == 0);
+  EXPECT(ok_true_in("shop@2", "(db-create-sequence order_no)"));
+  EXPECT(ok_true_in("shop@3", "(db-create-sequence shop@1::order_no)"));
+  EXPECT(seq_state("shop_order_no_seq") == 0);
+  /* One sequence for the versions that map it. */
+  EXPECT(int_in("shop@1", "(db-nextval order_no)", 1));
+  EXPECT(int_in("shop@2", "(db-nextval order_no)", 2));
+  EXPECT(int_in("shop@3", "(db-nextval shop@2::order_no)", 3));
+  EXPECT(int_in("shop@2", "(db-nextval \"shop@1::order_no\")", 4));
+  /* Creating it again keeps the value. */
+  EXPECT(ok_true_in("shop@1", "(db-create-sequence order_no)"));
+  EXPECT(seq_state("shop_order_no_seq") == 4);
+  /* Refused calls do not advance it. */
+  EXPECT(fails("(db-nextval shop@1::order_no)", NO_RULE("db-nextval")));
+  EXPECT(fails_in("solo@1", "(db-nextval shop@1::order_no)",
+                  "clpdaemon: db-nextval: sequence alias 'shop@1::order_no' "
+                  "is not mapped by definition solo of the calling rule "
+                  "(mapped by shop@1)"));
+  EXPECT(fails_in("shop@3", "(db-nextval order_no)",
+                  "clpdaemon: db-nextval: sequence alias 'order_no' is "
+                  "mapped by shop@1, shop@2: qualify it as "
+                  "<package>::order_no"));
+  EXPECT(seq_state("shop_order_no_seq") == 4);
+  EXPECT(int_in("shop@1", "(db-nextval order_no)", 5));
+  /* Another definition's sequence counts on its own. */
+  EXPECT(ok_true_in("solo@1", "(db-create-sequence ticket_no)"));
+  EXPECT(int_in("solo@1", "(db-nextval ticket_no)", 1));
+  EXPECT(seq_state("shop_order_no_seq") == 5);
+  /* A sequence that is not owned: missing until another system creates
+   * it, then used as it is. */
+  EXPECT(fails_in("shop@1", "(db-nextval legacy)",
+                  "clpdaemon: db-nextval: sequence alias 'legacy': sequence "
+                  "'crm_legacy_seq' does not exist"));
+  sql(pg ? "CREATE SEQUENCE crm_legacy_seq START 40"
+         : "INSERT INTO clpd_sequence VALUES ('crm_legacy_seq', 39)");
+  EXPECT(int_in("shop@2", "(db-nextval legacy)", 40));
+  /* Overflow: an error, the value stays at the maximum. */
+  sql(pg ? "ALTER SEQUENCE crm_legacy_seq RESTART WITH 9223372036854775807"
+         : "UPDATE clpd_sequence SET value = 9223372036854775806 WHERE name = "
+           "'crm_legacy_seq'");
+  EXPECT(int_in("shop@1", "(db-nextval legacy)", INT64_MAX));
+  EXPECT(fails_in("shop@1", "(db-nextval legacy)",
+                  pg ? "clpdaemon: db-nextval: sequence alias 'legacy': "
+                       "sequence 'crm_legacy_seq': nextval: reached maximum "
+                       "value of sequence \"?\" (9223372036854775807) "
+                       "(SQLSTATE 2200H)"
+                     : "clpdaemon: db-nextval: sequence alias 'legacy': "
+                       "sequence 'crm_legacy_seq' has reached its maximum "
+                       "value"));
+  EXPECT(seq_state("crm_legacy_seq") == INT64_MAX);
+  /* SQLite: a counter row deleted by someone else is a missing sequence. */
+  if (!pg) {
+    sql("DELETE FROM clpd_sequence WHERE name = 'crm_legacy_seq'");
+    EXPECT(fails_in("shop@1", "(db-nextval legacy)",
+                    "clpdaemon: db-nextval: sequence alias 'legacy': "
+                    "sequence 'crm_legacy_seq' does not exist"));
+    EXPECT(seq_state("crm_legacy_seq") == -1);
+  }
+  EXPECT(!clpd_db_in_transaction(db));
+}
+
+/* Two connections (two daemons on one database) never get the same
+ * value. */
+static void test_two_connections(void) {
+  clpd_db *other = NULL;
+  char msg[512];
+  long long first;
+  int i;
+  if (clpd_db_open(db_spec, &other, msg, sizeof msg) != CLPD_DB_OK) {
+    fprintf(stderr, "orm_ddl_test: second connection: %s\n", msg);
+    failures++;
+    return;
+  }
+  first = seq_state("shop_order_no_seq") + 1;
+  for (i = 0; i < 6; i++) {
+    ddl.db = i % 2 == 0 ? db : other;
+    EXPECT(int_in(i % 3 == 0 ? "shop@1" : "shop@2", "(db-nextval order_no)",
+                  first + i));
+  }
+  ddl.db = db;
+  EXPECT(seq_state("shop_order_no_seq") == first + 5);
+  clpd_db_close(other);
+}
+
+/* The database-error paths of db-create-sequence and db-nextval: FALSE,
+ * one line with the database message, the value unchanged. */
+static void test_sequence_db_errors(void) {
+  static const char *const create_prefix =
+      "clpdaemon: db-create-sequence: sequence alias 'ticket_no': sequence "
+      "'solo_ticket_no_seq': ";
+  static const char *const next_prefix =
+      "clpdaemon: db-nextval: sequence alias 'ticket_no': sequence "
+      "'solo_ticket_no_seq': ";
+  long long before = seq_state("solo_ticket_no_seq");
+  fail_sql = pg ? "CREATE SEQUENCE" : "CREATE TABLE IF NOT EXISTS";
+  EXPECT(fails_db("solo@1", "(db-create-sequence ticket_no)", create_prefix));
+  if (!pg) {
+    fail_sql = "INSERT";
+    EXPECT(fails_db("solo@1", "(db-create-sequence ticket_no)",
+                    create_prefix));
+  } else {
+    fail_sql = "current_schema()";
+    EXPECT(fails_db("solo@1", "(db-create-sequence ticket_no)",
+                    create_prefix));
+    fail_sql = "current_schema()";
+    EXPECT(fails_db("solo@1", "(db-nextval ticket_no)", next_prefix));
+  }
+  fail_sql = pg ? "nextval" : "UPDATE";
+  EXPECT(fails_db("solo@1", "(db-nextval ticket_no)", next_prefix));
+  EXPECT(seq_state("solo_ticket_no_seq") == before);
+  EXPECT(int_in("solo@1", "(db-nextval ticket_no)", before + 1));
+  EXPECT(!clpd_db_in_transaction(db));
+}
+
+/* PostgreSQL: the sequence is created in and read from current_schema(),
+ * never a same-named sequence of a later search_path schema; without a
+ * current schema both functions are errors. */
+static void test_sequence_search_path(void) {
+  static const char *const no_schema =
+      "sequence alias 'ticket_no': sequence 'solo_ticket_no_seq': no current "
+      "schema (the search_path names no existing schema)";
+  char line[512];
+  sql("DROP SCHEMA IF EXISTS seq_first CASCADE");
+  sql("DROP SCHEMA IF EXISTS seq_second CASCADE");
+  sql("CREATE SCHEMA seq_first");
+  sql("CREATE SCHEMA seq_second");
+  sql("CREATE SEQUENCE seq_second.solo_ticket_no_seq START 100");
+  sql("SET search_path = seq_first, seq_second");
+  EXPECT(fails_in("solo@1", "(db-nextval ticket_no)",
+                  "clpdaemon: db-nextval: sequence alias 'ticket_no': "
+                  "sequence 'solo_ticket_no_seq' does not exist"));
+  EXPECT(ok_true_in("solo@1", "(db-create-sequence ticket_no)"));
+  EXPECT(int_in("solo@1", "(db-nextval ticket_no)", 1));
+  sql("SET search_path = seq_missing");
+  snprintf(line, sizeof line, "clpdaemon: db-create-sequence: %s", no_schema);
+  EXPECT(fails_in("solo@1", "(db-create-sequence ticket_no)", line));
+  snprintf(line, sizeof line, "clpdaemon: db-nextval: %s", no_schema);
+  EXPECT(fails_in("solo@1", "(db-nextval ticket_no)", line));
+  sql("RESET search_path");
+  EXPECT(rows_in("seq_second", "solo_ticket_no_seq") == 1);
+  {
+    clpd_db_result *r = NULL;
+    EXPECT(clpd_db_exec(db, "SELECT is_called FROM "
+                            "seq_second.solo_ticket_no_seq", NULL, 0, &r) ==
+               CLPD_DB_OK &&
+           clpd_db_result_value(r, 0, 0)->integer == 0);
+    clpd_db_result_free(r);
+  }
+  sql("DROP SCHEMA seq_first CASCADE");
+  sql("DROP SCHEMA seq_second CASCADE");
+}
+
+/* The log of Reset with the deffacts `construct` (one function call in a
+ * slot value): no rule is executing while deffacts are evaluated. */
+static void reset_log(const char *construct, char *log, size_t cap) {
+  FILE *f = tmpfile();
+  Deffacts *d;
+  size_t n;
+  if (f == NULL || Build(env, construct) != BE_NO_ERROR) exit(2);
+  clpd_log_set(f);
+  Reset(env);
+  clpd_log_set(NULL);
+  SetEvaluationError(env, false);
+  SetHaltExecution(env, false);
+  d = FindDeffacts(env, "shop@1::probe-facts");
+  if (d == NULL || !Undeffacts(d, env)) exit(2);
+  rewind(f);
+  n = fread(log, 1, cap - 1, f);
+  log[n] = '\0';
+  fclose(f);
+}
+
+/* T9d review (L85): the functions that change the database refuse a
+ * deffacts evaluated at Reset and an Eval after a rule has run, with the
+ * exact line, and leave the table and the sequence as they are. */
+static void test_refused_outside_rules(void) {
+  static const char *const calls[][2] = {
+      {"(db-drop-table order)", NO_RULE("db-drop-table")},
+      {"(db-create-table solo@1::ticket)", NO_RULE("db-create-table")},
+      {"(db-create-sequence legacy)", NO_RULE("db-create-sequence")},
+      {"(db-nextval order_no)", NO_RULE("db-nextval")},
+      {"(db-create-sequence solo@1::ticket_no)",
+       NO_RULE("db-create-sequence")}};
+  long long order_no, ticket_no;
+  size_t i;
+  ddl.allow_drop = 1;
+  EXPECT(ok_true_in("shop@1", "(db-create-table order)"));
+  sql("INSERT INTO shop_order (wf_id, line_no, status, price) VALUES "
+      "('w9', 9, 'kept', '1')");
+  if (pg) sql("DROP SEQUENCE solo_ticket_no_seq");
+  else sql("DELETE FROM clpd_sequence WHERE name = 'solo_ticket_no_seq'");
+  order_no = seq_state("shop_order_no_seq");
+  EXPECT(order_no > 0 && rows("shop_order") == 1 &&
+         rows("solo_ticket") == -1);
+  if (Build(env, "(deftemplate shop@1::probe (slot v))") != BE_NO_ERROR)
+    exit(2);
+  for (i = 0; i < sizeof calls / sizeof calls[0]; i++) {
+    char construct[512], log[2048], want[512];
+    snprintf(construct, sizeof construct,
+             "(deffacts shop@1::probe-facts (probe (v %s)))", calls[i][0]);
+    reset_log(construct, log, sizeof log);
+    snprintf(want, sizeof want, "%s\n", calls[i][1]);
+    EXPECT(same(construct, log, want));
+  }
+  /* A rule of the package has run; none is executing now. */
+  {
+    call_result c;
+    call_in("shop@1", "(db-check-schema order)", &c);
+    EXPECT(c.ran && c.kind == 'M' && c.log[0] == '\0');
+  }
+  for (i = 0; i < sizeof calls / sizeof calls[0]; i++)
+    EXPECT(fails(calls[i][0], calls[i][1]));
+  EXPECT(rows("shop_order") == 1 && rows("solo_ticket") == -1);
+  EXPECT(seq_state("shop_order_no_seq") == order_no);
+  EXPECT(seq_state("solo_ticket_no_seq") == -1 &&
+         seq_state("crm_legacy_seq") == (pg ? INT64_MAX : -1));
+  ticket_no = 0;
+  EXPECT(int_in("shop@1", "(db-nextval order_no)", order_no + 1));
+  EXPECT(ok_true_in("solo@1", "(db-create-sequence ticket_no)"));
+  EXPECT(int_in("solo@1", "(db-nextval ticket_no)", ticket_no + 1));
+  ddl.allow_drop = 0;
+}
+
+/* SQLite: the linked library supports UPDATE ... RETURNING (3.35.0). */
+static void test_sqlite_version(void) {
+  clpd_db_result *r = NULL;
+  int major = 0, minor = 0;
+  EXPECT(clpd_db_exec(db, "SELECT sqlite_version()", NULL, 0, &r) ==
+         CLPD_DB_OK);
+  if (r == NULL) return;
+  EXPECT(sscanf(clpd_db_result_value(r, 0, 0)->data, "%d.%d", &major,
+                &minor) == 2 &&
+         (major > 3 || (major == 3 && minor >= 35)));
+  printf("sqlite %s\n", (const char *)clpd_db_result_value(r, 0, 0)->data);
+  clpd_db_result_free(r);
+}
+
 int main(int argc, char **argv) {
   char spec[sizeof root + 32];
   if (argc != 1 && argc != 3) {
@@ -818,6 +1207,12 @@ int main(int argc, char **argv) {
   test_db_error_paths();
   test_lookup_case();
   if (pg) test_search_path();
+  test_sequences();
+  test_two_connections();
+  test_sequence_db_errors();
+  if (pg) test_sequence_search_path();
+  test_refused_outside_rules();
+  if (!pg) test_sqlite_version();
   clpd_packages_free(&pkgs);
   DestroyEnvironment(env);
   clpd_db_close(db);

@@ -1,9 +1,9 @@
-/* ORM DDL functions (T9b, T9d, docs/orm.md#ddl-functions). The SQL text
- * holds only names and types from the mapping (identifiers checked at
- * load, quoted here), the per-backend type names and, on PostgreSQL, the
- * current schema's name (quoted); catalog lookups pass the table name as a
- * parameter. Every statement runs in autocommit, at most one CREATE or
- * DROP per call. */
+/* ORM DDL and sequence functions (T9b, T9d, T9c,
+ * docs/orm.md#ddl-functions). The SQL text holds only names and types from
+ * the mapping (identifiers checked at load, quoted here), the per-backend
+ * type names and, on PostgreSQL, the current schema's name (quoted);
+ * catalog lookups and db-nextval pass the names as parameters. Every
+ * statement runs in autocommit, at most one CREATE or DROP per call. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "orm_ddl.h"
@@ -58,30 +58,77 @@ static void shown(const char *s, char *out, size_t n) {
   out[i] = '\0';
 }
 
-/* Logs "clpdaemon: <udf>: <message>" on the daemon log stream, throws the
- * CLIPS error and sets ret to FALSE, the value the function returns. */
-static void fail(UDFContext *ctx, UDFValue *ret, const char *fmt, ...) {
+/* What the name argument of a function names: a mapped template (the
+ * table functions) or a sequence alias (T9c). */
+typedef enum { NAMES_TEMPLATE, NAMES_SEQUENCE } name_kind;
+
+/* How messages call the argument and the database object it maps. */
+static const char *const argument_word[] = {"template", "sequence alias"};
+static const char *const object_word[] = {"table", "sequence"};
+
+typedef struct {
+  name_kind kind;
+  const clpd_package *pkg;
+  const clpd_orm_template *t; /* NAMES_TEMPLATE */
+  const clpd_orm_sequence *s; /* NAMES_SEQUENCE */
+  char name[NAME_SHOWN + 1];  /* the argument, as messages show it */
+} target;
+
+/* The table or sequence name of a resolved target. */
+static const char *object_of(const target *tg) {
+  return tg->kind == NAMES_TEMPLATE ? tg->t->table : tg->s->name;
+}
+
+/* Logs "clpdaemon: <udf>: [<prefix>]<message>" on the daemon log stream,
+ * throws the CLIPS error and sets ret to FALSE, the value the function
+ * returns. With a resolved target the prefix is "template '<t>': table
+ * '<table>'" or "sequence alias '<a>': sequence '<name>'". */
+static void vfail(UDFContext *ctx, UDFValue *ret, const target *tg,
+                  const char *fmt, va_list ap) {
   FILE *log = clpd_log();
-  va_list ap;
   fprintf(log, "clpdaemon: %s: ", UDFContextFunctionName(ctx));
-  va_start(ap, fmt);
+  if (tg != NULL)
+    fprintf(log, "%s '%s': %s '%s'", argument_word[tg->kind], tg->name,
+            object_word[tg->kind], object_of(tg));
   vfprintf(log, fmt, ap);
-  va_end(ap);
   fputc('\n', log);
   fflush(log);
   UDFThrowError(ctx);
   ret->lexemeValue = FalseSymbol(ctx->environment);
 }
 
-typedef struct {
-  const clpd_package *pkg;
-  const clpd_orm_template *t;
-  char name[NAME_SHOWN + 1]; /* the argument, as messages show it */
-} target;
+static void fail(UDFContext *ctx, UDFValue *ret, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vfail(ctx, ret, NULL, fmt, ap);
+  va_end(ap);
+}
+
+/* fail() with the target prefix; fmt continues it (": <message>" or
+ * " is not owned ..."). */
+static void fail_on(UDFContext *ctx, UDFValue *ret, const target *tg,
+                    const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vfail(ctx, ret, tg, fmt, ap);
+  va_end(ap);
+}
+
+static int is_pg(const clpd_db *db) {
+  return strcmp(clpd_db_backend(db), "postgresql") == 0;
+}
 
 /* A package whose every mapping check passed. */
 static int mapped(const clpd_package *p) {
   return p->orm != NULL && p->orm_templates != NULL;
+}
+
+/* The template or sequence `name` of a mapped package p, or NULL. */
+static const void *lookup(const clpd_package *p, name_kind kind,
+                          const char *name) {
+  if (!mapped(p)) return NULL;
+  if (kind == NAMES_TEMPLATE) return clpd_orm_template_of(p->orm, name);
+  return clpd_orm_sequence_of(p->orm, name);
 }
 
 /* The loaded package of module m, or NULL. */
@@ -99,17 +146,16 @@ static int in_scope(const clpd_package *p, const char *definition) {
   return definition == NULL || strcmp(p->manifest.definition, definition) == 0;
 }
 
-/* "<pkg>, <pkg>, ..." of the mapped packages mapping the template `name`
- * and, with in == 1, in the scope of `definition` (in == 0: outside it).
- * The caller frees the text. */
-static char *mappers(const clpd_packages *pkgs, const char *name,
-                     const char *definition, int in) {
+/* "<pkg>, <pkg>, ..." of the mapped packages mapping `name` (a template or
+ * an alias, per kind) and, with in == 1, in the scope of `definition`
+ * (in == 0: outside it). The caller frees the text. */
+static char *mappers(const clpd_packages *pkgs, name_kind kind,
+                     const char *name, const char *definition, int in) {
   sbuf list = {NULL, 0, 0};
   size_t i;
   for (i = 0; i < pkgs->count; i++) {
     const clpd_package *p = &pkgs->items[i];
-    if (mapped(p) && in_scope(p, definition) == in &&
-        clpd_orm_template_of(p->orm, name) != NULL) {
+    if (in_scope(p, definition) == in && lookup(p, kind, name) != NULL) {
       if (list.len > 0) put(&list, ", ");
       put(&list, p->manifest.name);
     }
@@ -117,17 +163,20 @@ static char *mappers(const clpd_packages *pkgs, const char *name,
   return list.s;
 }
 
-/* Resolves the first argument: <package>::<template>, or an unqualified
- * template of `caller` (the package whose module calls), else of the only
- * package mapping it. With a definition, only that definition's packages
- * count, and a template only other definitions map is an error of its
- * own. Returns 0 (FALSE in ret, error logged) when it cannot. */
+/* Resolves the first argument, a template or a sequence alias per kind:
+ * <package>::<name>, or an unqualified name of `caller` (the package
+ * whose module calls), else of the only package mapping it. With a
+ * definition, only that definition's packages count, and a name only
+ * other definitions map is an error of its own. Returns 0 (FALSE in ret,
+ * error logged) when it cannot. */
 static int resolve(UDFContext *ctx, UDFValue *ret, const clpd_package *caller,
-                   const char *definition, target *out) {
+                   const char *definition, name_kind kind, target *out) {
   const clpd_orm_ddl *ddl = ctx->context;
   const clpd_packages *pkgs = ddl->packages;
+  const char *word = argument_word[kind];
+  const void *item = NULL;
   UDFValue arg;
-  const char *name, *sep, *base;
+  const char *name, *sep;
   size_t i, found = 0;
 
   if (!UDFFirstArgument(ctx, LEXEME_BITS, &arg)) {
@@ -136,66 +185,65 @@ static int resolve(UDFContext *ctx, UDFValue *ret, const clpd_package *caller,
   }
   name = arg.lexemeValue->contents;
   shown(name, out->name, sizeof out->name);
+  out->kind = kind;
   out->pkg = NULL;
   out->t = NULL;
+  out->s = NULL;
   sep = strstr(name, "::");
-  base = name;
   if (sep != NULL) {
     size_t n = (size_t)(sep - name);
-    base = sep + 2;
-    for (i = 0; i < pkgs->count && out->t == NULL; i++) {
+    for (i = 0; i < pkgs->count && item == NULL; i++) {
       const clpd_package *p = &pkgs->items[i];
-      if (mapped(p) && strlen(p->manifest.name) == n &&
+      if (strlen(p->manifest.name) == n &&
           strncmp(p->manifest.name, name, n) == 0 &&
-          (out->t = clpd_orm_template_of(p->orm, base)) != NULL)
+          (item = lookup(p, kind, sep + 2)) != NULL)
         out->pkg = p;
     }
-    if (out->t != NULL && !in_scope(out->pkg, definition)) {
-      fail(ctx, ret, "template '%s' is not mapped by definition %s of the "
-                     "calling rule (mapped by %s)", out->name, definition,
+    if (item != NULL && !in_scope(out->pkg, definition)) {
+      fail(ctx, ret, "%s '%s' is not mapped by definition %s of the calling "
+                     "rule (mapped by %s)", word, out->name, definition,
            out->pkg->manifest.name);
       return 0;
     }
+  } else if (caller != NULL && (item = lookup(caller, kind, name)) != NULL) {
+    out->pkg = caller;
   } else {
-    if (caller != NULL && mapped(caller) &&
-        (out->t = clpd_orm_template_of(caller->orm, name)) != NULL) {
-      out->pkg = caller;
-      return 1;
-    }
     for (i = 0; i < pkgs->count; i++) {
       const clpd_package *p = &pkgs->items[i];
-      const clpd_orm_template *t;
-      if (mapped(p) && in_scope(p, definition) &&
-          (t = clpd_orm_template_of(p->orm, name)) != NULL) {
-        if (found++ == 0) {
-          out->pkg = p;
-          out->t = t;
-        }
+      const void *it;
+      if (in_scope(p, definition) && (it = lookup(p, kind, name)) != NULL &&
+          found++ == 0) {
+        out->pkg = p;
+        item = it;
       }
     }
     if (found > 1) {
-      char *list = mappers(pkgs, name, definition, 1);
-      fail(ctx, ret, "template '%s' is mapped by %s: qualify it as "
-                     "<package>::%s", out->name, list, out->name);
+      char *list = mappers(pkgs, kind, name, definition, 1);
+      fail(ctx, ret, "%s '%s' is mapped by %s: qualify it as <package>::%s",
+           word, out->name, list, out->name);
       free(list);
       return 0;
     }
     if (found == 0 && definition != NULL) {
-      char *list = mappers(pkgs, name, definition, 0);
+      char *list = mappers(pkgs, kind, name, definition, 0);
       if (list != NULL) {
-        fail(ctx, ret, "template '%s' is not mapped by definition %s of the "
-                       "calling rule (mapped by %s)", out->name, definition,
-             list);
+        fail(ctx, ret, "%s '%s' is not mapped by definition %s of the "
+                       "calling rule (mapped by %s)", word, out->name,
+             definition, list);
         free(list);
         return 0;
       }
     }
   }
-  if (out->t == NULL) {
-    fail(ctx, ret, "unknown template '%s' (no loaded package maps it)",
+  if (item == NULL) {
+    fail(ctx, ret, "unknown %s '%s' (no loaded package maps it)", word,
          out->name);
     return 0;
   }
+  if (kind == NAMES_TEMPLATE)
+    out->t = item;
+  else
+    out->s = item;
   return 1;
 }
 
@@ -205,15 +253,17 @@ static int resolve_any(UDFContext *ctx, UDFValue *ret, target *out) {
   const clpd_orm_ddl *ddl = ctx->context;
   return resolve(ctx, ret,
                  package_of(ddl->packages, GetCurrentModule(ctx->environment)),
-                 NULL, out);
+                 NULL, NAMES_TEMPLATE, out);
 }
 
-/* db-create-table and db-drop-table (L84): only a rule whose actions are
- * running, of a loaded package, and only the templates its definition maps
+/* The functions that change the database (db-create-table, db-drop-table,
+ * db-create-sequence, db-nextval; L84, T9c): only a rule whose actions are
+ * running, of a loaded package, and only the names its definition maps
  * (any version); an unqualified name prefers the rule's own package.
  * Anything else (the top level, a deffacts at Reset, a plugin hook, a rule
  * of another module) is refused. */
-static int resolve_own(UDFContext *ctx, UDFValue *ret, target *out) {
+static int resolve_own(UDFContext *ctx, UDFValue *ret, name_kind kind,
+                       target *out) {
   const clpd_orm_ddl *ddl = ctx->context;
   Environment *env = ctx->environment;
   Defrule *rule = EngineData(env)->ExecutingRule;
@@ -234,50 +284,48 @@ static int resolve_own(UDFContext *ctx, UDFValue *ret, target *out) {
                    "in module '%s')", rule_name, module_name);
     return 0;
   }
-  return resolve(ctx, ret, caller, caller->manifest.definition, out);
+  return resolve(ctx, ret, caller, caller->manifest.definition, kind, out);
 }
 
-/* Runs one generated statement; on failure logs it with the table. */
+/* Runs one generated statement; on failure logs it with the target. */
 static int run(UDFContext *ctx, UDFValue *ret, const target *tg,
-               const char *sql) {
+               const char *sql, const clpd_db_value *params, size_t n) {
   clpd_db *db = ((const clpd_orm_ddl *)ctx->context)->db;
-  if (clpd_db_exec(db, sql, NULL, 0, NULL) == CLPD_DB_OK) return 1;
-  fail(ctx, ret, "template '%s': table '%s': %s", tg->name, tg->t->table,
-       clpd_db_error(db));
+  if (clpd_db_exec(db, sql, params, n, NULL) == CLPD_DB_OK) return 1;
+  fail_on(ctx, ret, tg, ": %s", clpd_db_error(db));
   return 0;
 }
 
-/* Starts b with `verb` and the table name: on PostgreSQL qualified with
- * current_schema(), the schema db-check-schema inspects, so a same-named
- * table of a later search_path schema is never the one created or
- * dropped (L84); on SQLite unqualified. Returns 0 (FALSE in ret, error
- * logged) when PostgreSQL has no current schema or the query fails. */
-static int put_table(UDFContext *ctx, UDFValue *ret, const target *tg,
-                     sbuf *b, const char *verb) {
+/* Appends `verb` and the table or sequence name to b: on PostgreSQL
+ * qualified with current_schema(), the schema db-check-schema inspects, so
+ * a same-named object of a later search_path schema is never the one
+ * created, dropped or advanced (L84); on SQLite unqualified. Returns 0
+ * (FALSE in ret, error logged) when PostgreSQL has no current schema or
+ * the query fails. */
+static int put_object(UDFContext *ctx, UDFValue *ret, const target *tg,
+                      sbuf *b, const char *verb) {
   clpd_db *db = ((const clpd_orm_ddl *)ctx->context)->db;
   clpd_db_result *r = NULL;
   const clpd_db_value *v;
   put(b, verb);
-  if (strcmp(clpd_db_backend(db), "postgresql") == 0) {
+  if (is_pg(db)) {
     if (clpd_db_exec(db, "SELECT current_schema()", NULL, 0, &r) !=
         CLPD_DB_OK) {
-      fail(ctx, ret, "template '%s': table '%s': %s", tg->name, tg->t->table,
-           clpd_db_error(db));
+      fail_on(ctx, ret, tg, ": %s", clpd_db_error(db));
       return 0;
     }
     v = clpd_db_result_rows(r) == 1 ? clpd_db_result_value(r, 0, 0) : NULL;
     if (v == NULL || v->type != CLPD_DB_TEXT) {
       clpd_db_result_free(r);
-      fail(ctx, ret, "template '%s': table '%s': no current schema (the "
-                     "search_path names no existing schema)", tg->name,
-           tg->t->table);
+      fail_on(ctx, ret, tg, ": no current schema (the search_path names no "
+                            "existing schema)");
       return 0;
     }
     put_ident(b, v->data);
     put(b, ".");
     clpd_db_result_free(r);
   }
-  put_ident(b, tg->t->table);
+  put_ident(b, object_of(tg));
   return 1;
 }
 
@@ -309,16 +357,16 @@ static void create_table(Environment *env, UDFContext *ctx, UDFValue *ret) {
   target tg;
   sbuf sql = {NULL, 0, 0};
   int ok;
-  if (!resolve_own(ctx, ret, &tg)) return;
+  if (!resolve_own(ctx, ret, NAMES_TEMPLATE, &tg)) return;
   if (!tg.t->owned) {
-    fail(ctx, ret, "template '%s': table '%s' is not owned (owned = no), so "
-                   "it is never created", tg.name, tg.t->table);
+    fail_on(ctx, ret, &tg, " is not owned (owned = no), so it is never "
+                           "created");
     return;
   }
-  ok = put_table(ctx, ret, &tg, &sql, "CREATE TABLE IF NOT EXISTS ");
+  ok = put_object(ctx, ret, &tg, &sql, "CREATE TABLE IF NOT EXISTS ");
   if (ok) {
     put_create(&sql, tg.t, clpd_db_backend(ddl->db));
-    ok = run(ctx, ret, &tg, sql.s);
+    ok = run(ctx, ret, &tg, sql.s, NULL, 0);
   }
   free(sql.s);
   if (ok) ret->lexemeValue = TrueSymbol(env);
@@ -329,20 +377,145 @@ static void drop_table(Environment *env, UDFContext *ctx, UDFValue *ret) {
   target tg;
   sbuf sql = {NULL, 0, 0};
   int ok;
-  if (!resolve_own(ctx, ret, &tg)) return;
+  if (!resolve_own(ctx, ret, NAMES_TEMPLATE, &tg)) return;
   if (!ddl->allow_drop) {
     fail(ctx, ret, "dropping tables is disabled (orm_allow_drop = no)");
     return;
   }
   if (!tg.t->owned) {
-    fail(ctx, ret, "template '%s': table '%s' is not owned (owned = no), so "
-                   "it is never dropped", tg.name, tg.t->table);
+    fail_on(ctx, ret, &tg, " is not owned (owned = no), so it is never "
+                           "dropped");
     return;
   }
-  ok = put_table(ctx, ret, &tg, &sql, "DROP TABLE IF EXISTS ") &&
-       run(ctx, ret, &tg, sql.s);
+  ok = put_object(ctx, ret, &tg, &sql, "DROP TABLE IF EXISTS ") &&
+       run(ctx, ret, &tg, sql.s, NULL, 0);
   free(sql.s);
   if (ok) ret->lexemeValue = TrueSymbol(env);
+}
+
+/* SQLite stands in for sequences with one counter row per sequence name
+ * (T9c): value is the last value db-nextval returned, 0 before the first,
+ * like a PostgreSQL sequence with its defaults (START 1, INCREMENT 1). */
+#define LITE_COUNTERS                                                      \
+  "CREATE TABLE IF NOT EXISTS \"clpd_sequence\" (\"name\" TEXT PRIMARY "  \
+  "KEY, \"value\" INTEGER NOT NULL)"
+#define LITE_COUNTER_ROW                                                   \
+  "INSERT INTO \"clpd_sequence\" (\"name\", \"value\") VALUES ($1, 0) ON " \
+  "CONFLICT (\"name\") DO NOTHING"
+/* One statement; the guard leaves a row at the INT64 maximum unchanged
+ * (SQLite would turn the sum into a REAL) and returns no row. */
+#define LITE_NEXTVAL                                                       \
+  "UPDATE \"clpd_sequence\" SET \"value\" = \"value\" + 1 WHERE \"name\" = " \
+  "$1 AND \"value\" < 9223372036854775807 RETURNING \"value\""
+
+static void create_sequence(Environment *env, UDFContext *ctx,
+                            UDFValue *ret) {
+  const clpd_orm_ddl *ddl = ctx->context;
+  target tg;
+  sbuf sql = {NULL, 0, 0};
+  clpd_db_value name;
+  int ok;
+  if (!resolve_own(ctx, ret, NAMES_SEQUENCE, &tg)) return;
+  if (!tg.s->owned) {
+    fail_on(ctx, ret, &tg, " is not owned (owned = no), so it is never "
+                           "created");
+    return;
+  }
+  if (is_pg(ddl->db)) {
+    ok = put_object(ctx, ret, &tg, &sql, "CREATE SEQUENCE IF NOT EXISTS ") &&
+         run(ctx, ret, &tg, sql.s, NULL, 0);
+  } else {
+    name = clpd_db_text(tg.s->name);
+    ok = run(ctx, ret, &tg, LITE_COUNTERS, NULL, 0) &&
+         run(ctx, ret, &tg, LITE_COUNTER_ROW, &name, 1);
+  }
+  free(sql.s);
+  if (ok) ret->lexemeValue = TrueSymbol(env);
+}
+
+/* 1 when the target's sequence exists (PostgreSQL: a relation of that
+ * name in current_schema(); SQLite: the counter table and its row), 0
+ * when it does not, -1 when the lookup itself fails. */
+static int sequence_exists(clpd_db *db, const target *tg) {
+  static const char *const pg_relation =
+      "SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON "
+      "n.oid = c.relnamespace WHERE n.nspname = current_schema() AND "
+      "c.relname = $1";
+  static const char *const lite_counters =
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = "
+      "'clpd_sequence' COLLATE NOCASE";
+  static const char *const lite_row =
+      "SELECT 1 FROM \"clpd_sequence\" WHERE \"name\" = $1";
+  clpd_db_value name = clpd_db_text(tg->s->name);
+  clpd_db_result *r = NULL;
+  int found;
+  if (is_pg(db)) {
+    if (clpd_db_exec(db, pg_relation, &name, 1, &r) != CLPD_DB_OK) return -1;
+  } else {
+    if (clpd_db_exec(db, lite_counters, NULL, 0, &r) != CLPD_DB_OK) return -1;
+    found = clpd_db_result_rows(r) > 0;
+    clpd_db_result_free(r);
+    r = NULL;
+    if (!found) return 0;
+    if (clpd_db_exec(db, lite_row, &name, 1, &r) != CLPD_DB_OK) return -1;
+  }
+  found = clpd_db_result_rows(r) > 0;
+  clpd_db_result_free(r);
+  return found;
+}
+
+/* db-nextval: one statement advances the sequence and returns the value;
+ * PostgreSQL nextval($1) with the schema-qualified quoted name as a TEXT
+ * parameter, SQLite LITE_NEXTVAL. A failure or no value is explained by
+ * looking the sequence up: missing, the SQLite maximum, or the database's
+ * message. */
+static void next_value(Environment *env, UDFContext *ctx, UDFValue *ret) {
+  const clpd_orm_ddl *ddl = ctx->context;
+  int pg = is_pg(ddl->db);
+  target tg;
+  sbuf qualified = {NULL, 0, 0};
+  clpd_db_result *r = NULL;
+  const clpd_db_value *v = NULL;
+  clpd_db_value param;
+  clpd_db_status st;
+  char error[1024];
+  int exists;
+
+  if (!resolve_own(ctx, ret, NAMES_SEQUENCE, &tg)) return;
+  if (pg) {
+    if (!put_object(ctx, ret, &tg, &qualified, "")) {
+      free(qualified.s);
+      return;
+    }
+    param = clpd_db_text(qualified.s);
+    st = clpd_db_exec(ddl->db, "SELECT nextval($1)", &param, 1, &r);
+  } else {
+    param = clpd_db_text(tg.s->name);
+    st = clpd_db_exec(ddl->db, LITE_NEXTVAL, &param, 1, &r);
+  }
+  free(qualified.s);
+  if (st == CLPD_DB_OK && clpd_db_result_rows(r) == 1)
+    v = clpd_db_result_value(r, 0, 0);
+  if (v != NULL && v->type == CLPD_DB_INTEGER) {
+    ret->integerValue = CreateInteger(env, v->integer);
+    clpd_db_result_free(r);
+    return;
+  }
+  clpd_db_result_free(r);
+  if (v != NULL) {
+    fail_on(ctx, ret, &tg, ": the database returned no INTEGER");
+    return;
+  }
+  snprintf(error, sizeof error, "%s", clpd_db_error(ddl->db));
+  exists = sequence_exists(ddl->db, &tg);
+  if (exists == 0)
+    fail_on(ctx, ret, &tg, " does not exist");
+  else if (st != CLPD_DB_OK)
+    fail_on(ctx, ret, &tg, ": %s", error);
+  else if (exists < 0)
+    fail_on(ctx, ret, &tg, ": %s", clpd_db_error(ddl->db));
+  else
+    fail_on(ctx, ret, &tg, " has reached its maximum value");
 }
 
 /* SQLite column affinity of a declared type (the rules of "Datatypes In
@@ -421,8 +594,7 @@ static void check_schema(Environment *env, UDFContext *ctx, UDFValue *ret) {
   param = clpd_db_text(tg.t->table);
   if (clpd_db_exec(ddl->db, pg ? pg_table : lite_table, &param, 1, &r) !=
       CLPD_DB_OK) {
-    fail(ctx, ret, "template '%s': table '%s': %s", tg.name, tg.t->table,
-         clpd_db_error(ddl->db));
+    fail_on(ctx, ret, &tg, ": %s", clpd_db_error(ddl->db));
     return;
   }
   mb = CreateMultifieldBuilder(env, 4);
@@ -434,8 +606,7 @@ static void check_schema(Environment *env, UDFContext *ctx, UDFValue *ret) {
     if (clpd_db_exec(ddl->db, pg ? pg_columns : lite_columns, &param, 1, &r) !=
         CLPD_DB_OK) {
       MBDispose(mb);
-      fail(ctx, ret, "template '%s': table '%s': %s", tg.name, tg.t->table,
-           clpd_db_error(ddl->db));
+      fail_on(ctx, ret, &tg, ": %s", clpd_db_error(ddl->db));
       return;
     }
     for (i = 0; i < tg.t->column_count; i++) {
@@ -477,7 +648,11 @@ int clpd_orm_ddl_register(Environment *env, clpd_orm_ddl *ddl) {
       AddUDF(env, "db-check-schema", "bm", 1, 1, "sy", check_schema,
              "clpd_orm_check_schema", ddl) != AUE_NO_ERROR ||
       AddUDF(env, "db-drop-table", "b", 1, 1, "sy", drop_table,
-             "clpd_orm_drop_table", ddl) != AUE_NO_ERROR)
+             "clpd_orm_drop_table", ddl) != AUE_NO_ERROR ||
+      AddUDF(env, "db-create-sequence", "b", 1, 1, "sy", create_sequence,
+             "clpd_orm_create_sequence", ddl) != AUE_NO_ERROR ||
+      AddUDF(env, "db-nextval", "bl", 1, 1, "sy", next_value,
+             "clpd_orm_nextval", ddl) != AUE_NO_ERROR)
     return -1;
   return 0;
 }

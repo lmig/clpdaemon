@@ -139,6 +139,10 @@ const char *clpd_orm_type_fits_list(clpd_orm_sql_type t, char *buf,
 const clpd_orm_template *clpd_orm_template_of(const clpd_orm *orm,
                                               const char *name);
 
+/* The sequence of orm whose alias is `alias`, or NULL (T9c). */
+const clpd_orm_sequence *clpd_orm_sequence_of(const clpd_orm *orm,
+                                              const char *alias);
+
 /* Compares the tables a and b map (versions of one definition sharing a
  * table, docs/orm.md): the owned flag, the primary key columns in order,
  * and every column with its sql type and NOT NULL (null policy error or
