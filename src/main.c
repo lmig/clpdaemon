@@ -1,8 +1,9 @@
-/* clpdaemon entry point: command line, configuration (T2), plugins (T6)
- * and the event loop running engine cycles (T3). */
+/* clpdaemon entry point: command line, configuration (T2), plugins (T6),
+ * the database (T8d) and the event loop running engine cycles (T3). */
 #include "admin.h"
 #include "clips_trace.h"
 #include "config.h"
+#include "db.h"
 #include "engine.h"
 #include "fdcapture.h"
 #include "ingest.h"
@@ -119,8 +120,9 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   return sig < 0 ? 1 : 0;
 }
 
-/* Startup after the configuration (FR-2): trace files, environment,
- * plugins (load and init), rule packages, then either the --check report or
+/* Startup after the configuration (FR-2): trace files, environment, the
+ * database when one is configured (docs/database.md), plugins (load and
+ * init), rule packages, then either the --check report or
  * the admin socket (FR-20, unless admin_socket = none), the trace hooks, the plugins' after_load, Reset
  * once and the event loop; the socket file is removed on every path after
  * it was created.
@@ -130,13 +132,14 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
  * asserts are traced. With a trace, fds 1 and 2 are captured into it from
  * Reset until the plugins are shut down (FR-16); the daemon log stream
  * (src/log.h) is then the original stderr. Teardown (docs/plugins.md): the
- * plugins' shutdown while the environment exists, the environment, then the
- * plugin libraries. */
+ * plugins' shutdown while the environment exists, the environment, the
+ * database, then the plugin libraries. */
 static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_packages packages = {NULL, 0};
   clpd_plugins *plugins = NULL;
   clpd_clips_trace *ct = NULL;
   clpd_admin *admin = NULL;
+  clpd_db *db = NULL;
   clpd_engine *engine;
   clpd_trace *trace;
   int rc;
@@ -159,6 +162,17 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     fputs("clpdaemon: cannot create the CLIPS environment\n", clpd_log());
     clpd_trace_close(trace);
     return 1;
+  }
+  /* Before the plugins' init, also under --check. The message never holds
+   * the spec, which may name a user or host but never a password. */
+  if (cfg->database != NULL) {
+    char msg[512];
+    if (clpd_db_open(cfg->database, &db, msg, sizeof msg) != CLPD_DB_OK) {
+      fprintf(clpd_log(), "clpdaemon: cannot open the database: %s\n", msg);
+      clpd_engine_destroy(engine);
+      clpd_trace_close(trace);
+      return 1;
+    }
   }
   rc = clpd_plugins_load(clpd_engine_env(engine), &cfg->plugins, cfg->node_id,
                          &plugins, clpd_log());
@@ -210,6 +224,7 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_clips_trace_detach(ct);
   clpd_packages_free(&packages);
   clpd_engine_destroy(engine);
+  clpd_db_close(db); /* NULL when no database is configured */
   clpd_plugins_close(plugins);
   clpd_trace_close(trace);
   return rc;
