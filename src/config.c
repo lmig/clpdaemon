@@ -37,6 +37,8 @@ enum {
   KEY_PLUGINS,
   KEY_DATABASE,
   KEY_ORM_ALLOW_DROP,
+  KEY_CYCLE_RETRY_INITIAL,
+  KEY_CYCLE_RETRY_MAX,
   KEY_COUNT
 };
 
@@ -49,13 +51,15 @@ static const char *const key_names[KEY_COUNT] = {
     "trace_jsonl",
     "watch",            "packages",                "plugins",
     "database",         "orm_allow_drop",
+    "cycle_retry_initial_ms", "cycle_retry_max_ms",
 };
 
 static const key_kind key_kinds[KEY_COUNT] = {
     K_NODE_ID,     K_POSITIVE,      K_NON_NEGATIVE,  K_MAX_RULES,
     K_POSITIVE,    K_DURATION,      K_PATH,          K_MODE,
     K_OPTIONAL_PATH, K_OPTIONAL_PATH, K_WATCH,       K_PATH_LIST,
-    K_PATH_LIST,   K_DATABASE,      K_YES_NO,
+    K_PATH_LIST,   K_DATABASE,      K_YES_NO,        K_POSITIVE,
+    K_POSITIVE,
 };
 
 typedef struct {
@@ -237,6 +241,8 @@ static int apply(clpd_kv *kv, int key, char *value, clpd_config *cfg) {
   case KEY_MAX_RULES: cfg->max_rules_per_cycle = (int)v; break;
   case KEY_SAFETY_POLL: cfg->safety_poll_interval_ms = (int)v; break;
   case KEY_ORM_ALLOW_DROP: cfg->orm_allow_drop = (int)v; break;
+  case KEY_CYCLE_RETRY_INITIAL: cfg->cycle_retry_initial_ms = (int)v; break;
+  case KEY_CYCLE_RETRY_MAX: cfg->cycle_retry_max_ms = (int)v; break;
   default: break;
   }
   return 1;
@@ -257,6 +263,8 @@ static void set_defaults(clpd_config *cfg) {
   cfg->idle_eviction_after_s = CLPD_DEFAULT_IDLE_EVICTION_AFTER_S;
   cfg->admin_socket = clpd_strdup(CLPD_DEFAULT_ADMIN_SOCKET);
   cfg->admin_socket_mode = CLPD_DEFAULT_ADMIN_SOCKET_MODE;
+  cfg->cycle_retry_initial_ms = CLPD_DEFAULT_CYCLE_RETRY_INITIAL_MS;
+  cfg->cycle_retry_max_ms = CLPD_DEFAULT_CYCLE_RETRY_MAX_MS;
   cfg->watch_facts = 1;
   cfg->watch_rules = 1;
 }
@@ -283,6 +291,14 @@ int clpd_config_load(const char *path, clpd_config *cfg, FILE *err) {
             "clpdaemon: %s: cycle_min_interval_ms (%d) must not exceed "
             "tick_interval_ms (%d)\n",
             path, cfg->cycle_min_interval_ms, cfg->tick_interval_ms);
+    errors++;
+  }
+  if (st.valid[KEY_CYCLE_RETRY_INITIAL] && st.valid[KEY_CYCLE_RETRY_MAX] &&
+      cfg->cycle_retry_initial_ms > cfg->cycle_retry_max_ms) {
+    fprintf(err,
+            "clpdaemon: %s: cycle_retry_initial_ms (%d) must not exceed "
+            "cycle_retry_max_ms (%d)\n",
+            path, cfg->cycle_retry_initial_ms, cfg->cycle_retry_max_ms);
     errors++;
   }
   return errors != 0;

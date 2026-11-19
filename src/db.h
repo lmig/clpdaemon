@@ -20,12 +20,15 @@
  *   clpd_db_rollback outside one are CLPD_DB_ERROR. Commit ends the
  *   transaction even when it fails (a failed commit is rolled back). After
  *   an error inside a transaction the only portable call is rollback (on
- *   PostgreSQL the transaction is aborted). Transaction-control SQL must
- *   not be passed to clpd_db_exec.
+ *   PostgreSQL the transaction is aborted), unless it was opened with
+ *   clpd_db_begin_atomic, which behaves the same on both backends.
+ *   Transaction-control SQL must not be passed to clpd_db_exec.
  * - Errors: clpd_db_error returns the last message, one line, never
  *   containing the spec. CLPD_DB_UNIQUE is a unique or primary-key
  *   violation; CLPD_DB_LOST means the connection is gone (the retry policy
- *   belongs to the caller, FR-26) and any open transaction is over.
+ *   belongs to the caller, FR-26; clpd_db_reconnect reopens it) and any
+ *   open transaction is over (an atomic one still needs its commit or
+ *   rollback call).
  * - Results: clpd_db_exec copies every row into a clpd_db_result owned by
  *   the caller, freed with clpd_db_result_free. Names and values returned
  *   by the accessors stay valid until that result is freed, independent of
@@ -95,9 +98,31 @@ clpd_db_status clpd_db_exec(clpd_db *db, const char *sql,
                             clpd_db_result **result);
 
 clpd_db_status clpd_db_begin(clpd_db *db);
+/* Opens an all-or-nothing transaction (the daemon's cycle transaction,
+ * T10a): like clpd_db_begin, but the first clpd_db_exec that fails (any
+ * status but CLPD_DB_OK, a rejected statement or parameter included)
+ * rolls the transaction back at once, on every backend (SQLite would keep
+ * the statements that succeeded). Every later clpd_db_exec runs nothing
+ * and returns CLPD_DB_ERROR with the message "the transaction was rolled
+ * back after an earlier error"; clpd_db_commit then ends the transaction
+ * and returns the status of that first failure with its message, and
+ * clpd_db_rollback ends it with CLPD_DB_OK. clpd_db_in_transaction is 1
+ * until commit or rollback, also after a lost connection. */
+clpd_db_status clpd_db_begin_atomic(clpd_db *db);
 clpd_db_status clpd_db_commit(clpd_db *db);
 clpd_db_status clpd_db_rollback(clpd_db *db);
 int clpd_db_in_transaction(const clpd_db *db);
+
+/* Replaces the connection of db with a new one opened with spec (the spec
+ * db was opened with), keeping the handle, for example after
+ * CLPD_DB_LOST. An open transaction is rolled back first (abandoned when
+ * the connection is gone). On failure msg holds a one-line message (never
+ * the spec) and db stays without a connection: every call but
+ * clpd_db_reconnect, clpd_db_close, clpd_db_backend and clpd_db_error
+ * returns CLPD_DB_LOST with "not connected to the database" until a
+ * reconnect succeeds. */
+clpd_db_status clpd_db_reconnect(clpd_db *db, const char *spec, char *msg,
+                                 size_t n);
 
 /* Last error message, one line ("" when none). */
 const char *clpd_db_error(const clpd_db *db);

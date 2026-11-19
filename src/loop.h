@@ -36,6 +36,14 @@ clpd_loop *clpd_loop_open(int tick_ms, int min_ms, FILE *log);
  * writes to the loop's eventfd, which is thread-safe (the ingest queue
  * calls it from the posting thread, src/ingest.h). */
 void clpd_loop_notify(clpd_loop *l);
+/* From a cycle callback (T10a, the retry of a failed cycle transaction):
+ * the next cycle starts delay_ms after this call, neither sooner (a tick
+ * or a notification in between waits; the notification is kept for that
+ * cycle) nor later. Meanwhile the loop keeps reading the signals (a stop
+ * still ends it at once) and serving the registered fds. The next cycle
+ * runs on the normal schedule again unless it defers too. A delay_ms
+ * below 1 means the next loop iteration. */
+void clpd_loop_defer(clpd_loop *l, int delay_ms);
 /* Called on SIGHUP after its message is logged (trace reopen). */
 void clpd_loop_on_hup(clpd_loop *l, clpd_hup_fn *fn, void *ctx);
 /* Registers fd, polled for events (POLLIN and/or POLLOUT) while the loop

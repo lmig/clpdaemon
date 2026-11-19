@@ -14,6 +14,9 @@
 /* The table that stands in for sequences on SQLite (T9c), reserved on
  * every backend: no mapping may name it (T9e). */
 #define CLPD_ORM_SEQUENCE_TABLE "clpd_sequence"
+/* The daemon's table of workflow instances (T10a), created at startup and
+ * reserved on every backend like CLPD_ORM_SEQUENCE_TABLE. */
+#define CLPD_ORM_INSTANCE_TABLE "workflow_instance"
 
 /* Logical SQL types; each backend has its own type names (T9b). */
 typedef enum {
@@ -45,6 +48,14 @@ typedef enum {
   CLPD_ORM_NULL_COUNT
 } clpd_orm_null;
 
+/* `<tpl>.sync` (T10a, L90): auto, the cycle writes the template's facts
+ * itself (T10b); manual, only the DML functions write them (T10d). */
+typedef enum {
+  CLPD_ORM_SYNC_AUTO = 0, /* the default */
+  CLPD_ORM_SYNC_MANUAL,
+  CLPD_ORM_SYNC_COUNT
+} clpd_orm_sync;
+
 /* One `<tpl>.slot.<slot> = <column> <sql-type> <clips-type> <null>` line. */
 typedef struct {
   char *slot;
@@ -67,13 +78,14 @@ typedef struct {
   char *table; /* identifier */
   int owned;   /* 1: the daemon may create (and, if allowed, drop) it */
   clpd_list key; /* local key slots in order, without wf-id (may be empty) */
+  clpd_orm_sync sync; /* CLPD_ORM_SYNC_AUTO unless `<tpl>.sync = manual` */
   clpd_orm_column *columns; /* in file order */
   size_t column_count;
   /* Indexes into columns: wf-id first, then the local key in order; set
    * by clpd_orm_resolve_key (NULL until then). key.count + 1 entries. */
   size_t *key_columns;
   long line;                              /* first line naming it */
-  long table_line, owned_line, key_line;  /* 0 = not set */
+  long table_line, owned_line, key_line, sync_line; /* 0 = not set */
   clpd_orm_slot_line *slot_lines; /* every slot line, in file order */
   size_t slot_line_count;
 } clpd_orm_template;
@@ -95,7 +107,8 @@ typedef struct {
 } clpd_orm;
 
 /* Reads and validates the mapping file `path` (syntax, keys, identifiers,
- * the reserved table name CLPD_ORM_SEQUENCE_TABLE,
+ * the reserved table names CLPD_ORM_SEQUENCE_TABLE and
+ * CLPD_ORM_INSTANCE_TABLE,
  * types, null policies, required keys, a column or key slot repeated in a
  * template, a table or sequence mapped twice in the file). Every error is
  * written to err, one line each. Returns 0 when valid; otherwise nonzero,
@@ -119,6 +132,7 @@ int clpd_orm_valid_ident(const char *s);
 const char *clpd_orm_sql_type_name(clpd_orm_sql_type t);
 const char *clpd_orm_clips_type_name(clpd_orm_clips_type t);
 const char *clpd_orm_null_name(clpd_orm_null n);
+const char *clpd_orm_sync_name(clpd_orm_sync s);
 
 /* Column type for `backend` ("postgresql" or "sqlite", as returned by
  * clpd_db_backend), or NULL for another backend. SQLite names never get

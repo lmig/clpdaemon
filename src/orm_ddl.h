@@ -2,8 +2,11 @@
  * db-check-schema, db-drop-table and the sequence functions
  * db-create-sequence and db-nextval (T9c), registered by the core only
  * when a database is configured. Every SQL text comes from the mapping
- * (quoted identifiers, per-backend type names); each statement runs in
- * autocommit through clpd_db_exec, never BEGIN/COMMIT, never ALTER.
+ * (quoted identifiers, per-backend type names); each statement runs
+ * through clpd_db_exec on the daemon's connection, never BEGIN/COMMIT,
+ * never ALTER: from a rule, inside the cycle transaction (T10a), so a
+ * rolled-back cycle undoes it; elsewhere (db-check-schema at load) in
+ * autocommit.
  * db-create-table, db-drop-table, db-create-sequence and db-nextval act
  * only from the actions of a rule of a loaded package, on the templates
  * and sequence aliases of that package's definition (T9d, L84); on

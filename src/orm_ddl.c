@@ -2,8 +2,12 @@
  * docs/orm.md#ddl-functions). The SQL text holds only names and types from
  * the mapping (identifiers checked at load, quoted here), the per-backend
  * type names and, on PostgreSQL, the current schema's name (quoted);
- * catalog lookups and db-nextval pass the names as parameters. Every
- * statement runs in autocommit, at most one CREATE or DROP per call. */
+ * catalog lookups and db-nextval pass the names as parameters. At most
+ * one CREATE or DROP per call. Statements run on the daemon's connection:
+ * inside the cycle transaction when a rule calls them (T10a; after a
+ * failed statement there, the rest of the cycle's statements are refused,
+ * so db-nextval's lookup reports the database's message), in autocommit
+ * otherwise. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "orm_ddl.h"

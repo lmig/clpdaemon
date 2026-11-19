@@ -1591,8 +1591,11 @@ clpdaemon: db-drop-table: dropping tables is disabled (orm_allow_drop = no)
 if command -v sqlite3 >/dev/null 2>&1; then
   cases=$((cases + 1))
   got=$(sqlite3 ddl.db "SELECT type || ' ' || name || ': ' || coalesce(sql, '') FROM sqlite_master ORDER BY name" 2>&1)
+  # workflow_instance: created at startup, a package has a mapping (T10a).
   want='table ddl_order: CREATE TABLE "ddl_order" ("wf_id" TEXT NOT NULL, "line_no" INTEGER NOT NULL, "note" TEXT, PRIMARY KEY ("wf_id", "line_no"))
-index sqlite_autoindex_ddl_order_1: '
+index sqlite_autoindex_ddl_order_1: 
+index sqlite_autoindex_workflow_instance_1: 
+table workflow_instance: CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
   [ "$got" = "$want" ] || fail "orm ddl: the generated table" "got [$got], want [$want]"
   # A second run keeps the existing table and its row (IF NOT EXISTS), and
   # the refused drop leaves both.
@@ -1703,6 +1706,189 @@ CREATE TABLE "clpd_sequence" ("name" TEXT PRIMARY KEY, "value" INTEGER NOT NULL)
   [ "$got" = "$want" ] || fail "orm seq: the counter row" "got [$got], want [$want]"
 else
   echo "cli_test.sh: sqlite3 not found; the orm ddl catalog cases are skipped" >&2
+fi
+
+# --- cycle transaction (T10a, docs/database.md#cycle-transaction) -------------
+# The retry keys: positive integers, initial not above max (default 30000).
+retryerr() {
+  conf "$1.conf" "node_id = n1
+$2"
+  check "cycle retry: $1" 1 "" "$3" -- --config "$1.conf" --check
+}
+retryerr retry0 'cycle_retry_initial_ms = 0' \
+  "clpdaemon: retry0.conf:2: cycle_retry_initial_ms: expected a positive integer, got '0'"
+retryerr retrymax 'cycle_retry_max_ms = 1s' \
+  "clpdaemon: retrymax.conf:2: cycle_retry_max_ms: expected a positive integer, got '1s'"
+retryerr retryorder 'cycle_retry_initial_ms = 500
+cycle_retry_max_ms = 100' \
+  "clpdaemon: retryorder.conf: cycle_retry_initial_ms (500) must not exceed cycle_retry_max_ms (100)"
+retryerr retrydefault 'cycle_retry_initial_ms = 40000' \
+  "clpdaemon: retrydefault.conf: cycle_retry_initial_ms (40000) must not exceed cycle_retry_max_ms (30000)"
+conf retryok.conf 'node_id = n1
+cycle_retry_initial_ms = 250
+cycle_retry_max_ms = 250'
+check "cycle retry: valid keys" 0 "clpdaemon: retryok.conf: configuration OK" "" -- --config retryok.conf --check
+
+# The mapping key <tpl>.sync (auto or manual) and the reserved instance
+# table name.
+mkdir ormsync
+conf ormsync/package.conf 'definition = sync
+version = 1
+files = s.clp
+orm = orm.conf'
+conf ormsync/s.clp '(deftemplate order (slot wf-id))'
+conf ormsync/orm.conf 'order.table = sync_order
+order.owned = yes
+order.sync = sometimes
+order.slot.wf-id = wf_id text string error'
+conf ormsync.conf "node_id = n1
+database = sqlite:$WORK/sync.db
+packages = ormsync"
+check "orm: bad sync" 1 "" \
+  "clpdaemon: ormsync/orm.conf:3: order.sync: expected auto or manual, got 'sometimes'" -- --config ormsync.conf --check
+conf ormsync/orm.conf 'order.table = sync_order
+order.owned = yes
+order.sync = manual
+order.slot.wf-id = wf_id text string error'
+check "orm: sync manual" 0 "clpdaemon: ormsync.conf: configuration OK" "" -- --config ormsync.conf --check
+conf ormsync/orm.conf 'order.table = workflow_instance
+order.owned = no
+order.slot.wf-id = wf_id text string error'
+check "orm: reserved instance table name" 1 "" \
+  "clpdaemon: ormsync/orm.conf:1: order.table: table name 'workflow_instance' is reserved (the daemon's workflow instance table)" -- --config ormsync.conf --check
+
+# A package whose rule creates its table, then fails on a database error
+# (db-nextval of a sequence that does not exist): the cycle is rolled back
+# (the table is gone), cycle_end gets ok=0, one failure line with the wait.
+mkdir txpkg
+conf txpkg/package.conf 'definition = tx
+version = 1
+files = tx.clp
+orm = orm.conf
+ingest = go'
+conf txpkg/tx.clp '(deftemplate go (slot wf-id))
+(deftemplate order (slot wf-id) (slot note))
+(defrule r (go (wf-id ?w)) => (db-create-table order) (db-nextval missing_no))
+(deffacts seed (go (wf-id w1)))'
+conf txpkg/orm.conf 'order.table = tx_order
+order.owned = yes
+order.slot.wf-id = wf_id text string error
+order.slot.note = note text string nil
+seq.missing_no = tx_missing_seq
+seq.missing_no.owned = yes'
+TXERR="clpdaemon: db-nextval: sequence alias 'missing_no': sequence 'tx_missing_seq': no such table: clpd_sequence
+[PRCCODE4] Execution halted during the actions of defrule 'r'."
+rconf txhooks.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_hooks_a.so
+database = sqlite:$WORK/tx.db
+packages = txpkg"
+plugdaemon "cycle tx: a failed statement rolls the cycle back" txhooks.conf \
+  "clpdaemon: hooks-a: cycle_end ok=0" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+$TXERR
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+clpdaemon: hooks-a: cycle_end ok=0
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+
+# wait_status <socket> <pattern>: waits up to 5 s for a status reply
+# matching the grep pattern.
+wait_status() {
+  n=0
+  while ! "$ADMIN" "$1" 'status\n' 2>/dev/null | grep -q "$2"; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && return 1
+    sleep 0.05
+  done
+}
+# After the failure the retry (100 ms later) commits, which resets the
+# backoff: a later failure waits 100 ms again, not 200.
+rconf txreset.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/txreset.db
+packages = txpkg"
+cases=$((cases + 1))
+start txreset.conf admin.sock
+wait_status admin.sock ' cycles=2 ' || ok=0
+acase "cycle tx: inject after the retry" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w2"}}}\n'
+wait_status admin.sock ' cycles=4 ' || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+$TXERR
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+$TXERR
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "cycle tx: a committed cycle resets the backoff" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# During a long backoff the loop serves the admin socket (an inject is
+# queued, not run) and SIGTERM stops the daemon at once.
+rconf txwait.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 60000
+cycle_retry_max_ms = 60000
+database = sqlite:$WORK/txwait.db
+packages = txpkg"
+cases=$((cases + 1))
+start txwait.conf admin.sock
+wait_line err.txt "clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 60000 ms" || ok=0
+acase "cycle tx: status during the backoff" "OK node_id=n1 cycles=1 queue=0 facts=1" admin.sock 'status\n'
+acase "cycle tx: inject during the backoff" "OK queued
+OK node_id=n1 cycles=1 queue=1 facts=1" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w2"}}}\n' 'status\n'
+sleep 0.3
+acase "cycle tx: no cycle during the backoff" "OK node_id=n1 cycles=1 queue=1 facts=1" admin.sock 'status\n'
+t0=$(date +%s)
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+t1=$(date +%s)
+want="clpdaemon: n1: running
+$TXERR
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 60000 ms
+clpdaemon: received SIGTERM, stopping
+clpdaemon: 1 queued fact dropped at shutdown"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ $((t1 - t0)) -gt 3 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "cycle tx: SIGTERM during the backoff" "exit $rc, lines seen $ok, $((t1 - t0)) s, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+if command -v sqlite3 >/dev/null 2>&1; then
+  # The rolled-back cycle left only the daemon's instance table, created at
+  # startup because a package has a mapping.
+  cases=$((cases + 1))
+  got=$(sqlite3 tx.db "SELECT type || ' ' || name || ': ' || coalesce(sql, '') FROM sqlite_master ORDER BY name" 2>&1)
+  want='index sqlite_autoindex_workflow_instance_1: 
+table workflow_instance: CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
+  [ "$got" = "$want" ] || fail "cycle tx: rolled back, workflow_instance created" "got [$got], want [$want]"
+  # --check writes nothing: no workflow_instance; nor does a daemon whose
+  # packages have no mapping (dbrun.db above).
+  conf txcheck.conf "node_id = n1
+database = sqlite:$WORK/txcheck.db
+packages = txpkg"
+  check "cycle tx: --check" 0 "clpdaemon: txcheck.conf: configuration OK" "" -- --config txcheck.conf --check
+  cases=$((cases + 1))
+  got=$(sqlite3 txcheck.db "SELECT name FROM sqlite_master" 2>&1)$(sqlite3 dbrun.db "SELECT name FROM sqlite_master" 2>&1)
+  [ -z "$got" ] || fail "cycle tx: no workflow_instance under --check or without a mapping" "got [$got]"
+  # The table cannot be created (a read-only database file): exit 1.
+  sqlite3 txro.db 'CREATE TABLE other (x INTEGER)'
+  chmod 0444 txro.db
+  rconf txro.conf "node_id = n1
+database = sqlite:$WORK/txro.db
+packages = txpkg"
+  RUN='timeout 10'
+  check "cycle tx: workflow_instance cannot be created" 1 "" \
+    "clpdaemon: cannot create the workflow_instance table: attempt to write a readonly database" -- --config txro.conf
+  RUN=
+  cases=$((cases + 1))
+  [ ! -e admin.sock ] || fail "cycle tx: no admin socket after the failure" "$(ls -l admin.sock)"
+  chmod 0644 txro.db
 fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"

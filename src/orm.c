@@ -37,6 +37,8 @@ static const char *const clips_names[CLPD_ORM_CLIPS_TYPE_COUNT] = {
 static const char *const null_names[CLPD_ORM_NULL_COUNT] = {
     [CLPD_ORM_NULL_NIL] = "nil", [CLPD_ORM_NULL_DEFAULT] = "default",
     [CLPD_ORM_NULL_ERROR] = "error"};
+static const char *const sync_names[CLPD_ORM_SYNC_COUNT] = {
+    [CLPD_ORM_SYNC_AUTO] = "auto", [CLPD_ORM_SYNC_MANUAL] = "manual"};
 
 const char *clpd_orm_sql_type_name(clpd_orm_sql_type t) {
   return (unsigned)t < CLPD_ORM_SQL_TYPE_COUNT ? sql_names[t] : NULL;
@@ -48,6 +50,10 @@ const char *clpd_orm_clips_type_name(clpd_orm_clips_type t) {
 
 const char *clpd_orm_null_name(clpd_orm_null n) {
   return (unsigned)n < CLPD_ORM_NULL_COUNT ? null_names[n] : NULL;
+}
+
+const char *clpd_orm_sync_name(clpd_orm_sync s) {
+  return (unsigned)s < CLPD_ORM_SYNC_COUNT ? sync_names[s] : NULL;
 }
 
 const char *clpd_orm_backend_type(clpd_orm_sql_type t, const char *backend) {
@@ -285,7 +291,7 @@ static void on_template(clpd_kv *kv, clpd_orm *orm, char *key, char *value) {
   }
   attr = dot + 1;
   if (strcmp(attr, "table") != 0 && strcmp(attr, "owned") != 0 &&
-      strcmp(attr, "key") != 0 &&
+      strcmp(attr, "key") != 0 && strcmp(attr, "sync") != 0 &&
       !(strncmp(attr, SLOT_PREFIX, sizeof SLOT_PREFIX - 1) == 0 &&
         attr[sizeof SLOT_PREFIX - 1] != '\0')) {
     clpd_kv_error(kv, "unknown key '%s'", key);
@@ -302,6 +308,11 @@ static void on_template(clpd_kv *kv, clpd_orm *orm, char *key, char *value) {
                         "sequence counter table)", key, value);
       return;
     }
+    if (strcmp(value, CLPD_ORM_INSTANCE_TABLE) == 0) {
+      clpd_kv_error(kv, "%s: table name '%s' is reserved (the daemon's "
+                        "workflow instance table)", key, value);
+      return;
+    }
     for (i = 0; i < orm->template_count; i++) {
       const clpd_orm_template *o = &orm->templates[i];
       if (o != t && o->table != NULL && strcmp(o->table, value) == 0) {
@@ -314,6 +325,14 @@ static void on_template(clpd_kv *kv, clpd_orm *orm, char *key, char *value) {
   } else if (strcmp(attr, "owned") == 0) {
     if (duplicate(kv, key, &t->owned_line)) return;
     yes_no(kv, key, value, &t->owned);
+  } else if (strcmp(attr, "sync") == 0) {
+    int sync;
+    if (duplicate(kv, key, &t->sync_line)) return;
+    sync = lookup(sync_names, CLPD_ORM_SYNC_COUNT, value);
+    if (sync < 0)
+      clpd_kv_error(kv, "%s: expected auto or manual, got '%s'", key, value);
+    else
+      t->sync = (clpd_orm_sync)sync;
   } else if (strcmp(attr, "key") == 0) {
     clpd_list seen = {NULL, 0}, list = {NULL, 0};
     int ok;

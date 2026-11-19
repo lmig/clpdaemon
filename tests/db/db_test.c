@@ -334,6 +334,33 @@ static void test_sqlite_close_rolls_back(clpd_db **db, const char *spec) {
   if (*db != NULL) EXPECT(sq_count(*db, "SELECT count(*) FROM pgt") == 3);
 }
 
+/* A reconnect that fails leaves the handle without a connection (LOST on
+ * every call, the spec never shown) until a reconnect succeeds (T10a). */
+static void test_sqlite_reconnect(clpd_db *db, const char *dir,
+                                  const char *spec) {
+  char bad[128], msg[256];
+  snprintf(bad, sizeof bad, "sqlite:%s/nodir-secret/x.db", dir);
+  EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  EXPECT(clpd_db_exec(db, "DELETE FROM pgt", NULL, 0, NULL) == CLPD_DB_OK);
+  EXPECT(clpd_db_reconnect(db, bad, msg, sizeof msg) == CLPD_DB_ERROR);
+  EXPECT(strcmp(msg, "cannot open the SQLite database: unable to open "
+                     "database file") == 0);
+  EXPECT(clpd_db_in_transaction(db) == 0);
+  EXPECT(clpd_db_exec(db, "SELECT 1", NULL, 0, NULL) == CLPD_DB_LOST);
+  EXPECT(strcmp(clpd_db_error(db), "not connected to the database") == 0);
+  EXPECT(clpd_db_begin(db) == CLPD_DB_LOST);
+  EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_LOST);
+  EXPECT(strcmp(clpd_db_error(db), "not connected to the database") == 0);
+  EXPECT(clpd_db_in_transaction(db) == 0);
+  EXPECT(clpd_db_commit(db) == CLPD_DB_LOST);
+  EXPECT(clpd_db_rollback(db) == CLPD_DB_LOST);
+  EXPECT(strcmp(clpd_db_backend(db), "sqlite") == 0);
+  EXPECT(clpd_db_reconnect(db, spec, msg, sizeof msg) == CLPD_DB_OK);
+  EXPECT(strcmp(msg, "") == 0);
+  /* The DELETE of the abandoned transaction was rolled back. */
+  EXPECT(sq_count(db, "SELECT count(*) FROM pgt") == 3);
+}
+
 /* Link seam (--wrap of malloc, calloc and realloc, this test binary only):
  * while set, every allocation from the linked objects fails (the compiler
  * may turn realloc(NULL, n) into malloc, or calloc with the memset). */
@@ -420,6 +447,7 @@ static void test_sqlite(void) {
     test_sqlite_pg_types(db);
     test_sqlite_placeholders(db);
     test_sqlite_affected(db);
+    test_sqlite_reconnect(db, dir, spec);
     test_sqlite_close_rolls_back(&db, spec);
   }
   clpd_db_close(db);

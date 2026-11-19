@@ -17,6 +17,8 @@
 #define CLPD_DEFAULT_IDLE_EVICTION_AFTER_S (30L * 60)
 #define CLPD_DEFAULT_ADMIN_SOCKET "/run/clpdaemon/admin.sock"
 #define CLPD_DEFAULT_ADMIN_SOCKET_MODE 0600
+#define CLPD_DEFAULT_CYCLE_RETRY_INITIAL_MS 100
+#define CLPD_DEFAULT_CYCLE_RETRY_MAX_MS 30000
 
 typedef struct {
   char node_id[CLPD_NODE_ID_MAX + 1];
@@ -33,6 +35,10 @@ typedef struct {
   int watch_rules;
   char *database; /* NULL = no database; checked by clpd_db_check_spec */
   int orm_allow_drop; /* 1: db-drop-table may drop owned tables (T9b) */
+  /* Backoff of a failed cycle transaction (T10a): the first wait, doubled
+   * on each failure up to the maximum; initial <= max. */
+  int cycle_retry_initial_ms;
+  int cycle_retry_max_ms;
   clpd_list packages;
   clpd_list plugins;
 } clpd_config;

@@ -400,8 +400,96 @@ static void test_fd_stop_wins(void) {
   close(fds[1]);
 }
 
+/* clpd_loop_defer (T10a). */
+typedef struct {
+  clpd_loop *loop;
+  int cycles, fd_calls, rd, wr;
+  long long at[MAX_CYCLES], fd_at;
+} deferprobe;
+
+/* Cycle 1 defers 150 ms and notifies (the notification must wait);
+ * cycle 2 does nothing, so cycle 3 comes on the 20 ms tick; cycle 3
+ * stops. */
+static void defer_cycle(void *ctx) {
+  deferprobe *p = ctx;
+  if (p->cycles < MAX_CYCLES) p->at[p->cycles] = now_ms();
+  p->cycles++;
+  if (p->cycles == MAX_CYCLES) raise(SIGTERM);
+  if (p->cycles == 1) {
+    clpd_loop_defer(p->loop, 150);
+    clpd_loop_notify(p->loop);
+  }
+  if (p->cycles == 3) raise(SIGTERM);
+}
+
+static void test_defer(void) {
+  deferprobe p;
+  clpd_loop *loop = clpd_loop_open(20, 10, stderr);
+  EXPECT(loop != NULL);
+  if (loop == NULL) return;
+  memset(&p, 0, sizeof p);
+  p.loop = loop;
+  EXPECT(clpd_loop_run(loop, defer_cycle, &p) == SIGTERM);
+  EXPECT(p.cycles == 3);
+  EXPECT(p.at[1] - p.at[0] >= 150 - 1 && p.at[1] - p.at[0] < 400);
+  EXPECT(p.at[2] - p.at[1] >= 20 - 1 && p.at[2] - p.at[1] < 150);
+  clpd_loop_close(loop);
+}
+
+static void defer_fd_cb(void *ctx, int fd, short revents) {
+  deferprobe *p = ctx;
+  char c;
+  (void)revents;
+  if (read(fd, &c, 1) != 1) return;
+  p->fd_calls++;
+  p->fd_at = now_ms();
+  /* Served again and again for 100 ms (ten ticks), then a stop during
+   * the wait. */
+  if (p->fd_at - p->at[0] >= 100) raise(SIGTERM);
+  else if (write(p->wr, "y", 1) != 1) p->fd_calls = -1000000;
+}
+
+/* Cycle 1 defers 5 s and makes a registered fd readable: the fd is served
+ * during the wait (for 100 ms, ten 10 ms ticks that must not start a
+ * cycle), and a SIGTERM raised there ends the loop at once. */
+static void defer_fd_cycle(void *ctx) {
+  deferprobe *p = ctx;
+  if (p->cycles < MAX_CYCLES) p->at[p->cycles] = now_ms();
+  p->cycles++;
+  if (p->cycles == MAX_CYCLES) raise(SIGTERM);
+  if (p->cycles == 1) {
+    clpd_loop_defer(p->loop, 5000);
+    if (write(p->wr, "x", 1) != 1) p->fd_calls = 100;
+  }
+}
+
+static void test_defer_serves_fds_and_stops(void) {
+  deferprobe p;
+  int fds[2];
+  long long t0;
+  clpd_loop *loop = clpd_loop_open(10, 0, stderr);
+  EXPECT(loop != NULL && pipe(fds) == 0);
+  if (loop == NULL) return;
+  memset(&p, 0, sizeof p);
+  p.loop = loop;
+  p.rd = fds[0];
+  p.wr = fds[1];
+  EXPECT(clpd_loop_add_fd(loop, fds[0], POLLIN, defer_fd_cb, &p) == 0);
+  t0 = now_ms();
+  EXPECT(clpd_loop_run(loop, defer_fd_cycle, &p) == SIGTERM);
+  EXPECT(p.cycles == 1);
+  EXPECT(p.fd_calls >= 2);
+  EXPECT(p.fd_at - p.at[0] >= 100);
+  EXPECT(now_ms() - t0 < 2000);
+  clpd_loop_close(loop);
+  close(fds[0]);
+  close(fds[1]);
+}
+
 int main(void) {
   test_schedule_and_stop();
+  test_defer();
+  test_defer_serves_fds_and_stops();
   test_sighup_continues_and_sigint_stops();
   test_pending_stop_before_run();
   test_overrun_no_burst();

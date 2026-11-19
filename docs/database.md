@@ -38,7 +38,7 @@ Every PostgreSQL call runs on the engine thread, so the backend bounds them by d
 
 So a server that does not answer cannot hold the startup open (which runs while the stop signals are blocked) for the TCP timeout, and a lock another writer holds cannot stop the engine thread. A non-zero value from the connection string, the role or the database is kept as it is; for `lock_timeout` and `statement_timeout` a value of `0` cannot turn the timeout off (use a large value instead). `connect_timeout` is different: libpq reads `connect_timeout=0` (or `PGCONNECT_TIMEOUT=0`) as "wait forever", and the daemon keeps it, so avoid it. A `connect_timeout` set only in a `pg_service.conf` service entry is not seen and the 10 s default applies; put it in the connection string or in `PGCONNECT_TIMEOUT` instead. SQLite has none of these (its busy timeout is 5 s, see below).
 
-A lock or statement timeout is `CLPD_DB_ERROR` with the server's one-line message, for example `canceling statement due to lock timeout (SQLSTATE 55P03)` or `canceling statement due to statement timeout (SQLSTATE 57014)`; the connection stays usable, and inside a transaction the transaction is aborted like after any other error (roll it back). A connection that times out fails to open like any unreachable server (`cannot connect to PostgreSQL: ... timeout expired`). Retrying belongs to the caller (FR-26).
+A lock or statement timeout is `CLPD_DB_ERROR` with the server's one-line message, for example `canceling statement due to lock timeout (SQLSTATE 55P03)` or `canceling statement due to statement timeout (SQLSTATE 57014)`; the connection stays usable, and inside a transaction the transaction is aborted like after any other error (roll it back). A connection that times out fails to open like any unreachable server (`cannot connect to PostgreSQL: ... timeout expired`). Retrying belongs to the caller (FR-26): inside a cycle, the [cycle transaction](#cycle-transaction) retries.
 
 ## Startup
 
@@ -64,9 +64,54 @@ Configuration messages (also in [`configuration.md`](configuration.md#messages))
 | libpq cannot parse it | `clpdaemon: <file>:<line>: database: invalid PostgreSQL connection string` |
 | A password in it | `clpdaemon: <file>:<line>: database: the connection string must not contain a password (use a password file, see PGPASSFILE)` |
 
+## Cycle transaction
+
+With a `database`, every cycle of the running daemon is one transaction (T10a, D7, D8, NFR-3): it is opened before the facts queued for ingestion are asserted ([`ingest.md`](ingest.md)) and committed after `Run`, before the plugins' `cycle_end` ([`plugins.md`](plugins.md)). Every statement a rule sends in the cycle (the [DDL and sequence functions](orm.md#ddl-functions), later the synchronization and DML functions of T10) runs inside it. Without a `database` the cycle is unchanged.
+
+A cycle is rolled back when one of its statements fails with any status (`CLPD_DB_ERROR`, `CLPD_DB_UNIQUE`, `CLPD_DB_LOST`, a statement or parameter the interface rejects included) or when its commit fails. The daemon rolls back at the first failing statement itself, on both backends: SQLite would otherwise keep the statements that succeeded, and PostgreSQL aborts the transaction anyway. Every later statement of that cycle runs nothing and fails with `the transaction was rolled back after an earlier error` (so a rule's function that tries again gets an error, and nothing is written in autocommit). DDL is transactional on both backends: a table a rolled-back cycle created is gone, and a table it dropped is still there with its rows. A PostgreSQL sequence is not transactional: a value `db-nextval` drew in a rolled-back cycle stays used; on SQLite the counter row is an ordinary row and is rolled back with the cycle ([`orm.md`](orm.md#sequence-functions)).
+
+A rolled-back cycle:
+
+- writes one line to the daemon log stream, `clpdaemon: cycle transaction failed: <message>; retrying in <n> ms`, where `<message>` is the first failing statement's (or the commit's) one-line message, never the connection string;
+- gives the plugins' `cycle_end` `ok = 0`;
+- delays the next cycle by `<n>` ms: `cycle_retry_initial_ms` (default 100) after the first failure, doubled after each further one, never above `cycle_retry_max_ms` (default 30000), indefinitely ([`configuration.md`](configuration.md)). Ticks and notifications do not start a cycle sooner (a fact injected meanwhile waits in the queue); the event loop keeps serving signals (`SIGTERM` stops the daemon at once) and the admin socket. A committed cycle resets the wait.
+
+The retry is a whole new cycle: the queued facts are drained and `Run` runs again. Working memory is not restored yet (the rules' activations of the rolled-back cycle are spent; rehydration of the affected instances is T10c), and facts asserted from the queue in the rolled-back cycle are not queued again.
+
+When the transaction cannot even be opened (for example the server went away between cycles), the cycle does not run at all: no fact is drained, no plugin hook runs, the admin `status` cycle count does not grow, and the same line is logged with the same wait. After `CLPD_DB_LOST` (from any statement, the begin or the commit) each retry first reopens the connection with the same connection string; a reopen that fails is logged the same way (`<message>` being the connection error) and retried after the next wait.
+
+What is not a database failure commits: a rule's `(halt)` (the rules decided to stop), a `Run` cut by `max_rules_per_cycle` or by a stop signal, a CLIPS evaluation error that is no database status (for example a wrong argument type), and a DDL function that refuses before sending any statement (for example `orm_allow_drop = no`); the changes made so far in the cycle are kept. `cycle_end` still gets `ok = 0` for an evaluation error, as before.
+
+Inside the cycle transaction `db-nextval` cannot look a missing sequence up after its statement failed, so it reports the database's message (`relation "public.<name>" does not exist (SQLSTATE 42P01)`, SQLite `no such table: clpd_sequence`) instead of `does not exist`.
+
+## workflow_instance
+
+When a `database` is configured and at least one package has an ORM mapping (`orm` in its manifest), the daemon creates the table `workflow_instance` at startup, after the packages load and before the admin socket, with `CREATE TABLE IF NOT EXISTS` (an existing table is kept as it is, rows included); on PostgreSQL in `current_schema()`, like the [DDL functions](orm.md#ddl-functions). It holds one row per workflow instance (S10), written from T10b on. `--check` never creates it (it writes nothing), and a daemon without a mapping does not either.
+
+| Column | PostgreSQL | SQLite | NULL | Meaning |
+|---|---|---|---|---|
+| `wf_id` | `TEXT` | `TEXT` | `NOT NULL`, the primary key | the instance's `wf-id` |
+| `definition` | `TEXT` | `TEXT` | `NOT NULL` | workflow definition of its package |
+| `version` | `TEXT` | `TEXT` | `NOT NULL` | version of its package |
+| `status` | `TEXT` | `TEXT` | `NOT NULL` | `active` (T10b); later values with T11 |
+| `parent_wf_id` | `TEXT` | `TEXT` | nullable | parent instance of a subflow (T24) |
+| `owner_node` | `TEXT` | `TEXT` | nullable | node holding the lease (T21) |
+| `lease_until` | `TIMESTAMPTZ` | `TEXT` | nullable | end of that lease (T21) |
+| `created_at` | `TIMESTAMPTZ` | `TEXT` | `NOT NULL` | first write of the instance |
+| `updated_at` | `TIMESTAMPTZ` | `TEXT` | `NOT NULL` | last write of the instance |
+
+No column has a default: the daemon writes every value (T10b). The name `workflow_instance` is reserved: no ORM mapping may name a table so, on any backend ([`orm.md`](orm.md#messages)).
+
+| Situation | Message (stderr), then exit 1 after the plugins' `shutdown` |
+|---|---|
+| The table cannot be created | `clpdaemon: cannot create the workflow_instance table: <message>` (for example `attempt to write a readonly database`, or on PostgreSQL `no current schema (the search_path names no existing schema)`) |
+
 ## Interface
 
-`src/db.h` (engine thread only): `clpd_db_open`, `clpd_db_close`, `clpd_db_backend` (`sqlite` or `postgresql`), `clpd_db_exec`, `clpd_db_begin` / `clpd_db_commit` / `clpd_db_rollback`, `clpd_db_error`, and the result accessors.
+`src/db.h` (engine thread only): `clpd_db_open`, `clpd_db_close`, `clpd_db_reconnect`, `clpd_db_backend` (`sqlite` or `postgresql`), `clpd_db_exec`, `clpd_db_begin` / `clpd_db_begin_atomic` / `clpd_db_commit` / `clpd_db_rollback`, `clpd_db_error`, and the result accessors.
+
+- `clpd_db_begin_atomic` opens an all-or-nothing transaction (the cycle transaction): the first `clpd_db_exec` that fails rolls it back at once on both backends, every later `clpd_db_exec` runs nothing and returns `CLPD_DB_ERROR` with `the transaction was rolled back after an earlier error`, `clpd_db_commit` returns the first failure's status and message, and `clpd_db_rollback` returns `CLPD_DB_OK`. The transaction stays open (`clpd_db_in_transaction` is 1) until one of those two calls, also after a lost connection.
+- `clpd_db_reconnect(db, spec, msg, n)` replaces the connection of a handle with a new one opened with the same spec (an open transaction is rolled back, or abandoned when the connection is gone), so everything holding the handle keeps it. On failure `msg` holds the open error (never the spec) and every call on the handle but reconnect, close, backend and error returns `CLPD_DB_LOST` with `not connected to the database` until a reconnect succeeds.
 
 ### Statements and parameters
 
@@ -103,7 +148,8 @@ SQLite has no sequences: the ORM's `db-create-sequence` and `db-nextval` keep on
 - `clpdaemon_db`, `clpdaemon_db_sqlite_suite`: the interface (out of memory included, through a link seam on the allocators) and the shared backend suite (`tests/db/db_suite.c`) on SQLite.
 - `clpdaemon_db_pg`: the same suite plus PostgreSQL-only cases (password through `PGPASSFILE`, type mapping, `CLPD_DB_LOST` after the backend is terminated, the default timeouts and their overrides, a long class-22 value that must not leak, out of memory while decoding a `bytea`; a TCP listener on `127.0.0.1` that never answers stands in for an unreachable server) against a throwaway cluster. `tests/db/pg_cluster.sh` creates it with `initdb` in a private temporary directory, starts it with `pg_ctl` on a Unix socket in that directory only (no TCP), creates the role and database with `psql`, runs the test, and stops and removes the cluster on every exit path. The programs come from `CLPD_PG_BINDIR` when it is set, from `PATH` otherwise; when `initdb`, `pg_ctl` or `psql` is missing the script exits 77 and ctest reports the test as SKIPPED, not failed.
 - `clpdaemon_orm_ddl`, `clpdaemon_orm_ddl_pg`: the ORM DDL and sequence functions ([`orm.md`](orm.md#ddl-functions); two connections drawing from one sequence get distinct values) on a temporary SQLite file and, through the same `tests/db/pg_cluster.sh`, on a throwaway PostgreSQL cluster (SKIPPED without the programs). The PostgreSQL tests share a ctest resource lock, so their clusters never run at the same time.
-- `clpdaemon_cli`: opening a SQLite database under `--check` and in a running daemon, the open error, an unreachable PostgreSQL server, and the rejected values.
+- `clpdaemon_orm_tx`, `clpdaemon_orm_tx_pg`: the [cycle transaction](#cycle-transaction) and the [`workflow_instance`](#workflow_instance) table on SQLite and on a throwaway PostgreSQL cluster: a rolled-back cycle undoes a create and a drop and leaves every table and row unchanged, the exact failure lines, the backoff sequence (doubling, cap, reset), a failing begin or commit and the reconnect after `CLPD_DB_LOST` (injected through link seams on `clpd_db_begin_atomic`, `clpd_db_commit` and `clpd_db_reconnect`, this test binary only), what commits (`(halt)`, an evaluation error, a refusal), `db-nextval` in a rolled-back cycle, and, through the event loop, the waits between retries and `SIGTERM` during a wait. The atomic transaction and the reconnect are also in the shared suite and in `clpdaemon_db` / `clpdaemon_db_pg`.
+- `clpdaemon_cli`: opening a SQLite database under `--check` and in a running daemon, the open error, an unreachable PostgreSQL server, and the rejected values; the retry keys, a cycle rolled back by a rule (`cycle_end ok=0`, the exact lines, the table gone), the backoff reset, `SIGTERM` and the admin socket during a wait, `workflow_instance` created by a running daemon and not by `--check`, and a table that cannot be created.
 
 ```sh
 CLPD_PG_BINDIR=/usr/lib/postgresql/17/bin ctest --test-dir build -R clpdaemon_db_pg --output-on-failure

@@ -62,8 +62,18 @@ set_tests_properties(clpdaemon_orm_ddl PROPERTIES TIMEOUT 30)
 add_test(NAME clpdaemon_orm_ddl_pg
   COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:orm_ddl_test>)
 set_tests_properties(clpdaemon_orm_ddl_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
-set_tests_properties(clpdaemon_db_pg clpdaemon_orm_ddl_pg PROPERTIES
-  RESOURCE_LOCK clpd_pg_cluster)
+# Cycle transaction (T10a): the same pair, SQLite and PostgreSQL.
+add_executable(orm_tx_test orm/orm_tx_test.c)
+target_link_libraries(orm_tx_test PRIVATE clpd_core)
+target_include_directories(orm_tx_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+target_compile_options(orm_tx_test PRIVATE ${CLPD_WARNINGS})
+add_test(NAME clpdaemon_orm_tx COMMAND orm_tx_test)
+set_tests_properties(clpdaemon_orm_tx PROPERTIES TIMEOUT 60)
+add_test(NAME clpdaemon_orm_tx_pg
+  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:orm_tx_test>)
+set_tests_properties(clpdaemon_orm_tx_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+set_tests_properties(clpdaemon_db_pg clpdaemon_orm_ddl_pg clpdaemon_orm_tx_pg
+  PROPERTIES RESOURCE_LOCK clpd_pg_cluster)
 
 # Link seam for the reader-failure cases, this test binary only: the test
 # wraps poll and read (production objects are unchanged).
@@ -76,6 +86,10 @@ target_link_options(db_pg_test PRIVATE -Wl,--wrap=PQunescapeBytea)
 # Database-error paths of the ORM DDL functions (T9d): orm_ddl_test wraps
 # clpd_db_exec to make one generated statement fail.
 target_link_options(orm_ddl_test PRIVATE -Wl,--wrap=clpd_db_exec)
+# Cycle transaction failures the database cannot produce on demand (T10a):
+# orm_tx_test wraps begin, commit and reconnect.
+target_link_options(orm_tx_test PRIVATE -Wl,--wrap=clpd_db_begin_atomic
+  -Wl,--wrap=clpd_db_commit -Wl,--wrap=clpd_db_reconnect)
 
 # The loader test dlopens the plugins built in <build>/plugins, which take
 # their CLIPS symbols from the test executable.

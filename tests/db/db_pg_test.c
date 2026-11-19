@@ -648,6 +648,62 @@ static void test_lost(void) {
   clpd_db_close(admin);
 }
 
+/* The cycle transaction (T10a): a lost connection inside an atomic
+ * transaction refuses the later statements, commit returns LOST with the
+ * first message, and a reconnect with the same spec gives a working
+ * connection on the same handle (nothing of the lost transaction kept). */
+static void test_atomic_lost_reconnect(void) {
+  clpd_db *admin = open_db(conninfo), *db = open_db(conninfo);
+  clpd_db_value v;
+  char first[512], msg[512];
+  EXPECT(admin != NULL && db != NULL);
+  if (admin == NULL || db == NULL) {
+    clpd_db_close(admin);
+    clpd_db_close(db);
+    return;
+  }
+  EXPECT(run(admin, "CREATE TABLE pg_relost (id BIGINT PRIMARY KEY)") ==
+         CLPD_DB_OK);
+  EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  EXPECT(run(db, "INSERT INTO pg_relost (id) VALUES (1)") == CLPD_DB_OK);
+  terminate(admin, db);
+  EXPECT(run(db, "INSERT INTO pg_relost (id) VALUES (2)") == CLPD_DB_LOST);
+  snprintf(first, sizeof first, "%s", clpd_db_error(db));
+  EXPECT(one_line(first));
+  EXPECT(clpd_db_in_transaction(db) == 1);
+  EXPECT(run(db, "INSERT INTO pg_relost (id) VALUES (3)") == CLPD_DB_ERROR);
+  EXPECT(strcmp(clpd_db_error(db), "the transaction was rolled back after "
+                                   "an earlier error") == 0);
+  EXPECT(clpd_db_commit(db) == CLPD_DB_LOST);
+  EXPECT(strcmp(clpd_db_error(db), first) == 0);
+  EXPECT(clpd_db_in_transaction(db) == 0);
+  EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_LOST); /* still lost */
+  EXPECT(clpd_db_reconnect(db, conninfo, msg, sizeof msg) == CLPD_DB_OK);
+  EXPECT(strcmp(msg, "") == 0);
+  EXPECT(strcmp(clpd_db_backend(db), "postgresql") == 0);
+  EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  EXPECT(run(db, "INSERT INTO pg_relost (id) VALUES (4)") == CLPD_DB_OK);
+  EXPECT(clpd_db_commit(db) == CLPD_DB_OK);
+  EXPECT(scalar(admin, "SELECT string_agg(id::text, ',') FROM pg_relost",
+                NULL, 0, &v, msg, sizeof msg));
+  EXPECT(strcmp(msg, "4") == 0);
+  /* The new session has the default timeouts again (T8f). */
+  EXPECT(scalar(db, "SELECT current_setting('lock_timeout')", NULL, 0, &v,
+                msg, sizeof msg));
+  EXPECT(strcmp(msg, "5s") == 0);
+  /* A reconnect to a server that is not there fails without the spec. */
+  EXPECT(clpd_db_reconnect(db, "host=/nonexistent-clpd-dir port=1 "
+                               "dbname=x connect_timeout=2", msg,
+                           sizeof msg) == CLPD_DB_ERROR);
+  EXPECT(contains(msg, "cannot connect to PostgreSQL"));
+  EXPECT(run(db, "SELECT 1") == CLPD_DB_LOST);
+  EXPECT(clpd_db_reconnect(db, conninfo, msg, sizeof msg) == CLPD_DB_OK);
+  EXPECT(run(db, "SELECT 1") == CLPD_DB_OK);
+  EXPECT(run(admin, "DROP TABLE pg_relost") == CLPD_DB_OK);
+  clpd_db_close(db);
+  clpd_db_close(admin);
+}
+
 int main(int argc, char **argv) {
   int suite;
   if (argc != 3) {
@@ -661,6 +717,7 @@ int main(int argc, char **argv) {
   test_types_and_messages();
   test_aborted_commit();
   test_lost();
+  test_atomic_lost_reconnect();
   test_long_class22();
   test_out_of_memory();
   test_session_timeouts();

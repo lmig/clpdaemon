@@ -429,6 +429,75 @@ static void test_reserved_table(void) {
   clpd_orm_free(&m);
 }
 
+/* T10a: workflow_instance is the daemon's instance table, reserved like
+ * clpd_sequence; a sequence of that name is not a table mapping. */
+static void test_reserved_instance_table(void) {
+  clpd_orm m;
+  char eb[2048];
+  EXPECT(parse("o.table = workflow_instance\n"
+               "o.owned = no\n"
+               "o.slot.wf-id = wf_id text string error\n"
+               "p.table = workflow_instances\n"
+               "p.owned = no\n"
+               "p.slot.wf-id = wf_id text string error\n",
+               &m, eb, sizeof eb) != 0);
+  EXPECT(err_is(eb, "clpdaemon: %s:1: o.table: table name 'workflow_instance' "
+                    "is reserved (the daemon's workflow instance table)\n"));
+  clpd_orm_free(&m);
+}
+
+/* T10a (L90): <tpl>.sync = auto|manual, default auto. */
+static void test_sync(void) {
+  clpd_orm m;
+  char eb[2048];
+  EXPECT(parse("a.table = ta\n"
+               "a.owned = yes\n"
+               "a.slot.wf-id = wf_id text string error\n"
+               "b.table = tb\n"
+               "b.owned = yes\n"
+               "b.sync = manual\n"
+               "b.slot.wf-id = wf_id text string error\n"
+               "c.sync = auto\n"
+               "c.table = tc\n"
+               "c.owned = no\n"
+               "c.slot.wf-id = wf_id text string error\n",
+               &m, eb, sizeof eb) == 0);
+  EXPECT(err_is(eb, ""));
+  EXPECT(m.template_count == 3);
+  if (m.template_count == 3) {
+    EXPECT(m.templates[0].sync == CLPD_ORM_SYNC_AUTO &&
+           m.templates[0].sync_line == 0);
+    EXPECT(m.templates[1].sync == CLPD_ORM_SYNC_MANUAL &&
+           m.templates[1].sync_line == 6);
+    EXPECT(m.templates[2].sync == CLPD_ORM_SYNC_AUTO &&
+           m.templates[2].sync_line == 8 && m.templates[2].line == 8);
+  }
+  clpd_orm_free(&m);
+  EXPECT(parse("a.table = ta\n"
+               "a.owned = yes\n"
+               "a.sync = Manual\n"
+               "a.sync = manual\n"
+               "a.slot.wf-id = wf_id text string error\n"
+               "b.table = tb\n"
+               "b.owned = yes\n"
+               "b.sync =\n"
+               "b.slot.wf-id = wf_id text string error\n",
+               &m, eb, sizeof eb) != 0);
+  EXPECT(err_is(eb, "clpdaemon: %s:3: a.sync: expected auto or manual, got "
+                    "'Manual'\n"
+                    "clpdaemon: %s:4: duplicate key 'a.sync' (first set on line "
+                    "3)\n"
+                    "clpdaemon: %s:8: b.sync: expected auto or manual, got ''\n"));
+  if (m.template_count == 2) {
+    EXPECT(m.templates[0].sync == CLPD_ORM_SYNC_AUTO);
+    EXPECT(m.templates[1].sync == CLPD_ORM_SYNC_AUTO);
+  }
+  clpd_orm_free(&m);
+  EXPECT(strcmp(clpd_orm_sync_name(CLPD_ORM_SYNC_AUTO), "auto") == 0);
+  EXPECT(strcmp(clpd_orm_sync_name(CLPD_ORM_SYNC_MANUAL), "manual") == 0);
+  EXPECT(clpd_orm_sync_name(CLPD_ORM_SYNC_COUNT) == NULL);
+}
+
 static void test_missing_required(void) {
   clpd_orm m;
   char eb[4096];
@@ -556,6 +625,8 @@ int main(void) {
   test_keys();
   test_shared_names();
   test_reserved_table();
+  test_reserved_instance_table();
+  test_sync();
   test_missing_required();
   test_kvfile_rules();
   test_type_names();

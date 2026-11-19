@@ -37,7 +37,14 @@ typedef struct {
 struct clpd_db {
   const clpd_db_backend_ops *ops;
   void *impl; /* backend connection state */
+  int connected; /* 0 after a failed clpd_db_reconnect */
   int in_tx;
+  /* clpd_db_begin_atomic (T10a): atomic is set while such a transaction is
+   * open; failed is the status of its first failing statement (CLPD_DB_OK
+   * while none failed), failed_error that statement's message. */
+  int atomic;
+  clpd_db_status failed;
+  char failed_error[CLPD_DB_ERROR_MAX];
   char error[CLPD_DB_ERROR_MAX];
 };
 
