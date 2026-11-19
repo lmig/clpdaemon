@@ -26,6 +26,20 @@ The connection string must not contain a password: a `password=` or `sslpassword
 
 The value of `database` is never written to stderr, the trace files or the admin socket, not even in an error. A configuration error names the file and line only. A connection error shows the message of the backend, which may contain the socket path, the host name, the user name or an invalid option value (for example `cannot connect to PostgreSQL: invalid sslmode value: "bogus"`), never a password, since the string cannot hold one. A SQLite open error does not show the path.
 
+### Timeouts
+
+Every PostgreSQL call runs on the engine thread, so the backend bounds them by default:
+
+| Setting | Default | When it applies | Override |
+|---|---|---|---|
+| `connect_timeout` | 10 s | the connection string has no `connect_timeout` and `PGCONNECT_TIMEOUT` is not set | `connect_timeout=<seconds>` in the connection string (`?connect_timeout=<seconds>` in a URI), or `PGCONNECT_TIMEOUT` |
+| `lock_timeout` | 5 s | the session value after connecting is `0` (PostgreSQL's default: no timeout) | `options='-c lock_timeout=<value>'` in the connection string, or `ALTER ROLE ... SET` / `ALTER DATABASE ... SET lock_timeout` |
+| `statement_timeout` | 30 s | the session value after connecting is `0` | `options='-c statement_timeout=<value>'`, or a role or database setting |
+
+So a server that does not answer cannot hold the startup open (which runs while the stop signals are blocked) for the TCP timeout, and a lock another writer holds cannot stop the engine thread. A non-zero value from the connection string, the role or the database is kept as it is; a value of `0` cannot turn a timeout off (use a large value instead). SQLite has none of these (its busy timeout is 5 s, see below).
+
+A lock or statement timeout is `CLPD_DB_ERROR` with the server's one-line message, for example `canceling statement due to lock timeout (SQLSTATE 55P03)` or `canceling statement due to statement timeout (SQLSTATE 57014)`; the connection stays usable, and inside a transaction the transaction is aborted like after any other error (roll it back). A connection that times out fails to open like any unreachable server (`cannot connect to PostgreSQL: ... timeout expired`). Retrying belongs to the caller (FR-26).
+
 ## Startup
 
 The daemon opens the database after the configuration loads and before the plugins are loaded and initialized ([`plugins.md`](plugins.md)), and `--check` opens it too, so `--check` reports a database the daemon could not reach. A SQLite file that does not exist is created, also under `--check`. The connection is closed when the daemon exits, after the plugins' `shutdown` and the CLIPS environment are gone, and on every startup failure after it was opened.
@@ -74,6 +88,8 @@ An INTEGER parameter is sent to PostgreSQL as `int8`: a function that takes `int
 
 `CLPD_DB_OK`, `CLPD_DB_ERROR` (see `clpd_db_error`, one line), `CLPD_DB_UNIQUE` (unique or primary-key violation), `CLPD_DB_LOST` (connection lost; any open transaction is over, and retrying belongs to the caller, FR-26). `clpd_db_begin` inside a transaction and `clpd_db_commit` or `clpd_db_rollback` outside one are `CLPD_DB_ERROR`. On PostgreSQL a failed statement aborts the open transaction, so the next `clpd_db_commit` returns `CLPD_DB_ERROR` and nothing in it is kept; SQLite does not abort the transaction on an error, so `clpd_db_commit` there returns `CLPD_DB_OK` and keeps the statements that succeeded.
 
+Out of memory anywhere in the database layer is fatal: the daemon writes `clpdaemon: out of memory` to its log stream (stderr, or the original stderr while the trace captures fds 1 and 2) and exits 1.
+
 ## SQLite stand-ins
 
 The SQLite backend accepts PostgreSQL-style DDL type names: `TIMESTAMPTZ` and `JSONB` columns hold TEXT, `BYTEA` holds BLOB. Foreign keys are on, and a busy database is waited for up to 5 s.
@@ -82,8 +98,8 @@ Limitation: SQLite gives `TIMESTAMPTZ` and `JSONB` columns NUMERIC affinity, so 
 
 ## Tests
 
-- `clpdaemon_db`, `clpdaemon_db_sqlite_suite`: the interface and the shared backend suite (`tests/db/db_suite.c`) on SQLite.
-- `clpdaemon_db_pg`: the same suite plus PostgreSQL-only cases (password through `PGPASSFILE`, type mapping, `CLPD_DB_LOST` after the backend is terminated) against a throwaway cluster. `tests/db/pg_cluster.sh` creates it with `initdb` in a private temporary directory, starts it with `pg_ctl` on a Unix socket in that directory only (no TCP), creates the role and database with `psql`, runs the test, and stops and removes the cluster on every exit path. The programs come from `CLPD_PG_BINDIR` when it is set, from `PATH` otherwise; when `initdb`, `pg_ctl` or `psql` is missing the script exits 77 and ctest reports the test as SKIPPED, not failed.
+- `clpdaemon_db`, `clpdaemon_db_sqlite_suite`: the interface (out of memory included, through a link seam on the allocators) and the shared backend suite (`tests/db/db_suite.c`) on SQLite.
+- `clpdaemon_db_pg`: the same suite plus PostgreSQL-only cases (password through `PGPASSFILE`, type mapping, `CLPD_DB_LOST` after the backend is terminated, the default timeouts and their overrides, a long class-22 value that must not leak, out of memory while decoding a `bytea`; a TCP listener on `127.0.0.1` that never answers stands in for an unreachable server) against a throwaway cluster. `tests/db/pg_cluster.sh` creates it with `initdb` in a private temporary directory, starts it with `pg_ctl` on a Unix socket in that directory only (no TCP), creates the role and database with `psql`, runs the test, and stops and removes the cluster on every exit path. The programs come from `CLPD_PG_BINDIR` when it is set, from `PATH` otherwise; when `initdb`, `pg_ctl` or `psql` is missing the script exits 77 and ctest reports the test as SKIPPED, not failed.
 - `clpdaemon_cli`: opening a SQLite database under `--check` and in a running daemon, the open error, an unreachable PostgreSQL server, and the rejected values.
 
 ```sh

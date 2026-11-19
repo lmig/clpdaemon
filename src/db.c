@@ -2,6 +2,7 @@
  * parameter validation, transaction state, error messages and results,
  * shared by the SQLite and PostgreSQL backends (src/db_backend.h). */
 #include "db_backend.h"
+#include "log.h"
 
 #include <libpq-fe.h>
 #include <math.h>
@@ -17,12 +18,16 @@ struct clpd_db_result {
   int64_t affected;
 };
 
+void clpd_db_die_oom(void) {
+  FILE *log = clpd_log();
+  fputs("clpdaemon: out of memory\n", log);
+  fflush(log);
+  exit(1);
+}
+
 static void *xrealloc(void *p, size_t n) {
   void *q = realloc(p, n == 0 ? 1 : n);
-  if (q == NULL) {
-    perror("clpdaemon");
-    exit(1);
-  }
+  if (q == NULL) clpd_db_die_oom();
   return q;
 }
 
@@ -188,10 +193,7 @@ static int check_sql(clpd_db *db, const char *sql, size_t n) {
   int ended = 0, tokens = 0, ok = 0;
   size_t i;
 
-  if (used == NULL) {
-    perror("clpdaemon");
-    exit(1);
-  }
+  if (used == NULL) clpd_db_die_oom();
   while (*p != '\0') {
     char c = *p;
     if (is_space(c)) {

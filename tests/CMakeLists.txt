@@ -53,6 +53,11 @@ set_tests_properties(clpdaemon_db_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 # Link seam for the reader-failure cases, this test binary only: the test
 # wraps poll and read (production objects are unchanged).
 target_link_options(fdcapture_test PRIVATE -Wl,--wrap=poll -Wl,--wrap=read)
+# Out-of-memory cases (T8f): db_test wraps the allocators (src/db.c),
+# db_pg_test wraps PQunescapeBytea (src/db_pg.c).
+target_link_options(db_test PRIVATE
+  -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc)
+target_link_options(db_pg_test PRIVATE -Wl,--wrap=PQunescapeBytea)
 
 # The loader test dlopens the plugins built in <build>/plugins, which take
 # their CLIPS symbols from the test executable.

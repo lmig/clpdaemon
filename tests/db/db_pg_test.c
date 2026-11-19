@@ -9,14 +9,21 @@
 #include "db.h"
 #include "db_suite.h"
 
+#include <arpa/inet.h>
 #include <math.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "expect.h"
+#include "log.h"
 
 #define PASSWORD_MSG                                                       \
   "database: the connection string must not contain a password (use a "  \
@@ -233,6 +240,315 @@ static void test_types_and_messages(void) {
   clpd_db_close(db);
 }
 
+/* Class 22: the quotes are found on the whole message, so a value longer
+ * than the error buffer with quotes inside leaks nothing. */
+static void test_long_class22(void) {
+  clpd_db *db = open_db(conninfo);
+  char value[1200];
+  clpd_db_value p;
+  EXPECT(db != NULL);
+  if (db == NULL) return;
+  memset(value, 'z', sizeof value - 1);
+  value[sizeof value - 1] = '\0';
+  memcpy(value, "a\"LEAKMARK-T8F", 14);
+  memcpy(value + 600, "\"LEAKMARK-T8F\"", 14);
+  p = clpd_db_text(value);
+  EXPECT(clpd_db_exec(db, "SELECT $1::int8", &p, 1, NULL) == CLPD_DB_ERROR);
+  EXPECT(one_line(clpd_db_error(db)));
+  EXPECT(!contains(clpd_db_error(db), "LEAKMARK"));
+  EXPECT(!contains(clpd_db_error(db), "zz"));
+  EXPECT(strcmp(clpd_db_error(db), "invalid input syntax for type bigint: "
+                                   "\"?\" (SQLSTATE 22P02)") == 0);
+  clpd_db_close(db);
+}
+
+static double now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Runs fn in a child process bounded by `limit` seconds, so a missing
+ * timeout fails the case instead of hanging the test. The child opens its
+ * own connections and exits with its failed check count. */
+static void bounded(const char *name, void (*fn)(void), int limit) {
+  struct timespec ts = {0, 20000000};
+  double start = now();
+  int status = 0;
+  pid_t pid, done = 0;
+  fflush(stdout);
+  fflush(stderr);
+  pid = fork();
+  if (pid == 0) {
+    failures = 0;
+    fn();
+    fflush(stderr);
+    _exit(failures > 100 ? 100 : failures);
+  }
+  EXPECT(pid > 0);
+  if (pid <= 0) return;
+  while ((done = waitpid(pid, &status, WNOHANG)) == 0 &&
+         now() - start < limit)
+    nanosleep(&ts, NULL);
+  if (done == 0) {
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    failures++;
+    fprintf(stderr, "FAIL %s: still running after %d s\n", name, limit);
+    return;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    failures += WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    fprintf(stderr, "FAIL %s: child status %d\n", name, status);
+  }
+}
+
+static int show_is(clpd_db *db, const char *setting, const char *want) {
+  char sql[64], text[64] = "";
+  clpd_db_value v;
+  snprintf(sql, sizeof sql, "SHOW %s", setting);
+  return scalar(db, sql, NULL, 0, &v, text, sizeof text) &&
+         strcmp(text, want) == 0;
+}
+
+/* lock_timeout 5 s and statement_timeout 30 s unless the session already
+ * has a non-zero value (options, role or database settings). */
+static void test_session_timeouts(void) {
+  char spec[1024];
+  clpd_db *db = open_db(conninfo), *other;
+  EXPECT(db != NULL);
+  if (db == NULL) return;
+  EXPECT(show_is(db, "lock_timeout", "5s"));
+  EXPECT(show_is(db, "statement_timeout", "30s"));
+
+  snprintf(spec, sizeof spec,
+           "%s options='-c lock_timeout=200ms -c statement_timeout=300ms'",
+           conninfo);
+  other = open_db(spec);
+  EXPECT(other != NULL);
+  if (other != NULL) {
+    EXPECT(show_is(other, "lock_timeout", "200ms"));
+    EXPECT(show_is(other, "statement_timeout", "300ms"));
+  }
+  clpd_db_close(other);
+
+  /* A role setting wins too; the other one keeps the default. */
+  EXPECT(run(db, "ALTER ROLE CURRENT_USER SET statement_timeout = '7s'") ==
+         CLPD_DB_OK);
+  other = open_db(conninfo);
+  EXPECT(other != NULL);
+  if (other != NULL) {
+    EXPECT(show_is(other, "statement_timeout", "7s"));
+    EXPECT(show_is(other, "lock_timeout", "5s"));
+  }
+  clpd_db_close(other);
+  EXPECT(run(db, "ALTER ROLE CURRENT_USER RESET statement_timeout") ==
+         CLPD_DB_OK);
+  clpd_db_close(db);
+}
+
+/* Waits on a row another connection holds: CLPD_DB_ERROR (55P03) after the
+ * lock timeout, and the connection stays usable. */
+static void wait_for_lock(clpd_db *db, double min, double max) {
+  double start;
+  clpd_db_value v;
+  start = now();
+  EXPECT(run(db, "UPDATE pg_lock SET n = 2 WHERE id = 1") == CLPD_DB_ERROR);
+  start = now() - start;
+  EXPECT(start >= min && start <= max);
+  EXPECT(one_line(clpd_db_error(db)));
+  EXPECT(contains(clpd_db_error(db), "lock timeout"));
+  EXPECT(contains(clpd_db_error(db), "(SQLSTATE 55P03)"));
+  EXPECT(scalar(db, "SELECT 1", NULL, 0, &v, NULL, 0));
+  EXPECT(v.type == CLPD_DB_INTEGER && v.integer == 1);
+}
+
+static void case_lock_timeout(void) {
+  char spec[1024];
+  clpd_db *holder = open_db(conninfo), *fast, *slow;
+  EXPECT(holder != NULL);
+  if (holder == NULL) return;
+  EXPECT(run(holder, "CREATE TABLE pg_lock (id BIGINT PRIMARY KEY, "
+                     "n BIGINT)") == CLPD_DB_OK);
+  EXPECT(run(holder, "INSERT INTO pg_lock VALUES (1, 0)") == CLPD_DB_OK);
+  EXPECT(clpd_db_begin(holder) == CLPD_DB_OK);
+  EXPECT(run(holder, "UPDATE pg_lock SET n = 1 WHERE id = 1") == CLPD_DB_OK);
+
+  /* Override through options. */
+  snprintf(spec, sizeof spec, "%s options='-c lock_timeout=200ms'", conninfo);
+  fast = open_db(spec);
+  EXPECT(fast != NULL);
+  if (fast != NULL) {
+    wait_for_lock(fast, 0.15, 3.0);
+    /* Inside a transaction: the statement fails, rollback ends it. */
+    EXPECT(clpd_db_begin(fast) == CLPD_DB_OK);
+    EXPECT(run(fast, "UPDATE pg_lock SET n = 2 WHERE id = 1") ==
+           CLPD_DB_ERROR);
+    EXPECT(contains(clpd_db_error(fast), "55P03"));
+    EXPECT(clpd_db_rollback(fast) == CLPD_DB_OK);
+    wait_for_lock(fast, 0.15, 3.0);
+  }
+  clpd_db_close(fast);
+
+  /* The 5 s default. */
+  slow = open_db(conninfo);
+  EXPECT(slow != NULL);
+  if (slow != NULL) wait_for_lock(slow, 4.5, 8.0);
+  clpd_db_close(slow);
+
+  EXPECT(clpd_db_rollback(holder) == CLPD_DB_OK);
+  EXPECT(run(holder, "DROP TABLE pg_lock") == CLPD_DB_OK);
+  clpd_db_close(holder);
+}
+
+/* A statement over statement_timeout is CLPD_DB_ERROR (57014); the
+ * connection stays usable. */
+static void case_statement_timeout(void) {
+  char spec[1024];
+  clpd_db *db;
+  clpd_db_value v;
+  double start;
+  snprintf(spec, sizeof spec, "%s options='-c statement_timeout=300ms'",
+           conninfo);
+  db = open_db(spec);
+  EXPECT(db != NULL);
+  if (db == NULL) return;
+  start = now();
+  EXPECT(run(db, "SELECT pg_sleep(20)") == CLPD_DB_ERROR);
+  start = now() - start;
+  EXPECT(start >= 0.25 && start <= 3.0);
+  EXPECT(one_line(clpd_db_error(db)));
+  EXPECT(contains(clpd_db_error(db), "statement timeout"));
+  EXPECT(contains(clpd_db_error(db), "(SQLSTATE 57014)"));
+  EXPECT(scalar(db, "SELECT 2", NULL, 0, &v, NULL, 0));
+  EXPECT(v.type == CLPD_DB_INTEGER && v.integer == 2);
+  clpd_db_close(db);
+}
+
+/* connect_timeout: a TCP listener that never answers (the kernel accepts
+ * the connection, nobody reads the startup packet). */
+static int silent_port;
+static const char *connect_extra;
+static double connect_min, connect_max;
+
+static void case_connect_timeout(void) {
+  char spec[256], msg[512] = "";
+  clpd_db *db = (clpd_db *)&db;
+  double start;
+  snprintf(spec, sizeof spec,
+           "host=127.0.0.1 port=%d dbname=clpd_test user=clpd_test "
+           "sslmode=disable gssencmode=disable%s",
+           silent_port, connect_extra);
+  start = now();
+  EXPECT(clpd_db_open(spec, &db, msg, sizeof msg) == CLPD_DB_ERROR);
+  start = now() - start;
+  EXPECT(db == NULL);
+  EXPECT(one_line(msg));
+  EXPECT(contains(msg, "timeout expired"));
+  if (!(start >= connect_min && start <= connect_max)) {
+    failures++;
+    fprintf(stderr, "FAIL connect timeout%s: %.1f s, expected %.0f-%.0f\n",
+            connect_extra, start, connect_min, connect_max);
+  }
+}
+
+static void case_connect_timeout_env(void) {
+  setenv("PGCONNECT_TIMEOUT", "3", 1);
+  case_connect_timeout();
+}
+
+static void test_connect_timeout(void) {
+  struct sockaddr_in a;
+  socklen_t len = sizeof a;
+  int s = socket(AF_INET, SOCK_STREAM, 0), ok;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ok = s >= 0 && bind(s, (struct sockaddr *)&a, sizeof a) == 0 &&
+       listen(s, 16) == 0 &&
+       getsockname(s, (struct sockaddr *)&a, &len) == 0;
+  EXPECT(ok);
+  if (!ok) {
+    if (s >= 0) close(s);
+    return;
+  }
+  silent_port = ntohs(a.sin_port);
+  connect_extra = ""; /* the 10 s default */
+  connect_min = 9.0;
+  connect_max = 13.0;
+  bounded("connect_timeout default", case_connect_timeout, 20);
+  connect_extra = " connect_timeout=2"; /* the spec's value wins */
+  connect_min = 1.5;
+  connect_max = 4.5;
+  bounded("connect_timeout=2", case_connect_timeout, 10);
+  connect_extra = ""; /* PGCONNECT_TIMEOUT wins over the default */
+  connect_min = 2.5;
+  connect_max = 5.5;
+  bounded("PGCONNECT_TIMEOUT=3", case_connect_timeout_env, 10);
+  close(s);
+}
+
+/* Link seam (-Wl,--wrap=PQunescapeBytea, this test binary only). */
+static int fail_unescape;
+unsigned char *__real_PQunescapeBytea(const unsigned char *from, size_t *n);
+unsigned char *__wrap_PQunescapeBytea(const unsigned char *from, size_t *n);
+unsigned char *__wrap_PQunescapeBytea(const unsigned char *from, size_t *n) {
+  if (fail_unescape) return NULL;
+  return __real_PQunescapeBytea(from, n);
+}
+
+static char oom_log[64], oom_err[64];
+
+static void case_out_of_memory(void) {
+  FILE *log = fopen(oom_log, "w"), *err = freopen(oom_err, "w", stderr);
+  clpd_db *db;
+  if (log == NULL || err == NULL) _exit(4);
+  clpd_log_set(log);
+  db = open_db(conninfo);
+  if (db == NULL) _exit(5);
+  fail_unescape = 1;
+  run(db, "SELECT '\\x00ff'::bytea");
+  _exit(3);
+}
+
+/* Out of memory decoding a bytea: a fixed message on the daemon log
+ * stream (not stdio stderr, no errno text) and exit 1. */
+static void test_out_of_memory(void) {
+  char dir[] = "/tmp/clpd_db_pg_test.XXXXXX", buf[256];
+  int status = 0;
+  pid_t pid;
+  FILE *f;
+  size_t n;
+  if (mkdtemp(dir) == NULL) {
+    EXPECT(0);
+    return;
+  }
+  snprintf(oom_log, sizeof oom_log, "%s/log", dir);
+  snprintf(oom_err, sizeof oom_err, "%s/err", dir);
+  fflush(stdout);
+  fflush(stderr);
+  pid = fork();
+  if (pid == 0) case_out_of_memory();
+  EXPECT(pid > 0 && waitpid(pid, &status, 0) == pid);
+  EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+  buf[0] = '\0';
+  if ((f = fopen(oom_log, "r")) != NULL) {
+    n = fread(buf, 1, sizeof buf - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+  }
+  EXPECT(strcmp(buf, "clpdaemon: out of memory\n") == 0);
+  n = 1;
+  if ((f = fopen(oom_err, "r")) != NULL) {
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+  }
+  EXPECT(n == 0);
+  unlink(oom_log);
+  unlink(oom_err);
+  rmdir(dir);
+}
+
 /* A commit the server turns into a rollback is an error. */
 static void test_aborted_commit(void) {
   clpd_db *db = open_db(conninfo);
@@ -345,6 +661,12 @@ int main(int argc, char **argv) {
   test_types_and_messages();
   test_aborted_commit();
   test_lost();
+  test_long_class22();
+  test_out_of_memory();
+  test_session_timeouts();
+  bounded("lock_timeout", case_lock_timeout, 25);
+  bounded("statement_timeout", case_statement_timeout, 10);
+  test_connect_timeout();
   suite = clpd_db_suite(conninfo);
   if (suite != 0) fprintf(stderr, "shared suite: %d failed checks\n", suite);
   failures += suite;

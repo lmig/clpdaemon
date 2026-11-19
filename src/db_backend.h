@@ -52,8 +52,16 @@ void clpd_db_set_error(clpd_db *db, const char *fmt, ...)
 #endif
     ;
 
-/* Result building (memory is copied; exits on allocation failure like
- * clpd_strdup). Columns are declared once, before any row. */
+/* Fatal out of memory in the database layer: writes the fixed line
+ * "clpdaemon: out of memory" to the daemon log stream (src/log.h) and exits
+ * 1. No errno text: libpq does not set errno reliably. */
+#if defined(__GNUC__)
+__attribute__((noreturn))
+#endif
+void clpd_db_die_oom(void);
+
+/* Result building (memory is copied; exits on allocation failure through
+ * clpd_db_die_oom). Columns are declared once, before any row. */
 void clpd_db_result_init_columns(clpd_db_result *r, size_t columns);
 void clpd_db_result_set_name(clpd_db_result *r, size_t col, const char *name);
 size_t clpd_db_result_add_row(clpd_db_result *r); /* returns its index */

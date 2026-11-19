@@ -1,10 +1,14 @@
 /* PostgreSQL backend (src/db_backend.h, T8c) on libpq.
  *
- * - Connection: PQconnectdb on the conninfo db.c already checked (no
- *   password: it comes from PGPASSFILE/.pgpass), CONNECTION_OK required,
- *   client encoding UTF8, standard_conforming_strings on (the quoting
- *   db.c's SQL check assumes) and extra_float_digits 3 (exact doubles on
- *   any server). Notices are discarded, never printed.
+ * - Connection: PQconnectdbParams on the conninfo db.c already checked (no
+ *   password: it comes from PGPASSFILE/.pgpass), expanded over a default
+ *   connect_timeout of 10 s, so a connect_timeout in the conninfo (or
+ *   PGCONNECT_TIMEOUT) wins; CONNECTION_OK required, client encoding UTF8,
+ *   standard_conforming_strings on (the quoting db.c's SQL check assumes)
+ *   and extra_float_digits 3 (exact doubles on any server). lock_timeout
+ *   5 s and statement_timeout 30 s when the session value is 0, so a value
+ *   from options=-c ..., role or database settings wins; a timeout is an
+ *   ordinary error (55P03, 57014). Notices are discarded, never printed.
  * - Statements: PQexecParams with text-format parameters (INTEGER as int8,
  *   FLOAT as float8 with %.17g, TEXT untyped so the server types it from
  *   its context, e.g. timestamptz or jsonb), BLOB as a binary bytea
@@ -13,10 +17,12 @@
  *   bytea -> BLOB (decoded), bool -> INTEGER 0/1, anything else TEXT.
  * - Errors: one line, "<primary message> (SQLSTATE <code>)"; the DETAIL
  *   and other fields (which may carry row values) are never shown, and in
- *   data exceptions (class 22) the quoted input value is replaced by "?".
+ *   data exceptions (class 22) everything from the first to the last double
+ *   quote of the whole primary message (the input value) becomes "?".
  *   SQLSTATE 23505 is CLPD_DB_UNIQUE; a failure that leaves the connection
  *   CONNECTION_BAD is CLPD_DB_LOST.
  * - A COMMIT the server answers with ROLLBACK (aborted transaction) fails.
+ * - Out of memory exits through clpd_db_die_oom.
  * Engine thread only, like every clpd_db call. */
 #include "db_backend.h"
 
@@ -37,14 +43,16 @@
 
 #define PG_MAX_PARAMS 65535 /* protocol limit (Int16 count) */
 
+/* Defaults that bound every call on the engine thread (T8f, L80). */
+#define PG_CONNECT_TIMEOUT "10"  /* seconds */
+#define PG_LOCK_TIMEOUT "5s"
+#define PG_STATEMENT_TIMEOUT "30s"
+
 static PGconn *conn_of(clpd_db *db) { return (PGconn *)db->impl; }
 
 static void *xmalloc(size_t n) {
   void *p = calloc(n == 0 ? 1 : n, 1); /* zeroed: no uninitialized slots */
-  if (p == NULL) {
-    perror("clpdaemon");
-    exit(1);
-  }
+  if (p == NULL) clpd_db_die_oom();
   return p;
 }
 
@@ -67,8 +75,7 @@ static void set_conn_error(clpd_db *db, const char *prefix) {
 /* Maps a failed result (res may be NULL) to a status and a message. */
 static clpd_db_status fail_result(clpd_db *db, const PGresult *res,
                                   const char *what) {
-  const char *state, *primary;
-  char msg[CLPD_DB_ERROR_MAX], *first, *last;
+  const char *state, *primary, *first, *last;
 
   if (PQstatus(conn_of(db)) == CONNECTION_BAD) {
     set_conn_error(db, "connection to the database lost");
@@ -81,23 +88,25 @@ static clpd_db_status fail_result(clpd_db *db, const PGresult *res,
     set_conn_error(db, what);
     return CLPD_DB_ERROR;
   }
-  snprintf(msg, sizeof msg, "%s", primary);
   /* Data exceptions quote the offending input, e.g. invalid input syntax
    * for type bigint: "<value>"; the value may contain quotes itself, so
-   * everything from the first to the last quote goes. */
+   * everything from the first to the last quote goes. The quotes are found
+   * on the whole message, before any truncation to the error buffer, so no
+   * part of a long value can remain. */
   first = last = NULL;
   if (state != NULL && strncmp(state, "22", 2) == 0) {
-    first = strchr(msg, '"');
-    last = strrchr(msg, '"');
+    first = strchr(primary, '"');
+    last = strrchr(primary, '"');
   }
   if (first != NULL) {
-    *first = '\0';
-    clpd_db_set_error(db, "%s\"?\"%s (SQLSTATE %s)", msg,
+    size_t head = (size_t)(first - primary);
+    if (head > CLPD_DB_ERROR_MAX) head = CLPD_DB_ERROR_MAX;
+    clpd_db_set_error(db, "%.*s\"?\"%s (SQLSTATE %s)", (int)head, primary,
                       last != first ? last + 1 : "", state);
   } else if (state != NULL && *state != '\0') {
-    clpd_db_set_error(db, "%s (SQLSTATE %s)", msg, state);
+    clpd_db_set_error(db, "%s (SQLSTATE %s)", primary, state);
   } else {
-    clpd_db_set_error(db, "%s", msg);
+    clpd_db_set_error(db, "%s", primary);
   }
   return state != NULL && strcmp(state, "23505") == 0 ? CLPD_DB_UNIQUE
                                                       : CLPD_DB_ERROR;
@@ -144,10 +153,44 @@ static clpd_db_status simple(clpd_db *db, const char *sql, char *tag,
   return st;
 }
 
+/* Sets a timeout setting to `value` when the session has none (0), so a
+ * value from options=-c ..., role or database settings is kept. */
+static clpd_db_status default_timeout(clpd_db *db, const char *name,
+                                      const char *value) {
+  char sql[64];
+  PGresult *res;
+  clpd_db_status st;
+  int zero;
+
+  snprintf(sql, sizeof sql, "SHOW %s", name);
+  res = PQexec(conn_of(db), sql);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
+      PQnfields(res) != 1) {
+    st = fail_result(db, res, "cannot read the session timeouts");
+    PQclear(res);
+    return st;
+  }
+  zero = strcmp(PQgetvalue(res, 0, 0), "0") == 0;
+  PQclear(res);
+  if (!zero) return CLPD_DB_OK;
+  snprintf(sql, sizeof sql, "SET %s = '%s'", name, value);
+  return simple(db, sql, NULL, 0);
+}
+
 static clpd_db_status pg_open(clpd_db *db, const char *target) {
-  PGconn *c = PQconnectdb(target);
+  /* The target is expanded over the earlier keywords (expand_dbname), so
+   * its own connect_timeout overrides the default; PGCONNECT_TIMEOUT only
+   * applies to an unset option, so the default is left out when it is
+   * set. */
+  static const char *const keys[] = {"connect_timeout", "dbname", NULL};
+  const char *values[] = {PG_CONNECT_TIMEOUT, NULL, NULL};
+  const char *env = getenv("PGCONNECT_TIMEOUT");
+  int skip = env != NULL && *env != '\0';
+  PGconn *c;
   clpd_db_status st;
 
+  values[1] = target;
+  c = PQconnectdbParams(keys + skip, values + skip, 1);
   if (c == NULL) {
     clpd_db_set_error(db, "cannot connect to PostgreSQL: out of memory");
     return CLPD_DB_ERROR;
@@ -169,6 +212,10 @@ static clpd_db_status pg_open(clpd_db *db, const char *target) {
   st = simple(db, "SET standard_conforming_strings = on", NULL, 0);
   if (st == CLPD_DB_OK)
     st = simple(db, "SET extra_float_digits = 3", NULL, 0);
+  if (st == CLPD_DB_OK)
+    st = default_timeout(db, "lock_timeout", PG_LOCK_TIMEOUT);
+  if (st == CLPD_DB_OK)
+    st = default_timeout(db, "statement_timeout", PG_STATEMENT_TIMEOUT);
   if (st != CLPD_DB_OK) {
     PQfinish(c);
     db->impl = NULL;
@@ -214,11 +261,10 @@ static void store_value(clpd_db_result *result, size_t row, size_t col,
     v.integer = text[0] == 't';
     break;
   case OID_BYTEA:
+    /* NULL is out of memory (the text is the server's valid bytea
+     * output); libpq leaves errno unspecified, so none is shown. */
     bytes = PQunescapeBytea((const unsigned char *)text, &size);
-    if (bytes == NULL) {
-      perror("clpdaemon");
-      exit(1);
-    }
+    if (bytes == NULL) clpd_db_die_oom();
     v.type = CLPD_DB_BLOB;
     v.data = bytes;
     v.size = size;

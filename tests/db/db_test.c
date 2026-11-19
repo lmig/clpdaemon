@@ -12,9 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "expect.h"
+#include "log.h"
 
 #define PASSWORD_MSG                                                       \
   "database: the connection string must not contain a password (use a "  \
@@ -332,6 +334,69 @@ static void test_sqlite_close_rolls_back(clpd_db **db, const char *spec) {
   if (*db != NULL) EXPECT(sq_count(*db, "SELECT count(*) FROM pgt") == 3);
 }
 
+/* Link seam (--wrap of malloc, calloc and realloc, this test binary only):
+ * while set, every allocation from the linked objects fails (the compiler
+ * may turn realloc(NULL, n) into malloc, or calloc with the memset). */
+static int fail_alloc;
+void *__real_calloc(size_t n, size_t size);
+void *__wrap_calloc(size_t n, size_t size);
+void *__wrap_calloc(size_t n, size_t size) {
+  return fail_alloc ? NULL : __real_calloc(n, size);
+}
+void *__real_malloc(size_t n);
+void *__wrap_malloc(size_t n);
+void *__wrap_malloc(size_t n) { return fail_alloc ? NULL : __real_malloc(n); }
+void *__real_realloc(void *p, size_t n);
+void *__wrap_realloc(void *p, size_t n);
+void *__wrap_realloc(void *p, size_t n) {
+  return fail_alloc ? NULL : __real_realloc(p, n);
+}
+
+/* Reads a whole small file into buf (NUL-terminated); -1 on failure. */
+static long read_small(const char *path, char *buf, size_t n) {
+  FILE *f = fopen(path, "r");
+  size_t got;
+  if (f == NULL) return -1;
+  got = fread(buf, 1, n - 1, f);
+  buf[got] = '\0';
+  fclose(f);
+  return (long)got;
+}
+
+/* Out of memory in db.c is a fixed message on the daemon log stream (not
+ * stdio stderr, no errno text) and exit 1. */
+static void test_out_of_memory(const char *dir) {
+  char log_path[96], err_path[96], spec[96], buf[256];
+  int status = 0;
+  pid_t pid;
+
+  snprintf(log_path, sizeof log_path, "%s/oom.log", dir);
+  snprintf(err_path, sizeof err_path, "%s/oom.err", dir);
+  snprintf(spec, sizeof spec, "sqlite:%s/oom.db", dir);
+  fflush(stdout);
+  fflush(stderr);
+  pid = fork();
+  if (pid == 0) {
+    FILE *log = fopen(log_path, "w"), *err = freopen(err_path, "w", stderr);
+    clpd_db *db = NULL;
+    char msg[256];
+    if (log == NULL || err == NULL) _exit(4);
+    clpd_log_set(log);
+    fail_alloc = 1;
+    clpd_db_open(spec, &db, msg, sizeof msg);
+    _exit(3);
+  }
+  EXPECT(pid > 0 && waitpid(pid, &status, 0) == pid);
+  EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+  EXPECT(read_small(log_path, buf, sizeof buf) >= 0 &&
+         strcmp(buf, "clpdaemon: out of memory\n") == 0);
+  EXPECT(read_small(err_path, buf, sizeof buf) == 0);
+  unlink(log_path);
+  unlink(err_path);
+  snprintf(buf, sizeof buf, "%s/oom.db", dir);
+  unlink(buf);
+}
+
 static void test_sqlite(void) {
   char dir[] = "/tmp/clpd_db_test.XXXXXX", file[64], spec[80], extra[80];
   static const char *const suffixes[] = {"", "-journal", "-wal", "-shm"};
@@ -344,6 +409,7 @@ static void test_sqlite(void) {
     EXPECT(0);
     return;
   }
+  test_out_of_memory(dir);
   test_sqlite_open_failures(dir);
   snprintf(file, sizeof file, "%s/extra.db", dir);
   snprintf(spec, sizeof spec, "sqlite:%s", file);
