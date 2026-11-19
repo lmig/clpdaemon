@@ -1599,6 +1599,41 @@ drop TRUE" ] ||
 clpdaemon: received SIGTERM, stopping" ]; then
     fail "orm ddl: drop allowed" "exit $rc (lines seen $ok), table [$left], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
   fi
+  # A rule of another definition cannot drop (or create) the table, even
+  # with orm_allow_drop = yes (T9d, L84): one log line, the rule halts,
+  # the table and its row are kept.
+  mkdir ormown ormforeign
+  conf ormown/package.conf 'definition = own
+version = 1
+files = own.clp
+orm = orm.conf'
+  conf ormown/own.clp '(deftemplate item (slot wf-id) (slot note))'
+  conf ormown/orm.conf 'item.table = own_item
+item.owned = yes
+item.slot.wf-id = wf_id text string error
+item.slot.note = note text string nil'
+  conf ormforeign/package.conf 'definition = foreign
+version = 1
+files = foreign.clp'
+  conf ormforeign/foreign.clp '(deftemplate go (slot wf-id))
+(defrule r (go (wf-id ?w)) =>
+  (printout t "foreign" crlf)
+  (db-drop-table own@1::item)
+  (printout t "dropped" crlf))
+(deffacts seed (go (wf-id w1)))'
+  sqlite3 foreign.db "CREATE TABLE own_item (wf_id TEXT NOT NULL PRIMARY KEY, note TEXT); INSERT INTO own_item VALUES ('w1', 'kept')"
+  rconf foreign.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/foreign.db
+orm_allow_drop = yes
+packages = ormown, ormforeign"
+  ddlrun "orm ddl: another definition's table is refused" foreign.conf 'foreign' "clpdaemon: n1: running
+clpdaemon: db-drop-table: template 'own@1::item' is not mapped by definition foreign of the calling rule (mapped by own@1)
+[PRCCODE4] Execution halted during the actions of defrule 'r'."
+  cases=$((cases + 1))
+  got=$(sqlite3 foreign.db "SELECT wf_id || ' ' || note FROM own_item" 2>&1)
+  [ "$got" = "w1 kept" ] || fail "orm ddl: the other definition's row is kept" "got [$got]"
 else
   echo "cli_test.sh: sqlite3 not found; the orm ddl catalog cases are skipped" >&2
 fi

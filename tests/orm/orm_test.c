@@ -499,15 +499,17 @@ static void test_type_fits(void) {
   static const char *const lists[] = {
       "integer", "float", "string or symbol", "string", "integer",
       "string or symbol", "string or symbol", "float, string or symbol"};
+  char buf[CLPD_ORM_TYPE_LIST_SIZE];
   int i, j;
   for (i = 0; i < CLPD_ORM_SQL_TYPE_COUNT; i++) {
     for (j = 0; j < CLPD_ORM_CLIPS_TYPE_COUNT; j++)
       EXPECT(clpd_orm_type_fits(i, j) == fits[i][j]);
-    EXPECT(clpd_orm_type_fits_list(i) != NULL &&
-           strcmp(clpd_orm_type_fits_list(i), lists[i]) == 0);
+    EXPECT(clpd_orm_type_fits_list(i, buf, sizeof buf) == buf &&
+           strcmp(buf, lists[i]) == 0);
   }
   EXPECT(clpd_orm_type_fits(CLPD_ORM_SQL_TYPE_COUNT, CLPD_ORM_INTEGER) == 0);
-  EXPECT(clpd_orm_type_fits_list(CLPD_ORM_SQL_TYPE_COUNT) == NULL);
+  EXPECT(clpd_orm_type_fits_list(CLPD_ORM_SQL_TYPE_COUNT, buf, sizeof buf) ==
+         NULL);
 }
 
 int main(void) {

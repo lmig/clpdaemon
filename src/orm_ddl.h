@@ -2,7 +2,10 @@
  * db-check-schema and db-drop-table, registered by the core only when a
  * database is configured. Every SQL text comes from the mapping (quoted
  * identifiers, per-backend type names); each call is one autocommit
- * statement through clpd_db_exec, never BEGIN/COMMIT, never ALTER. */
+ * statement through clpd_db_exec, never BEGIN/COMMIT, never ALTER.
+ * db-create-table and db-drop-table act only from the actions of a rule of
+ * a loaded package, on templates of that package's definition (T9d, L84);
+ * on PostgreSQL they name the table in current_schema(). */
 #ifndef CLPD_ORM_DDL_H
 #define CLPD_ORM_DDL_H
 

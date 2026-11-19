@@ -2,7 +2,7 @@
 
 A rule package can map its deftemplates to database tables and name the database sequences its rules use (S7, S11, FR-22). The mapping lives in a separate file named by the manifest key `orm` ([`packages.md`](packages.md#manifest)). Nothing in it is implicit: every slot of a mapped template gets its own line with the column, the SQL type, the CLIPS type and what a NULL becomes.
 
-The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b) and the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, FR-23). `db-nextval` (T9c) and the per-cycle synchronization (T10) build on this model.
+The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b) and the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23). `db-nextval` (T9c) and the per-cycle synchronization (T10) build on this model.
 
 ## File format
 
@@ -141,27 +141,35 @@ Any error makes the daemon exit 1, like other package errors. Nothing is read fr
 
 ## DDL functions
 
-With a `database` in the configuration the core defines three CLIPS functions (FR-23, D9) before the plugins and packages load; without one they do not exist, so a package calling them fails to load (`Missing function declaration for 'db-create-table'`). Each call is one autocommit statement of its own through the database interface ([`database.md`](database.md)): the functions never send `BEGIN` or `COMMIT` and never `ALTER` a table. The SQL holds only the table, column and type names of the mapping, always quoted (`"shop_order"`); the catalog lookups pass the table name as a parameter (`= $1`).
+With a `database` in the configuration the core defines three CLIPS functions (FR-23, D9) before the plugins and packages load; without one they do not exist, so a package calling them fails to load (`Missing function declaration for 'db-create-table'`). Every statement they send runs in autocommit through the database interface, at most one `CREATE` or `DROP` per call ([`database.md`](database.md)): the functions never send `BEGIN` or `COMMIT` and never `ALTER` a table. The SQL holds only the table, column and type names of the mapping and, on PostgreSQL, the name of the current schema, always quoted (`"public"."shop_order"`); the catalog lookups pass the table name as a parameter (`= $1`).
+
+`db-create-table` and `db-drop-table` change the database, so only a rule may call them, and only for its own workflow definition (L84): the call must come from the actions of a rule of a loaded package, and the template must be mapped by a package of the same definition as that rule's package (any version: a rule of `shop@2` may create the table of `shop@1::order`). Called anywhere else (the top level, a deffacts evaluated at `Reset`, a plugin hook such as `after_load`, a rule of a module that is no package) they fail and touch nothing. `db-check-schema` only reads the catalog and may be called from anywhere, for the template of any loaded package.
 
 | Function | Returns | Effect |
 |---|---|---|
-| `(db-create-table <template>)` | `TRUE`, or `FALSE` on error | `CREATE TABLE IF NOT EXISTS` for an owned table (`owned = yes`): the mapped columns in file order with the backend type names, `NOT NULL` for null policy `error`, `PRIMARY KEY` (`wf_id` column, then the local key columns in order). An existing table is left as it is, rows included, whatever its columns: use `db-check-schema`. A table that is not owned is never created. |
+| `(db-create-table <template>)` | `TRUE`, or `FALSE` on error | From a rule, for a template of its own definition: `CREATE TABLE IF NOT EXISTS` for an owned table (`owned = yes`): the mapped columns in file order with the backend type names, `NOT NULL` for null policy `error`, `PRIMARY KEY` (`wf_id` column, then the local key columns in order). An existing table is left as it is, rows included, whatever its columns: use `db-check-schema`. A table that is not owned is never created. |
 | `(db-check-schema <template>)` | a multifield of difference strings, empty when the table matches; `FALSE` on error | Compares the mapping with the table in the database (owned or not). Columns the mapping does not name are ignored. |
-| `(db-drop-table <template>)` | `TRUE`, or `FALSE` on error | `DROP TABLE IF EXISTS` (so `TRUE` also when the table is already gone), only when the configuration sets `orm_allow_drop = yes` ([`configuration.md`](configuration.md)) and only for an owned table. |
+| `(db-drop-table <template>)` | `TRUE`, or `FALSE` on error | From a rule, for a template of its own definition: `DROP TABLE IF EXISTS` (so `TRUE` also when the table is already gone), only when the configuration sets `orm_allow_drop = yes` ([`configuration.md`](configuration.md)) and only for an owned table. |
 
-Generated SQL, for the example at the top on PostgreSQL:
+Generated SQL, for the example at the top on PostgreSQL with the current schema `public`:
 
 ```sql
-CREATE TABLE IF NOT EXISTS "shop_order" ("wf_id" TEXT NOT NULL, "line_no" BIGINT NOT NULL, "status" TEXT, "amount" NUMERIC, "placed_at" TIMESTAMPTZ, PRIMARY KEY ("wf_id", "line_no"))
+CREATE TABLE IF NOT EXISTS "public"."shop_order" ("wf_id" TEXT NOT NULL, "line_no" BIGINT NOT NULL, "status" TEXT, "amount" NUMERIC, "placed_at" TIMESTAMPTZ, PRIMARY KEY ("wf_id", "line_no"))
+DROP TABLE IF EXISTS "public"."shop_order"
 ```
+
+On PostgreSQL both statements name the schema `db-check-schema` inspects, `current_schema()` (the first schema of the `search_path` that exists), read with `SELECT current_schema()` just before; so a table of the same name in a later `search_path` schema is never created over, dropped or reported. When no schema of the `search_path` exists the call is an error. On SQLite the table name is unqualified (the `main` database).
 
 ### Template names
 
-`<template>` is a symbol or a string: `<package>::<template>` (`shop@1::order`) names the template of that package; an unqualified name is the template of the current module's package (the package of the rule that calls the function) when that package maps it, otherwise the template of the only loaded package that maps it. When several packages (versions of one definition) map it and none is the current module's, the call is an error that asks to qualify the name. Only packages whose mapping passed every check count. A wrong argument type or count is reported by CLIPS itself.
+`<template>` is a symbol or a string: `<package>::<template>` (`shop@1::order`) names the template of that package; an unqualified name is the template of the caller's package when that package maps it, otherwise the template of the only loaded package that maps it. When several packages map it and none is the caller's, the call is an error that asks to qualify the name. Only packages whose mapping passed every check count. A wrong argument type or count is reported by CLIPS itself.
+
+- `db-check-schema`: the caller's package is the package of the current module (the package of the rule that calls it, or of the module set at the top level); every loaded package counts.
+- `db-create-table` and `db-drop-table`: the caller's package is the package of the executing rule, and only the packages of its definition count. A qualified name of another definition's package, or an unqualified name only other definitions map, is an error of its own; several versions of the own definition mapping an unqualified name ask to qualify it, listing only those versions.
 
 ### db-check-schema
 
-The table is looked up in the current schema: on PostgreSQL `information_schema.tables` and `information_schema.columns` with `table_schema = current_schema() AND table_name = $1`; on SQLite `sqlite_master` (`name = $1`, tables and views) and `pragma_table_info($1)`. Column names compare exactly on PostgreSQL and without ASCII case on SQLite. The strings, per mapped column in file order:
+The table is looked up in the current schema: on PostgreSQL `information_schema.tables` and `information_schema.columns` with `table_schema = current_schema() AND table_name = $1`; on SQLite `sqlite_master` (`name = $1 COLLATE NOCASE`, tables and views) and `pragma_table_info($1)`. Table and column names compare exactly on PostgreSQL (the generated names are quoted, so `"SHOP_ORDER"` is another table) and without ASCII case on SQLite, as SQLite itself resolves names: a table created as `SHOP_ORDER` is the one `db-check-schema` inspects and the one `CREATE TABLE IF NOT EXISTS` leaves in place. The strings, per mapped column in file order:
 
 | Difference | String |
 |---|---|
@@ -178,15 +186,19 @@ An error writes one line to the daemon log stream (stderr, or the original stder
 
 | Situation | Message |
 |---|---|
+| `db-create-table` or `db-drop-table` outside the actions of a rule | `clpdaemon: <udf>: only a rule of a rule package may call it (no rule is executing)` |
+| `db-create-table` or `db-drop-table` from a rule of a module that is no package | `clpdaemon: <udf>: only a rule of a rule package may call it (rule '<rule>' is in module '<module>')` |
 | No loaded package maps the template | `clpdaemon: <udf>: unknown template '<template>' (no loaded package maps it)` |
-| Unqualified name mapped by several packages | `clpdaemon: <udf>: template '<template>' is mapped by <pkg>, <pkg>[, ...]: qualify it as <package>::<template>` |
+| `db-create-table` or `db-drop-table` on a template only other definitions map | `clpdaemon: <udf>: template '<template>' is not mapped by definition <definition> of the calling rule (mapped by <pkg>[, <pkg>...])`, the packages of other definitions that map it (for a qualified name, the package named) |
+| Unqualified name mapped by several packages | `clpdaemon: <udf>: template '<template>' is mapped by <pkg>, <pkg>[, ...]: qualify it as <package>::<template>` (for `db-create-table` and `db-drop-table`, only versions of the calling rule's definition) |
 | `db-create-table` on a table that is not owned | `clpdaemon: db-create-table: template '<template>': table '<table>' is not owned (owned = no), so it is never created` |
 | `db-drop-table` with `orm_allow_drop = no` | `clpdaemon: db-drop-table: dropping tables is disabled (orm_allow_drop = no)` |
 | `db-drop-table` on a table that is not owned | `clpdaemon: db-drop-table: template '<template>': table '<table>' is not owned (owned = no), so it is never dropped` |
-| The database refuses a statement | `clpdaemon: <udf>: template '<template>': table '<table>': <database message>` ([`database.md`](database.md#status), one line) |
+| PostgreSQL: no schema of the `search_path` exists (`db-create-table`, `db-drop-table`) | `clpdaemon: <udf>: template '<template>': table '<table>': no current schema (the search_path names no existing schema)` |
+| The database refuses a statement (also a catalog lookup or the `current_schema()` query) | `clpdaemon: <udf>: template '<template>': table '<table>': <database message>` ([`database.md`](database.md#status), one line) |
 
-`<udf>` is the function name, `<template>` the argument as given (control characters shown as `?`, at most 200 bytes). The checks run in the order of the table: the name first, then for `db-drop-table` the configuration key, then ownership.
+`<udf>` is the function name, `<template>` the argument as given, `<rule>` and `<module>` the calling rule and its module (all three with control characters shown as `?`, at most 200 bytes). The checks run in the order of the table: for `db-create-table` and `db-drop-table` the caller first, then the name, then for `db-drop-table` the configuration key, then ownership, then the current schema and the statement.
 
 ## Interface
 
-`src/orm.h` holds the CLIPS-free model and parser: `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list`, `clpd_orm_template_of` and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register`, which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.
+`src/orm.h` holds the CLIPS-free model and parser: `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of` and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register`, which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.

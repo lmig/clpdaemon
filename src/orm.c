@@ -4,6 +4,7 @@
 
 #include "log.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -437,8 +438,9 @@ void clpd_orm_free(clpd_orm *orm) {
   memset(orm, 0, sizeof *orm);
 }
 
-/* The CLIPS types each sql type holds (L83), one bit per clpd_orm_clips_type,
- * and how messages list them. */
+/* The CLIPS types each sql type holds (L83), one bit per
+ * clpd_orm_clips_type: the only source of both clpd_orm_type_fits and the
+ * lists messages show. */
 #define FIT(c) (1u << (c))
 static const unsigned fits[CLPD_ORM_SQL_TYPE_COUNT] = {
     FIT(CLPD_ORM_INTEGER),                                       /* bigint */
@@ -449,9 +451,6 @@ static const unsigned fits[CLPD_ORM_SQL_TYPE_COUNT] = {
     FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),                 /* timestamptz */
     FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),                 /* jsonb */
     FIT(CLPD_ORM_FLOAT) | FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL)}; /* numeric */
-static const char *const fit_lists[CLPD_ORM_SQL_TYPE_COUNT] = {
-    "integer", "float", "string or symbol", "string", "integer",
-    "string or symbol", "string or symbol", "float, string or symbol"};
 
 int clpd_orm_type_fits(clpd_orm_sql_type t, clpd_orm_clips_type c) {
   if ((unsigned)t >= CLPD_ORM_SQL_TYPE_COUNT ||
@@ -460,8 +459,22 @@ int clpd_orm_type_fits(clpd_orm_sql_type t, clpd_orm_clips_type c) {
   return (fits[t] & FIT(c)) != 0;
 }
 
-const char *clpd_orm_type_fits_list(clpd_orm_sql_type t) {
-  return (unsigned)t < CLPD_ORM_SQL_TYPE_COUNT ? fit_lists[t] : NULL;
+const char *clpd_orm_type_fits_list(clpd_orm_sql_type t, char *buf,
+                                    size_t n) {
+  size_t len = 0, left = 0;
+  int c;
+  if ((unsigned)t >= CLPD_ORM_SQL_TYPE_COUNT || n == 0) return NULL;
+  buf[0] = '\0';
+  for (c = 0; c < CLPD_ORM_CLIPS_TYPE_COUNT; c++)
+    if ((fits[t] & FIT(c)) != 0) left++;
+  for (c = 0; c < CLPD_ORM_CLIPS_TYPE_COUNT; c++) {
+    if ((fits[t] & FIT(c)) == 0) continue;
+    left--;
+    snprintf(buf + len, n - len, "%s%s", clips_names[c],
+             left > 1 ? ", " : left == 1 ? " or " : "");
+    len += strlen(buf + len);
+  }
+  return buf;
 }
 
 const clpd_orm_template *clpd_orm_template_of(const clpd_orm *orm,

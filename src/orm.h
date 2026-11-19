@@ -126,9 +126,14 @@ const char *clpd_orm_backend_type(clpd_orm_sql_type t, const char *backend);
  * float, string and symbol; text, timestamptz and jsonb hold string and
  * symbol; bytea holds string. 0 otherwise or out of range. */
 int clpd_orm_type_fits(clpd_orm_sql_type t, clpd_orm_clips_type c);
-/* The CLIPS types t holds as messages name them ("integer", "string or
- * symbol", "float, string or symbol", ...), or NULL out of range. */
-const char *clpd_orm_type_fits_list(clpd_orm_sql_type t);
+/* Writes the CLIPS types t holds (clpd_orm_type_fits), as messages name
+ * them, into buf: in clpd_orm_clips_type order, ", " between them and
+ * " or " before the last ("integer", "string or symbol", "float, string or
+ * symbol"). Returns buf, or NULL out of range or when n is 0;
+ * CLPD_ORM_TYPE_LIST_SIZE bytes always suffice. */
+#define CLPD_ORM_TYPE_LIST_SIZE 48
+const char *clpd_orm_type_fits_list(clpd_orm_sql_type t, char *buf,
+                                    size_t n);
 
 /* The mapped template `name` of orm, or NULL. */
 const clpd_orm_template *clpd_orm_template_of(const clpd_orm *orm,

@@ -206,11 +206,12 @@ static int bind_template(Deftemplate *d, clpd_orm_template *t,
   for (i = 0; i < t->column_count; i++) {
     const clpd_orm_column *c = &t->columns[i];
     if (!clpd_orm_type_fits(c->sql_type, c->clips_type)) {
+      char fit[CLPD_ORM_TYPE_LIST_SIZE];
       fprintf(err, ORM_PREFIX "template '%s': slot '%s': sql type %s cannot "
                    "hold clips type %s (expected %s)\n", pkg, t->name,
               c->slot, clpd_orm_sql_type_name(c->sql_type),
               clpd_orm_clips_type_name(c->clips_type),
-              clpd_orm_type_fits_list(c->sql_type));
+              clpd_orm_type_fits_list(c->sql_type, fit, sizeof fit));
       errors++;
     }
     if ((s = slot_of(d, c->slot)) == NULL) {
@@ -262,54 +263,63 @@ static int bind_template(Deftemplate *d, clpd_orm_template *t,
   return errors;
 }
 
-/* The first earlier package of another definition whose mapping names
- * the table (or, with seq, the sequence) `name`, or NULL. */
-static const char *mapped_by(const clpd_packages *out, const char *name,
-                             int seq) {
-  const clpd_package *pkg = &out->items[out->count - 1];
-  size_t i, j;
-  for (i = 0; i + 1 < out->count; i++) {
+/* What a mapping name is: PostgreSQL keeps tables and sequences in one
+ * namespace, so the checks compare names of both kinds. */
+typedef enum { ORM_TABLE, ORM_SEQUENCE } orm_name_kind;
+
+/* 1 when mapping o names `name` as a table or sequence (kind). check_orm
+ * stores a package's orm only after clpd_orm_parse succeeded, and a valid
+ * mapping has a table for every template and a name for every sequence,
+ * so strcmp never sees NULL. */
+static int names(const clpd_orm *o, const char *name, orm_name_kind kind) {
+  size_t j;
+  if (kind == ORM_SEQUENCE) {
+    for (j = 0; j < o->sequence_count; j++)
+      if (strcmp(o->sequences[j].name, name) == 0) return 1;
+  } else {
+    for (j = 0; j < o->template_count; j++)
+      if (strcmp(o->templates[j].table, name) == 0) return 1;
+  }
+  return 0;
+}
+
+/* The first of the first n packages of out whose mapping names `name`
+ * (kind), skipping the packages of definition `skip` when it is not NULL;
+ * or NULL. */
+static const char *first_naming(const clpd_packages *out, size_t n,
+                                const char *name, orm_name_kind kind,
+                                const char *skip) {
+  size_t i;
+  for (i = 0; i < n; i++) {
     const clpd_package *o = &out->items[i];
-    /* check_orm stores o->orm only after clpd_orm_parse succeeded, and a
-     * valid mapping has a table for every template and a name for every
-     * sequence, so neither strcmp below sees NULL. */
     if (o->orm == NULL ||
-        strcmp(o->manifest.definition, pkg->manifest.definition) == 0)
+        (skip != NULL && strcmp(o->manifest.definition, skip) == 0))
       continue;
-    if (seq) {
-      for (j = 0; j < o->orm->sequence_count; j++)
-        if (strcmp(o->orm->sequences[j].name, name) == 0)
-          return o->manifest.name;
-    } else {
-      for (j = 0; j < o->orm->template_count; j++)
-        if (strcmp(o->orm->templates[j].table, name) == 0)
-          return o->manifest.name;
-    }
+    if (names(o->orm, name, kind)) return o->manifest.name;
   }
   return NULL;
 }
 
-/* The first package of out (earlier ones in load order, then the last one
- * when self is nonzero) whose mapping names the table (or, with seq, the
- * sequence) `name`, whatever its definition; or NULL. PostgreSQL keeps
- * tables and sequences in one namespace, so a name cannot be both. */
-static const char *named_by(const clpd_packages *out, const char *name,
-                            int seq, int self) {
-  size_t i, j, n = out->count - (self ? 0 : 1);
-  for (i = 0; i < n; i++) {
-    const clpd_orm *o = out->items[i].orm;
-    if (o == NULL) continue;
-    if (seq) {
-      for (j = 0; j < o->sequence_count; j++)
-        if (strcmp(o->sequences[j].name, name) == 0)
-          return out->items[i].manifest.name;
-    } else {
-      for (j = 0; j < o->template_count; j++)
-        if (strcmp(o->templates[j].table, name) == 0)
-          return out->items[i].manifest.name;
-    }
-  }
-  return NULL;
+/* The first earlier package of another definition than the last package
+ * of out that maps `name` (kind), or NULL. */
+static const char *mapped_by_other_definition(const clpd_packages *out,
+                                              const char *name,
+                                              orm_name_kind kind) {
+  return first_naming(out, out->count - 1, name, kind,
+                      out->items[out->count - 1].manifest.definition);
+}
+
+/* The first earlier package (any definition) that maps `name` (kind), or
+ * NULL. */
+static const char *named_by_earlier(const clpd_packages *out,
+                                    const char *name, orm_name_kind kind) {
+  return first_naming(out, out->count - 1, name, kind, NULL);
+}
+
+/* Like named_by_earlier, then the last package of out itself. */
+static const char *named_by_any(const clpd_packages *out, const char *name,
+                                orm_name_kind kind) {
+  return first_naming(out, out->count, name, kind, NULL);
 }
 
 /* Versions of one definition that share a table map it identically (T9b,
@@ -382,28 +392,32 @@ static int check_orm(Environment *env, clpd_packages *out, int have_database,
     }
   }
   for (i = 0; i < orm->template_count; i++) {
-    if ((other = mapped_by(out, orm->templates[i].table, 0)) != NULL) {
+    if ((other = mapped_by_other_definition(out, orm->templates[i].table,
+                                            ORM_TABLE)) != NULL) {
       fprintf(err, ORM_PREFIX "table '%s' is already mapped by %s\n", name,
               orm->templates[i].table, other);
       errors++;
     }
   }
   for (i = 0; i < orm->sequence_count; i++) {
-    if ((other = mapped_by(out, orm->sequences[i].name, 1)) != NULL) {
+    if ((other = mapped_by_other_definition(out, orm->sequences[i].name,
+                                            ORM_SEQUENCE)) != NULL) {
       fprintf(err, ORM_PREFIX "sequence '%s' is already mapped by %s\n", name,
               orm->sequences[i].name, other);
       errors++;
     }
   }
   for (i = 0; i < orm->sequence_count; i++) {
-    if ((other = named_by(out, orm->sequences[i].name, 0, 1)) != NULL) {
+    if ((other = named_by_any(out, orm->sequences[i].name, ORM_TABLE)) !=
+        NULL) {
       fprintf(err, ORM_PREFIX "sequence '%s' has the name of a table mapped "
                    "by %s\n", name, orm->sequences[i].name, other);
       errors++;
     }
   }
   for (i = 0; i < orm->template_count; i++) {
-    if ((other = named_by(out, orm->templates[i].table, 1, 0)) != NULL) {
+    if ((other = named_by_earlier(out, orm->templates[i].table,
+                                  ORM_SEQUENCE)) != NULL) {
       fprintf(err, ORM_PREFIX "table '%s' has the name of a sequence mapped "
                    "by %s\n", name, orm->templates[i].table, other);
       errors++;
