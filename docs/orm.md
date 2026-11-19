@@ -2,7 +2,7 @@
 
 A rule package can map its deftemplates to database tables and name the database sequences its rules use (S7, S11, FR-22). The mapping lives in a separate file named by the manifest key `orm` ([`packages.md`](packages.md#manifest)). Nothing in it is implicit: every slot of a mapped template gets its own line with the column, the SQL type, the CLIPS type and what a NULL becomes.
 
-The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b) the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23) and the [sequence functions](#sequence-functions) `db-create-sequence` and `db-nextval` (T9c). The per-cycle synchronization (T10) builds on this model.
+The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b, T9e), the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23), and the [sequence functions](#sequence-functions) `db-create-sequence` and `db-nextval` (T9c, T9e). The per-cycle synchronization (T10) builds on this model.
 
 ## File format
 
@@ -36,7 +36,7 @@ seq.order_no.owned   = yes
 
 | Key | Value | Default |
 |---|---|---|
-| `<tpl>.table` | table name, an [identifier](#identifiers) | required |
+| `<tpl>.table` | table name, an [identifier](#identifiers); not `clpd_sequence`, reserved on every backend for the daemon's sequence counters ([below](#generated-sql)) | required |
 | `<tpl>.owned` | `yes`: the table belongs to the daemon (`db-create-table` may create it, `db-drop-table` may drop it when `orm_allow_drop = yes`); `no`: an existing table, never created nor dropped | required |
 | `<tpl>.key` | comma-separated list of zero or more slots, the local key in order; `wf-id` is always the first key column and is not listed | empty (the key is `wf-id` alone) |
 | `<tpl>.slot.<slot>` | `<column> <sql-type> <clips-type> <null>`, four fields separated by spaces or tabs | one line required for every slot |
@@ -89,7 +89,7 @@ What a NULL column becomes when a row is loaded into a fact (T10):
 
 The mapping is read after the package's files, the `wf-id` lint and the `ingest` check ([`packages.md`](packages.md#loading)), at startup and under `--check`. A package with `orm` needs a database: without the `database` key in the configuration ([`database.md`](database.md)) it is an error. The checks are:
 
-1. The file itself: syntax, unknown or repeated keys, values, required keys, null policy of key slots, a column, table or sequence used twice in the file.
+1. The file itself: syntax, unknown or repeated keys, values (the reserved table name `clpd_sequence` included), required keys, null policy of key slots, a column, table or sequence used twice in the file.
 2. A configured `database`.
 3. Each mapped template, in file order: it is a deftemplate of the package; it has a `wf-id` slot; each slot line, in file order, has an SQL type that holds its CLIPS type, names a slot of the template, and that slot's type constraint allows the declared CLIPS type and, with null policy `nil`, SYMBOL; each key slot is a slot of the template; every slot of the template is mapped and none is a multislot.
 4. Tables, then sequences, already mapped by an earlier package of another definition. Versions of one definition (`shop@1` and `shop@2`) may map the same tables and sequences; two definitions may not. A package whose mapping file is valid claims its tables and sequences even if a later check failed. The mapping is not read when a file of the package fails to load (step 2 of [`packages.md`](packages.md#loading)).
@@ -107,6 +107,7 @@ Any error makes the daemon exit 1, like other package errors. Nothing is read fr
 | Key of no known form | `clpdaemon: <file>:<line>: unknown key '<key>'` |
 | Repeated key | `clpdaemon: <file>:<line>: duplicate key '<key>' (first set on line <n>)` |
 | Bad table or sequence name | `clpdaemon: <file>:<line>: <key>: expected an identifier matching [a-z_][a-z0-9_]* (at most 63 bytes), got '<value>'` |
+| Table named `clpd_sequence` (on every backend) | `clpdaemon: <file>:<line>: <tpl>.table: table name 'clpd_sequence' is reserved (the daemon's sequence counter table)` |
 | Bad column name | `clpdaemon: <file>:<line>: <key>: column: expected an identifier matching [a-z_][a-z0-9_]* (at most 63 bytes), got '<column>'` |
 | Bad sequence alias | `clpdaemon: <file>:<line>: <key>: sequence alias: expected an identifier matching [a-z_][a-z0-9_]* (at most 63 bytes), got '<alias>'` |
 | Bad `owned` | `clpdaemon: <file>:<line>: <key>: expected yes or no, got '<value>'` |
@@ -215,13 +216,15 @@ A rule draws numbers from the database sequences its package maps (`seq.<alias>`
 | | PostgreSQL | SQLite |
 |---|---|---|
 | `db-create-sequence` | `SELECT current_schema()`, then `CREATE SEQUENCE IF NOT EXISTS "<schema>"."<name>"` (PostgreSQL's defaults: `bigint`, start 1, increment 1) | `CREATE TABLE IF NOT EXISTS "clpd_sequence" ("name" TEXT PRIMARY KEY, "value" INTEGER NOT NULL)`, then `INSERT INTO "clpd_sequence" ("name", "value") VALUES ($1, 0) ON CONFLICT ("name") DO NOTHING` |
-| `db-nextval` | `SELECT current_schema()`, then `SELECT nextval($1)` with `"<schema>"."<name>"` as the TEXT parameter (no cast in the SQL text) | `UPDATE "clpd_sequence" SET "value" = "value" + 1 WHERE "name" = $1 AND "value" < 9223372036854775807 RETURNING "value"` |
+| `db-nextval` | `SELECT current_schema()`, then `SELECT nextval($1)` with `"<schema>"."<name>"` as the TEXT parameter (no cast in the SQL text) | `UPDATE "clpd_sequence" SET "value" = "value" + 1 WHERE "name" = $1 AND typeof("value") = 'integer' AND "value" < 9223372036854775807 RETURNING "value"` |
 
-On PostgreSQL the sequence lives in `current_schema()`, like the tables: a same-named sequence of a later `search_path` schema is never created over or advanced. SQLite has no sequences, so the counter table `clpd_sequence` stands in for them (tests only, [`database.md`](database.md#sqlite-stand-ins)): one row per sequence name, `value` the last value returned (0 before the first), advanced by one `UPDATE ... RETURNING` statement (SQLite 3.35 or later). Do not map a table named `clpd_sequence` on SQLite. When a call fails or returns no value, the function looks the sequence up (PostgreSQL: a relation of that name in `current_schema()` in `pg_catalog.pg_class`; SQLite: the counter table and the row) to tell a missing sequence from another error. The largest value is 9223372036854775807 (INT64): on SQLite the guard leaves a row at the maximum unchanged and the call is an error; on PostgreSQL the sequence's own `MAXVALUE` applies and the call fails with PostgreSQL's message.
+On PostgreSQL the sequence lives in `current_schema()`, like the tables: a same-named sequence of a later `search_path` schema is never created over or advanced. SQLite has no sequences, so the counter table `clpd_sequence` stands in for them (tests only, [`database.md`](database.md#sqlite-stand-ins)): one row per sequence name, `value` the last value returned (0 before the first), advanced by one `UPDATE ... RETURNING` statement (SQLite 3.35 or later). So that no mapped table can collide with it (and `db-drop-table` never resets the counters), the table name `clpd_sequence` is reserved on every backend: a mapping that names it does not load ([messages](#messages)). The `UPDATE` only advances a row whose value is an INTEGER below the maximum: a value of another type, written by someone else (a REAL would be advanced and come back as a REAL; TEXT and BLOB compare above every number), leaves the row unchanged and the call is an error of its own. When a call fails or returns no value, the function looks the sequence up (PostgreSQL: a sequence, `relkind = 'S'`, of that name in `current_schema()` in `pg_catalog.pg_class`, so a table or view of that name is a missing sequence; SQLite: the counter table, the row and the type of its value) to tell a missing sequence from another error. The largest value is 9223372036854775807 (INT64): on SQLite the guard leaves a row at the maximum unchanged and the call is an error; on PostgreSQL the sequence's own `MAXVALUE` applies and the call fails with PostgreSQL's message.
+
+On SQLite `db-create-sequence` sends two autocommit statements, the `CREATE TABLE IF NOT EXISTS` of the counter table and the `INSERT` of the row. When the `INSERT` fails the call returns `FALSE` with the database message, but the counter table the first statement created stays (empty of that row): `db-nextval` then reports the sequence as missing, and calling `db-create-sequence` again adds the row.
 
 ### Sequence errors
 
-The same log line, CLIPS evaluation error and `FALSE` as the [DDL errors](#errors); nothing is created or advanced.
+The same log line, CLIPS evaluation error and `FALSE` as the [DDL errors](#errors); nothing is advanced, and nothing is created except the SQLite counter table when only the row's `INSERT` fails ([above](#generated-sql)).
 
 | Situation | Message |
 |---|---|
@@ -230,11 +233,12 @@ The same log line, CLIPS evaluation error and `FALSE` as the [DDL errors](#error
 | An alias only other definitions map (for a qualified alias, the package named) | `clpdaemon: <udf>: sequence alias '<alias>' is not mapped by definition <definition> of the calling rule (mapped by <pkg>[, <pkg>...])` |
 | Unqualified alias mapped by several versions of the calling rule's definition | `clpdaemon: <udf>: sequence alias '<alias>' is mapped by <pkg>, <pkg>[, ...]: qualify it as <package>::<alias>` |
 | `db-create-sequence` on a sequence that is not owned | `clpdaemon: db-create-sequence: sequence alias '<alias>': sequence '<name>' is not owned (owned = no), so it is never created` |
-| `db-nextval` on a sequence that does not exist (SQLite: no counter table or no row) | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>' does not exist` |
+| `db-nextval` on a sequence that does not exist (PostgreSQL: no sequence of that name in `current_schema()`, also when a table or view has the name; SQLite: no counter table or no row) | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>' does not exist` |
+| SQLite: the counter row holds a value that is no INTEGER (REAL, TEXT, BLOB; written by someone else), left unchanged | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>': the counter value is not an INTEGER` |
 | SQLite: the counter is at 9223372036854775807 | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>' has reached its maximum value` |
 | PostgreSQL: no schema of the `search_path` exists | `clpdaemon: <udf>: sequence alias '<alias>': sequence '<name>': no current schema (the search_path names no existing schema)` |
-| The database refuses a statement (PostgreSQL's maximum included: `nextval: reached maximum value of sequence "?" (9223372036854775807) (SQLSTATE 2200H)`, the name hidden like every data exception, [`database.md`](database.md#status)) | `clpdaemon: <udf>: sequence alias '<alias>': sequence '<name>': <database message>` |
-| SQLite: the counter row holds no INTEGER (written by someone else) | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>': the database returned no INTEGER` |
+| The database refuses a statement (PostgreSQL's maximum included: `nextval: reached maximum value of sequence "?" (9223372036854775807) (SQLSTATE 2200H)`, the name hidden like every data exception, [`database.md`](database.md#status)), or `db-nextval` got no value and the lookup that follows fails | `clpdaemon: <udf>: sequence alias '<alias>': sequence '<name>': <database message>` |
+| `db-nextval`: the statement returned a value that is no INTEGER (neither backend's statement should: a safety net) | `clpdaemon: db-nextval: sequence alias '<alias>': sequence '<name>': the database returned no INTEGER` |
 
 `<alias>` is the argument as given (control characters shown as `?`, at most 200 bytes). The checks run in the order of the table: the caller, the alias, ownership, then the statements.
 
@@ -245,6 +249,11 @@ The same log line, CLIPS evaluation error and `FALSE` as the [DDL errors](#error
 - PostgreSQL: `CREATE SEQUENCE IF NOT EXISTS` and `nextval($1)` on the name qualified with `current_schema()`, the name passed as a TEXT parameter; SQLite: the counter table `clpd_sequence(name TEXT PRIMARY KEY, value INTEGER NOT NULL)` with one row per name, starting so that the first value is 1, like PostgreSQL.
 - Errors as the other DDL functions; a missing sequence and an INT64 overflow are errors (SQLite guards in the statement, so the row is not changed; PostgreSQL reports its own error); error messages never show a value from the database.
 
+### Decisions (T9e)
+
+- The table name `clpd_sequence` is reserved on every backend (a mapping naming it fails to load), so a mapped table can never be the SQLite counter table.
+- PostgreSQL: only a sequence (`relkind = 'S'`) counts as existing in the lookup after a failed `nextval`. SQLite: the `UPDATE` also requires `typeof("value") = 'integer'`, so a counter of another type is never advanced and gets its own message instead of the maximum-value one.
+
 ## Interface
 
-`src/orm.h` holds the CLIPS-free model and parser: `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of`, `clpd_orm_sequence_of` (T9c) and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register`, (all five functions), which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.
+`src/orm.h` holds the CLIPS-free model and parser: `CLPD_ORM_SEQUENCE_TABLE` (the reserved `clpd_sequence`), `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of`, `clpd_orm_sequence_of` (T9c) and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register` (all five functions), which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.

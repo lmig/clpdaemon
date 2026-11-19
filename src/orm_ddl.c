@@ -63,8 +63,11 @@ static void shown(const char *s, char *out, size_t n) {
 typedef enum { NAMES_TEMPLATE, NAMES_SEQUENCE } name_kind;
 
 /* How messages call the argument and the database object it maps. */
-static const char *const argument_word[] = {"template", "sequence alias"};
-static const char *const object_word[] = {"table", "sequence"};
+static const char *const argument_word[] = {[NAMES_TEMPLATE] = "template",
+                                            [NAMES_SEQUENCE] =
+                                                "sequence alias"};
+static const char *const object_word[] = {[NAMES_TEMPLATE] = "table",
+                                          [NAMES_SEQUENCE] = "sequence"};
 
 typedef struct {
   name_kind kind;
@@ -123,12 +126,35 @@ static int mapped(const clpd_package *p) {
   return p->orm != NULL && p->orm_templates != NULL;
 }
 
-/* The template or sequence `name` of a mapped package p, or NULL. */
-static const void *lookup(const clpd_package *p, name_kind kind,
-                          const char *name) {
-  if (!mapped(p)) return NULL;
-  if (kind == NAMES_TEMPLATE) return clpd_orm_template_of(p->orm, name);
-  return clpd_orm_sequence_of(p->orm, name);
+/* The template `name` of a mapped package p, or NULL. */
+static const clpd_orm_template *template_in(const clpd_package *p,
+                                            const char *name) {
+  return mapped(p) ? clpd_orm_template_of(p->orm, name) : NULL;
+}
+
+/* The sequence of a mapped package p whose alias is `alias`, or NULL. */
+static const clpd_orm_sequence *sequence_in(const clpd_package *p,
+                                            const char *alias) {
+  return mapped(p) ? clpd_orm_sequence_of(p->orm, alias) : NULL;
+}
+
+/* 1 when the mapped package p maps `name` (a template or an alias, per
+ * kind); then, with out, sets out->pkg and out->t or out->s. */
+static int maps(const clpd_package *p, name_kind kind, const char *name,
+                target *out) {
+  const clpd_orm_template *t = NULL;
+  const clpd_orm_sequence *s = NULL;
+  if (kind == NAMES_TEMPLATE)
+    t = template_in(p, name);
+  else
+    s = sequence_in(p, name);
+  if (t == NULL && s == NULL) return 0;
+  if (out != NULL) {
+    out->pkg = p;
+    out->t = t;
+    out->s = s;
+  }
+  return 1;
 }
 
 /* The loaded package of module m, or NULL. */
@@ -155,7 +181,7 @@ static char *mappers(const clpd_packages *pkgs, name_kind kind,
   size_t i;
   for (i = 0; i < pkgs->count; i++) {
     const clpd_package *p = &pkgs->items[i];
-    if (in_scope(p, definition) == in && lookup(p, kind, name) != NULL) {
+    if (in_scope(p, definition) == in && maps(p, kind, name, NULL)) {
       if (list.len > 0) put(&list, ", ");
       put(&list, p->manifest.name);
     }
@@ -174,10 +200,10 @@ static int resolve(UDFContext *ctx, UDFValue *ret, const clpd_package *caller,
   const clpd_orm_ddl *ddl = ctx->context;
   const clpd_packages *pkgs = ddl->packages;
   const char *word = argument_word[kind];
-  const void *item = NULL;
   UDFValue arg;
   const char *name, *sep;
   size_t i, found = 0;
+  int resolved = 0;
 
   if (!UDFFirstArgument(ctx, LEXEME_BITS, &arg)) {
     ret->lexemeValue = FalseSymbol(ctx->environment);
@@ -192,31 +218,29 @@ static int resolve(UDFContext *ctx, UDFValue *ret, const clpd_package *caller,
   sep = strstr(name, "::");
   if (sep != NULL) {
     size_t n = (size_t)(sep - name);
-    for (i = 0; i < pkgs->count && item == NULL; i++) {
+    for (i = 0; i < pkgs->count && !resolved; i++) {
       const clpd_package *p = &pkgs->items[i];
-      if (strlen(p->manifest.name) == n &&
-          strncmp(p->manifest.name, name, n) == 0 &&
-          (item = lookup(p, kind, sep + 2)) != NULL)
-        out->pkg = p;
+      resolved = strlen(p->manifest.name) == n &&
+                 strncmp(p->manifest.name, name, n) == 0 &&
+                 maps(p, kind, sep + 2, out);
     }
-    if (item != NULL && !in_scope(out->pkg, definition)) {
+    if (resolved && !in_scope(out->pkg, definition)) {
       fail(ctx, ret, "%s '%s' is not mapped by definition %s of the calling "
                      "rule (mapped by %s)", word, out->name, definition,
            out->pkg->manifest.name);
       return 0;
     }
-  } else if (caller != NULL && (item = lookup(caller, kind, name)) != NULL) {
-    out->pkg = caller;
+  } else if (caller != NULL && maps(caller, kind, name, out)) {
+    resolved = 1;
   } else {
+    /* The first package mapping it fills out. */
     for (i = 0; i < pkgs->count; i++) {
       const clpd_package *p = &pkgs->items[i];
-      const void *it;
-      if (in_scope(p, definition) && (it = lookup(p, kind, name)) != NULL &&
-          found++ == 0) {
-        out->pkg = p;
-        item = it;
-      }
+      if (in_scope(p, definition) &&
+          maps(p, kind, name, found == 0 ? out : NULL))
+        found++;
     }
+    resolved = found == 1;
     if (found > 1) {
       char *list = mappers(pkgs, kind, name, definition, 1);
       fail(ctx, ret, "%s '%s' is mapped by %s: qualify it as <package>::%s",
@@ -235,15 +259,11 @@ static int resolve(UDFContext *ctx, UDFValue *ret, const clpd_package *caller,
       }
     }
   }
-  if (item == NULL) {
+  if (!resolved) {
     fail(ctx, ret, "unknown %s '%s' (no loaded package maps it)", word,
          out->name);
     return 0;
   }
-  if (kind == NAMES_TEMPLATE)
-    out->t = item;
-  else
-    out->s = item;
   return 1;
 }
 
@@ -394,19 +414,24 @@ static void drop_table(Environment *env, UDFContext *ctx, UDFValue *ret) {
 }
 
 /* SQLite stands in for sequences with one counter row per sequence name
- * (T9c): value is the last value db-nextval returned, 0 before the first,
+ * (T9c) in the table CLPD_ORM_SEQUENCE_TABLE, a name no mapping may use
+ * (T9e): value is the last value db-nextval returned, 0 before the first,
  * like a PostgreSQL sequence with its defaults (START 1, INCREMENT 1). */
+#define LITE_TABLE "\"" CLPD_ORM_SEQUENCE_TABLE "\""
 #define LITE_COUNTERS                                                      \
-  "CREATE TABLE IF NOT EXISTS \"clpd_sequence\" (\"name\" TEXT PRIMARY "  \
-  "KEY, \"value\" INTEGER NOT NULL)"
+  "CREATE TABLE IF NOT EXISTS " LITE_TABLE " (\"name\" TEXT PRIMARY KEY, " \
+  "\"value\" INTEGER NOT NULL)"
 #define LITE_COUNTER_ROW                                                   \
-  "INSERT INTO \"clpd_sequence\" (\"name\", \"value\") VALUES ($1, 0) ON " \
+  "INSERT INTO " LITE_TABLE " (\"name\", \"value\") VALUES ($1, 0) ON "    \
   "CONFLICT (\"name\") DO NOTHING"
-/* One statement; the guard leaves a row at the INT64 maximum unchanged
- * (SQLite would turn the sum into a REAL) and returns no row. */
+/* One statement; the guard leaves a row unchanged and returns no row when
+ * its value is no INTEGER (written by someone else: a REAL would be
+ * advanced, TEXT compares above every number) or is at the INT64 maximum
+ * (SQLite would turn the sum into a REAL). */
 #define LITE_NEXTVAL                                                       \
-  "UPDATE \"clpd_sequence\" SET \"value\" = \"value\" + 1 WHERE \"name\" = " \
-  "$1 AND \"value\" < 9223372036854775807 RETURNING \"value\""
+  "UPDATE " LITE_TABLE " SET \"value\" = \"value\" + 1 WHERE \"name\" = $1 " \
+  "AND typeof(\"value\") = 'integer' AND \"value\" < 9223372036854775807 " \
+  "RETURNING \"value\""
 
 static void create_sequence(Environment *env, UDFContext *ctx,
                             UDFValue *ret) {
@@ -433,42 +458,58 @@ static void create_sequence(Environment *env, UDFContext *ctx,
   if (ok) ret->lexemeValue = TrueSymbol(env);
 }
 
-/* 1 when the target's sequence exists (PostgreSQL: a relation of that
- * name in current_schema(); SQLite: the counter table and its row), 0
- * when it does not, -1 when the lookup itself fails. */
-static int sequence_exists(clpd_db *db, const target *tg) {
-  static const char *const pg_relation =
+/* What the lookup after a db-nextval without a value finds. */
+typedef enum {
+  SEQUENCE_LOOKUP_FAILED,
+  SEQUENCE_MISSING,
+  SEQUENCE_EXISTS,
+  SEQUENCE_NOT_INTEGER /* SQLite: the counter row holds no INTEGER */
+} sequence_state;
+
+/* Looks the target's sequence up: PostgreSQL, a sequence (relkind 'S',
+ * like the tests) of that name in current_schema(); SQLite, the counter
+ * table and its row, and whether the row's value is an INTEGER. */
+static sequence_state sequence_lookup(clpd_db *db, const target *tg) {
+  static const char *const pg_sequence =
       "SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON "
       "n.oid = c.relnamespace WHERE n.nspname = current_schema() AND "
-      "c.relname = $1";
+      "c.relname = $1 AND c.relkind = 'S'";
   static const char *const lite_counters =
-      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = "
-      "'clpd_sequence' COLLATE NOCASE";
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '"
+      CLPD_ORM_SEQUENCE_TABLE "' COLLATE NOCASE";
   static const char *const lite_row =
-      "SELECT 1 FROM \"clpd_sequence\" WHERE \"name\" = $1";
+      "SELECT typeof(\"value\") = 'integer' FROM " LITE_TABLE " WHERE "
+      "\"name\" = $1";
   clpd_db_value name = clpd_db_text(tg->s->name);
   clpd_db_result *r = NULL;
-  int found;
+  sequence_state state;
   if (is_pg(db)) {
-    if (clpd_db_exec(db, pg_relation, &name, 1, &r) != CLPD_DB_OK) return -1;
+    if (clpd_db_exec(db, pg_sequence, &name, 1, &r) != CLPD_DB_OK)
+      return SEQUENCE_LOOKUP_FAILED;
+    state = clpd_db_result_rows(r) > 0 ? SEQUENCE_EXISTS : SEQUENCE_MISSING;
   } else {
-    if (clpd_db_exec(db, lite_counters, NULL, 0, &r) != CLPD_DB_OK) return -1;
-    found = clpd_db_result_rows(r) > 0;
+    if (clpd_db_exec(db, lite_counters, NULL, 0, &r) != CLPD_DB_OK)
+      return SEQUENCE_LOOKUP_FAILED;
+    state = clpd_db_result_rows(r) > 0 ? SEQUENCE_EXISTS : SEQUENCE_MISSING;
     clpd_db_result_free(r);
     r = NULL;
-    if (!found) return 0;
-    if (clpd_db_exec(db, lite_row, &name, 1, &r) != CLPD_DB_OK) return -1;
+    if (state == SEQUENCE_MISSING) return state;
+    if (clpd_db_exec(db, lite_row, &name, 1, &r) != CLPD_DB_OK)
+      return SEQUENCE_LOOKUP_FAILED;
+    if (clpd_db_result_rows(r) == 0)
+      state = SEQUENCE_MISSING;
+    else if (clpd_db_result_value(r, 0, 0)->integer == 0)
+      state = SEQUENCE_NOT_INTEGER;
   }
-  found = clpd_db_result_rows(r) > 0;
   clpd_db_result_free(r);
-  return found;
+  return state;
 }
 
 /* db-nextval: one statement advances the sequence and returns the value;
  * PostgreSQL nextval($1) with the schema-qualified quoted name as a TEXT
  * parameter, SQLite LITE_NEXTVAL. A failure or no value is explained by
- * looking the sequence up: missing, the SQLite maximum, or the database's
- * message. */
+ * looking the sequence up: missing, the database's message, a failed
+ * lookup, a SQLite counter that is no INTEGER, or the SQLite maximum. */
 static void next_value(Environment *env, UDFContext *ctx, UDFValue *ret) {
   const clpd_orm_ddl *ddl = ctx->context;
   int pg = is_pg(ddl->db);
@@ -479,7 +520,7 @@ static void next_value(Environment *env, UDFContext *ctx, UDFValue *ret) {
   clpd_db_value param;
   clpd_db_status st;
   char error[1024];
-  int exists;
+  sequence_state state;
 
   if (!resolve_own(ctx, ret, NAMES_SEQUENCE, &tg)) return;
   if (pg) {
@@ -507,13 +548,15 @@ static void next_value(Environment *env, UDFContext *ctx, UDFValue *ret) {
     return;
   }
   snprintf(error, sizeof error, "%s", clpd_db_error(ddl->db));
-  exists = sequence_exists(ddl->db, &tg);
-  if (exists == 0)
+  state = sequence_lookup(ddl->db, &tg);
+  if (state == SEQUENCE_MISSING)
     fail_on(ctx, ret, &tg, " does not exist");
   else if (st != CLPD_DB_OK)
     fail_on(ctx, ret, &tg, ": %s", error);
-  else if (exists < 0)
+  else if (state == SEQUENCE_LOOKUP_FAILED)
     fail_on(ctx, ret, &tg, ": %s", clpd_db_error(ddl->db));
+  else if (state == SEQUENCE_NOT_INTEGER)
+    fail_on(ctx, ret, &tg, ": the counter value is not an INTEGER");
   else
     fail_on(ctx, ret, &tg, " has reached its maximum value");
 }
@@ -540,14 +583,14 @@ static char affinity(const char *decl) {
 
 /* PostgreSQL udt_name values a column of each sql type may have. */
 static const char *const pg_compatible[CLPD_ORM_SQL_TYPE_COUNT][4] = {
-    {"int8", "int4", "int2", NULL}, /* bigint */
-    {"float8", "float4", NULL},     /* double */
-    {"text", "varchar", NULL},      /* text */
-    {"bytea", NULL},                /* bytea */
-    {"bool", NULL},                 /* boolean */
-    {"timestamptz", NULL},          /* timestamptz */
-    {"jsonb", NULL},                /* jsonb */
-    {"numeric", NULL}};             /* numeric */
+    [CLPD_ORM_BIGINT] = {"int8", "int4", "int2", NULL},
+    [CLPD_ORM_DOUBLE] = {"float8", "float4", NULL},
+    [CLPD_ORM_TEXT] = {"text", "varchar", NULL},
+    [CLPD_ORM_BYTEA] = {"bytea", NULL},
+    [CLPD_ORM_BOOLEAN] = {"bool", NULL},
+    [CLPD_ORM_TIMESTAMPTZ] = {"timestamptz", NULL},
+    [CLPD_ORM_JSONB] = {"jsonb", NULL},
+    [CLPD_ORM_NUMERIC] = {"numeric", NULL}};
 
 /* 1 when an existing column of catalog type `type` holds sql type t: on
  * PostgreSQL one of the udt_names above; on SQLite the declared type has

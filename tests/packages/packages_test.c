@@ -69,6 +69,14 @@ static void done(run *r) {
   DestroyEnvironment(r->env);
 }
 
+static int err_matches(const run *r, const char *want) {
+  if (strcmp(r->err, want) != 0) {
+    fprintf(stderr, "  got:  [%s]\n  want: [%s]\n", r->err, want);
+    return 0;
+  }
+  return 1;
+}
+
 static const char *tmpl = "(deftemplate ev (slot wf-id))\n";
 
 /* Two packages load into their own modules; focus lets the rules of both
@@ -192,6 +200,140 @@ static void test_defmodule_rejected(void) {
   done(&r);
 }
 
+/* T9e (L87): every construct a package file defines must be in the
+ * package's module. A construct in another package's module or in MAIN is
+ * a load error naming the file, the construct type, its qualified name and
+ * the package module, one line per construct in definition order; checked
+ * per construct, so a file that switches back to its own module, a
+ * redefinition of another package's construct (also one with the same
+ * text), a defglobal evaluated into another module, a construct built
+ * while a defglobal is evaluated (the build leaves MAIN current, so the
+ * global lands there too), a deftemplate whose default switches the
+ * module and a message-handler on another module's class are all
+ * caught. */
+static void test_construct_in_other_module(void) {
+  const char *dirs[2];
+  char want[8192], file[300];
+  run r;
+  const char *a = package("own-a", "definition = shop\nversion = 1\n"
+                                   "files = s.clp\n");
+  const char *b = package("own-b", "definition = b\nversion = 1\n"
+                                   "files = f.clp, never.clp\n");
+  write_file(a, "s.clp",
+             "(deftemplate ev (slot wf-id))\n"
+             "(defglobal ?*count* = 0)\n"
+             "(defclass C (is-a USER))\n"
+             "(deffunction f () 1)\n"
+             "(deffunction g () 2)\n"
+             "(defrule start (ev (wf-id ?w)) => )\n");
+  write_file(b, "f.clp",
+             "(deftemplate own (slot wf-id))\n"
+             "(defrule shop@1::planted (ev (wf-id ?w)) => )\n"
+             "(defrule b@1::back (own (wf-id ?w)) => )\n"
+             "(defrule shop@1::start (ev (wf-id ?w)) => )\n"
+             "(deftemplate after (slot wf-id))\n"
+             "(deffunction shop@1::f () 1)\n"
+             "(deftemplate MAIN::m (slot wf-id))\n"
+             "(deffacts MAIN::facts)\n"
+             "(defglobal MAIN ?*g* = 1)\n"
+             "(defglobal shop@1 ?*count* = 0)\n"
+             "(deffunction MAIN::fn () 1)\n"
+             "(defgeneric MAIN::gen)\n"
+             "(defmethod MAIN::gen2 ((?a INTEGER)) 1)\n"
+             "(defclass MAIN::K (is-a USER))\n"
+             "(definstances MAIN::inst)\n"
+             "(defmessage-handler shop@1::C hi () 1)\n"
+             "(defglobal b@1 ?*a* = (set-current-module MAIN)\n"
+             "  ?*b* = (set-current-module b@1))\n"
+             "(defmessage-handler USER hello () 1)\n"
+             "(defglobal ?*z* = (build \"(deffunction MAIN::built () 1)\"))\n"
+             "(deftemplate b@1::home (slot wf-id))\n"
+             "(deftemplate sw (slot wf-id)\n"
+             "  (slot s (default (set-current-module MAIN))))\n"
+             "(deftemplate b@1::last (slot wf-id))\n");
+  write_file(b, "never.clp", "(deftemplate never (slot wf-id))\n");
+  dirs[0] = a;
+  dirs[1] = b;
+  load(&r, dirs, 2);
+  EXPECT(r.rc != 0);
+  snprintf(file, sizeof file, "clpdaemon: %s/f.clp: ", b);
+  snprintf(want, sizeof want,
+           "%sdefrule 'shop@1::planted' is outside the package module b@1\n"
+           "%sdefrule 'shop@1::start' is outside the package module b@1\n"
+           "%sdeftemplate 'shop@1::after' is outside the package module b@1\n"
+           "%sdeffunction 'shop@1::f' is outside the package module b@1\n"
+           "%sdeftemplate 'MAIN::m' is outside the package module b@1\n"
+           "%sdeffacts 'MAIN::facts' is outside the package module b@1\n"
+           "%sdefglobal 'MAIN::?*g*' is outside the package module b@1\n"
+           "%sdefglobal 'shop@1::?*count*' is outside the package module "
+           "b@1\n"
+           "%sdeffunction 'MAIN::fn' is outside the package module b@1\n"
+           "%sdefgeneric 'MAIN::gen' is outside the package module b@1\n"
+           "%sdefmethod 'MAIN::gen2' is outside the package module b@1\n"
+           "%sdefclass 'MAIN::K' is outside the package module b@1\n"
+           "%sdefinstances 'MAIN::inst' is outside the package module b@1\n"
+           "%sdefmessage-handler 'shop@1::C hi primary' is outside the "
+           "package module b@1\n"
+           "%sdefglobal 'MAIN::?*a*' is outside the package module b@1\n"
+           "%sdefmessage-handler 'MAIN::USER hello primary' is outside the "
+           "package module b@1\n"
+           "%sdeffunction 'MAIN::built' is outside the package module b@1\n"
+           "%sdefglobal 'MAIN::?*z*' is outside the package module b@1\n"
+           "%sdeftemplate 'MAIN::sw' is outside the package module b@1\n",
+           file, file, file, file, file, file, file, file, file, file, file,
+           file, file, file, file, file, file, file, file);
+  EXPECT(err_matches(&r, want));
+  /* Loading the package stopped at the file. */
+  EXPECT(FindDeftemplate(r.env, "b@1::never") == NULL);
+  EXPECT(FindDeftemplate(r.env, "b@1::last") != NULL);
+  EXPECT(strcmp(DefmoduleName(GetCurrentModule(r.env)), "MAIN") == 0);
+  done(&r);
+}
+
+/* Constructs of every type in the package's own module load, also with
+ * the module named explicitly, and a later package loads after them. */
+static void test_constructs_in_own_module(void) {
+  const char *dirs[2];
+  run r;
+  const char *a = package("mine", "definition = mine\nversion = 1\n"
+                                  "files = a.clp, b.clp\n"
+                                  "lint_exempt = template:flag\n");
+  const char *b = package("next", "definition = next\nversion = 1\n"
+                                  "files = t.clp\n");
+  write_file(a, "a.clp",
+             "(deftemplate ev (slot wf-id))\n"
+             "(deftemplate mine@1::other (slot wf-id))\n"
+             "(defrule r (ev (wf-id ?w)) (flag) => )\n"
+             "(defrule mine@1::q (other (wf-id ?w)) => )\n"
+             "(deffacts seed (ev (wf-id w1)))\n"
+             "(deffacts mine@1::more (other (wf-id w2)))\n"
+             "(defglobal ?*x* = 1)\n"
+             "(defglobal mine@1 ?*y* = 2 ?*x* = 3)\n"
+             "(deffunction f () 1)\n"
+             "(deffunction mine@1::f () 2)\n"
+             "(defgeneric gen)\n"
+             "(defmethod gen ((?a INTEGER)) 1)\n"
+             "(defmethod mine@1::gen ((?a STRING)) 2)\n"
+             "(defclass K (is-a USER) (slot s))\n"
+             "(defmessage-handler K hi () 1)\n"
+             "(defmessage-handler mine@1::K hi () 2)\n"
+             "(definstances inst (k1 of K))\n");
+  write_file(a, "b.clp", "(defrule mine@1::later (ev (wf-id ?w)) => )\n");
+  write_file(b, "t.clp", tmpl);
+  dirs[0] = a;
+  dirs[1] = b;
+  load(&r, dirs, 2);
+  EXPECT(r.rc == 0 && err_matches(&r, ""));
+  EXPECT(FindDefrule(r.env, "mine@1::later") != NULL &&
+         FindDeftemplate(r.env, "next@1::ev") != NULL);
+  /* The check leaves the watch flags of the globals as CLIPS set them. */
+  EXPECT(!GetWatchState(r.env, GLOBALS));
+  EXPECT(FindDefglobal(r.env, "mine@1::x") != NULL &&
+         !DefglobalGetWatch(FindDefglobal(r.env, "mine@1::x")) &&
+         !DefglobalGetWatch(FindDefglobal(r.env, "mine@1::y")));
+  done(&r);
+}
+
 static void test_duplicate_package(void) {
   const char *dirs[2];
   char want[1024];
@@ -274,14 +416,6 @@ static void test_ingest(void) {
   EXPECT(r.pkgs.count == 3 && r.pkgs.items[1].ingest == NULL &&
          r.pkgs.items[2].ingest == NULL);
   done(&r);
-}
-
-static int err_matches(const run *r, const char *want) {
-  if (strcmp(r->err, want) != 0) {
-    fprintf(stderr, "  got:  [%s]\n  want: [%s]\n", r->err, want);
-    return 0;
-  }
-  return 1;
 }
 
 static const char *orm_tmpl =
@@ -696,6 +830,8 @@ int main(void) {
   test_clips_error_is_forwarded();
   test_directory_in_files();
   test_defmodule_rejected();
+  test_construct_in_other_module();
+  test_constructs_in_own_module();
   test_duplicate_package();
   test_manifest_error();
   test_ingest();

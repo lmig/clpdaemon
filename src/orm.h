@@ -11,6 +11,9 @@
 
 #define CLPD_ORM_IDENT_MAX 63 /* bytes; PostgreSQL's NAMEDATALEN - 1 */
 #define CLPD_ORM_WF_ID "wf-id" /* always the first key slot */
+/* The table that stands in for sequences on SQLite (T9c), reserved on
+ * every backend: no mapping may name it (T9e). */
+#define CLPD_ORM_SEQUENCE_TABLE "clpd_sequence"
 
 /* Logical SQL types; each backend has its own type names (T9b). */
 typedef enum {
@@ -92,6 +95,7 @@ typedef struct {
 } clpd_orm;
 
 /* Reads and validates the mapping file `path` (syntax, keys, identifiers,
+ * the reserved table name CLPD_ORM_SEQUENCE_TABLE,
  * types, null policies, required keys, a column or key slot repeated in a
  * template, a table or sequence mapped twice in the file). Every error is
  * written to err, one line each. Returns 0 when valid; otherwise nonzero,

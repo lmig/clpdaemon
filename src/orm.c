@@ -14,20 +14,29 @@
 #define SLOT_PREFIX "slot."
 
 static const char *const sql_names[CLPD_ORM_SQL_TYPE_COUNT] = {
-    "bigint", "double", "text", "bytea", "boolean", "timestamptz", "jsonb",
-    "numeric"};
+    [CLPD_ORM_BIGINT] = "bigint",   [CLPD_ORM_DOUBLE] = "double",
+    [CLPD_ORM_TEXT] = "text",       [CLPD_ORM_BYTEA] = "bytea",
+    [CLPD_ORM_BOOLEAN] = "boolean", [CLPD_ORM_TIMESTAMPTZ] = "timestamptz",
+    [CLPD_ORM_JSONB] = "jsonb",     [CLPD_ORM_NUMERIC] = "numeric"};
 /* Type names per backend (T9b). The SQLite names keep INTEGER, REAL, TEXT
  * or BLOB affinity, never NUMERIC, so values come back as they were
  * stored (L76): TIMESTAMPTZ, JSONB and NUMERIC are TEXT there. */
 static const char *const pg_names[CLPD_ORM_SQL_TYPE_COUNT] = {
-    "BIGINT", "DOUBLE PRECISION", "TEXT", "BYTEA", "BOOLEAN", "TIMESTAMPTZ",
-    "JSONB", "NUMERIC"};
+    [CLPD_ORM_BIGINT] = "BIGINT",   [CLPD_ORM_DOUBLE] = "DOUBLE PRECISION",
+    [CLPD_ORM_TEXT] = "TEXT",       [CLPD_ORM_BYTEA] = "BYTEA",
+    [CLPD_ORM_BOOLEAN] = "BOOLEAN", [CLPD_ORM_TIMESTAMPTZ] = "TIMESTAMPTZ",
+    [CLPD_ORM_JSONB] = "JSONB",     [CLPD_ORM_NUMERIC] = "NUMERIC"};
 static const char *const sqlite_names[CLPD_ORM_SQL_TYPE_COUNT] = {
-    "INTEGER", "REAL", "TEXT", "BLOB", "INTEGER", "TEXT", "TEXT", "TEXT"};
+    [CLPD_ORM_BIGINT] = "INTEGER",  [CLPD_ORM_DOUBLE] = "REAL",
+    [CLPD_ORM_TEXT] = "TEXT",       [CLPD_ORM_BYTEA] = "BLOB",
+    [CLPD_ORM_BOOLEAN] = "INTEGER", [CLPD_ORM_TIMESTAMPTZ] = "TEXT",
+    [CLPD_ORM_JSONB] = "TEXT",      [CLPD_ORM_NUMERIC] = "TEXT"};
 static const char *const clips_names[CLPD_ORM_CLIPS_TYPE_COUNT] = {
-    "integer", "float", "string", "symbol"};
-static const char *const null_names[CLPD_ORM_NULL_COUNT] = {"nil", "default",
-                                                            "error"};
+    [CLPD_ORM_INTEGER] = "integer", [CLPD_ORM_FLOAT] = "float",
+    [CLPD_ORM_STRING] = "string",   [CLPD_ORM_SYMBOL] = "symbol"};
+static const char *const null_names[CLPD_ORM_NULL_COUNT] = {
+    [CLPD_ORM_NULL_NIL] = "nil", [CLPD_ORM_NULL_DEFAULT] = "default",
+    [CLPD_ORM_NULL_ERROR] = "error"};
 
 const char *clpd_orm_sql_type_name(clpd_orm_sql_type t) {
   return (unsigned)t < CLPD_ORM_SQL_TYPE_COUNT ? sql_names[t] : NULL;
@@ -288,6 +297,11 @@ static void on_template(clpd_kv *kv, clpd_orm *orm, char *key, char *value) {
   if (strcmp(attr, "table") == 0) {
     if (duplicate(kv, key, &t->table_line) || !ident(kv, key, "", value))
       return;
+    if (strcmp(value, CLPD_ORM_SEQUENCE_TABLE) == 0) {
+      clpd_kv_error(kv, "%s: table name '%s' is reserved (the daemon's "
+                        "sequence counter table)", key, value);
+      return;
+    }
     for (i = 0; i < orm->template_count; i++) {
       const clpd_orm_template *o = &orm->templates[i];
       if (o != t && o->table != NULL && strcmp(o->table, value) == 0) {
@@ -443,14 +457,15 @@ void clpd_orm_free(clpd_orm *orm) {
  * lists messages show. */
 #define FIT(c) (1u << (c))
 static const unsigned fits[CLPD_ORM_SQL_TYPE_COUNT] = {
-    FIT(CLPD_ORM_INTEGER),                                       /* bigint */
-    FIT(CLPD_ORM_FLOAT),                                         /* double */
-    FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),                 /* text */
-    FIT(CLPD_ORM_STRING),                                        /* bytea */
-    FIT(CLPD_ORM_INTEGER),                                       /* boolean */
-    FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),                 /* timestamptz */
-    FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),                 /* jsonb */
-    FIT(CLPD_ORM_FLOAT) | FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL)}; /* numeric */
+    [CLPD_ORM_BIGINT] = FIT(CLPD_ORM_INTEGER),
+    [CLPD_ORM_DOUBLE] = FIT(CLPD_ORM_FLOAT),
+    [CLPD_ORM_TEXT] = FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),
+    [CLPD_ORM_BYTEA] = FIT(CLPD_ORM_STRING),
+    [CLPD_ORM_BOOLEAN] = FIT(CLPD_ORM_INTEGER),
+    [CLPD_ORM_TIMESTAMPTZ] = FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),
+    [CLPD_ORM_JSONB] = FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),
+    [CLPD_ORM_NUMERIC] =
+        FIT(CLPD_ORM_FLOAT) | FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL)};
 
 int clpd_orm_type_fits(clpd_orm_sql_type t, clpd_orm_clips_type c) {
   if ((unsigned)t >= CLPD_ORM_SQL_TYPE_COUNT ||

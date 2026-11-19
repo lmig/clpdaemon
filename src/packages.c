@@ -24,12 +24,8 @@ static bool capture_query(Environment *env, const char *name, void *ctx) {
   return strcmp(name, STDERR) == 0 || strcmp(name, STDWRN) == 0;
 }
 
-static void capture_write(Environment *env, const char *name, const char *str,
-                          void *ctx) {
-  capture *c = ctx;
+static void append(capture *c, const char *str) {
   size_t n = strlen(str);
-  (void)env;
-  (void)name;
   if (c->len + n + 1 > c->cap) {
     size_t cap = c->cap == 0 ? 256 : c->cap;
     char *grown;
@@ -43,6 +39,13 @@ static void capture_write(Environment *env, const char *name, const char *str,
   }
   memcpy(c->buf + c->len, str, n + 1);
   c->len += n;
+}
+
+static void capture_write(Environment *env, const char *name, const char *str,
+                          void *ctx) {
+  (void)env;
+  (void)name;
+  append(ctx, str);
 }
 
 /* Writes each non-blank captured line as "clpdaemon: <pkg>: clips: <line>". */
@@ -68,13 +71,372 @@ static size_t module_count(Environment *env) {
   return n;
 }
 
+/* Module guard (T9e, L87): every construct a package file defines must be
+ * in the package's module. While a file loads, the parse function of
+ * every construct type is replaced by a hook that runs it and then looks
+ * at what it defined, so each construct is checked where CLIPS put it,
+ * not only by the current module at the end (a qualified name switches
+ * the current module, and a later one can switch it back):
+ *
+ * - deftemplate, defrule, deffacts, deffunction, defgeneric, defmethod
+ *   (its defgeneric), defclass, definstances: one parse defines one
+ *   construct, and CLIPS appends a new or redefined construct to the end
+ *   of its module's list. The last construct of another module whose list
+ *   changed (its first or last construct) is reported; so is the last
+ *   construct of the current module when the parse left another module
+ *   current (a redefinition can reuse the freed address of the construct
+ *   it replaced, so the list alone cannot tell). A construct built while
+ *   the parse evaluates an expression goes through its own hook.
+ * - defglobal: a redefinition updates the existing global in place, so
+ *   the hook marks the globals the statement touches through their watch
+ *   flag (CLIPS sets it on every global it defines when WatchGlobals is
+ *   on, and keeps it otherwise) and restores every flag afterwards.
+ * - defmessage-handler: the handler of a class of another module (also a
+ *   system class such as USER, visible from every module) that the parse
+ *   added, or whose actions it replaced, is reported.
+ *
+ * Modules created by the file are left to the defmodule check. One load
+ * runs at a time, so the hooks find their state in `guard`. */
+
+#define GUARD_HOOKS 16 /* construct types hooked; CLIPS 6.4 has 10 */
+
+typedef enum { DEFINES_LIST, DEFINES_GLOBALS, DEFINES_HANDLERS } guard_kind;
+
+typedef struct {
+  Construct *construct;
+  bool (*parse)(Environment *, const char *); /* CLIPS's own */
+  guard_kind kind;
+  const char *type;  /* as messages name it: the construct name */
+  unsigned list;     /* DEFINES_LIST: module item of the constructs */
+} guard_hook;
+
+typedef struct {
+  Environment *env;
+  Defmodule *home; /* the package module */
+  const char *file, *pkg;
+  Defmodule **others; /* the modules before the load, without home */
+  size_t other_count;
+  guard_hook hooks[GUARD_HOOKS];
+  size_t hook_count;
+  capture lines; /* the messages, in definition order */
+  int errors;
+  int depth; /* nested parses (a build evaluated by a defglobal) */
+  const void **reported; /* by the outermost parse, never twice */
+  size_t reported_count, reported_cap;
+} module_guard;
+
+static module_guard *guard;
+
+static void *guard_alloc(size_t count, size_t size) {
+  void *p = calloc(count + 1, size);
+  if (p == NULL) clpd_log_die_errno();
+  return p;
+}
+
+/* Index of m in guard->others, or -1 (home, or created by the file). */
+static long other_index(const Defmodule *m) {
+  size_t i;
+  for (i = 0; i < guard->other_count; i++)
+    if (guard->others[i] == m) return (long)i;
+  return -1;
+}
+
+static ConstructHeader *first_item(Defmodule *m, unsigned list) {
+  return ((struct defmoduleItemHeader *)GetModuleItem(guard->env, m, list))
+      ->firstItem;
+}
+
+static ConstructHeader *last_item(Defmodule *m, unsigned list) {
+  return ((struct defmoduleItemHeader *)GetModuleItem(guard->env, m, list))
+      ->lastItem;
+}
+
+/* Writes "clpdaemon: <file>: <type> '<module>::<name>[<suffix>]' is
+ * outside the package module <pkg>" once per construct (item). */
+static void report(const void *item, const char *type, Defmodule *m,
+                   const char *name, const char *suffix) {
+  char line[1024];
+  size_t i;
+  for (i = 0; i < guard->reported_count; i++)
+    if (guard->reported[i] == item) return;
+  if (guard->reported_count == guard->reported_cap) {
+    size_t cap = guard->reported_cap == 0 ? 16 : guard->reported_cap * 2;
+    const void **grown = realloc(guard->reported, cap * sizeof *grown);
+    if (grown == NULL) clpd_log_die_errno();
+    guard->reported = grown;
+    guard->reported_cap = cap;
+  }
+  guard->reported[guard->reported_count++] = item;
+  snprintf(line, sizeof line, "clpdaemon: %s: %s '%s::%s%s' is outside the "
+           "package module %s\n", guard->file, type, DefmoduleName(m), name,
+           suffix, guard->pkg);
+  append(&guard->lines, line);
+  guard->errors++;
+}
+
+static void report_item(const guard_hook *h, ConstructHeader *item) {
+  report(item, h->type, item->whichModule->theModule, item->name->contents,
+         "");
+}
+
+/* What a hooked parse may change, taken before it runs. */
+typedef struct {
+  /* DEFINES_LIST: the first and last construct of each list of the other
+   * modules. */
+  ConstructHeader **first, **last;
+  /* DEFINES_GLOBALS: every global with its watch flag. */
+  Defglobal **globals;
+  unsigned char *watch;
+  size_t global_count;
+  bool watch_globals;
+  /* DEFINES_HANDLERS: the classes of the other modules with the actions
+   * of each handler. */
+  Defclass **classes;
+  Expression ***actions;
+  unsigned short *handler_count;
+  size_t class_count;
+} guard_snapshot;
+
+static void snapshot_lists(const guard_hook *h, guard_snapshot *s) {
+  size_t i;
+  s->first = guard_alloc(guard->other_count, sizeof *s->first);
+  s->last = guard_alloc(guard->other_count, sizeof *s->last);
+  for (i = 0; i < guard->other_count; i++) {
+    s->first[i] = first_item(guard->others[i], h->list);
+    s->last[i] = last_item(guard->others[i], h->list);
+  }
+}
+
+static void compare_lists(const guard_hook *h, const guard_snapshot *s) {
+  long current = other_index(GetCurrentModule(guard->env));
+  size_t i;
+  for (i = 0; i < guard->other_count; i++) {
+    Defmodule *m = guard->others[i];
+    ConstructHeader *last = last_item(m, h->list);
+    if (last != NULL &&
+        ((long)i == current || last != s->last[i] ||
+         first_item(m, h->list) != s->first[i]))
+      report_item(h, last);
+  }
+}
+
+static void free_lists(guard_snapshot *s) {
+  free(s->first);
+  free(s->last);
+}
+
+/* Every global of every module, in module order. */
+static size_t all_globals(Defglobal **out) {
+  unsigned list = DefglobalData(guard->env)->DefglobalModuleIndex;
+  Defmodule *m;
+  ConstructHeader *c;
+  size_t n = 0;
+  for (m = GetNextDefmodule(guard->env, NULL); m != NULL;
+       m = GetNextDefmodule(guard->env, m))
+    for (c = first_item(m, list); c != NULL; c = c->next) {
+      if (out != NULL) out[n] = (Defglobal *)c;
+      n++;
+    }
+  return n;
+}
+
+static void snapshot_globals(guard_snapshot *s) {
+  size_t i;
+  s->global_count = all_globals(NULL);
+  s->globals = guard_alloc(s->global_count, sizeof *s->globals);
+  s->watch = guard_alloc(s->global_count, sizeof *s->watch);
+  all_globals(s->globals);
+  for (i = 0; i < s->global_count; i++) {
+    s->watch[i] = s->globals[i]->watch;
+    s->globals[i]->watch = 0;
+  }
+  s->watch_globals = DefglobalData(guard->env)->WatchGlobals;
+  DefglobalData(guard->env)->WatchGlobals = true;
+}
+
+/* Reports the globals the parse defined in another module (watch set) and
+ * restores the flags as CLIPS would have left them: a redefined global
+ * keeps a set flag, a new one gets WatchGlobals. Also after a failed
+ * parse. */
+static void compare_globals(guard_snapshot *s, int parsed) {
+  size_t n = all_globals(NULL), i, j;
+  Defglobal **now = guard_alloc(n, sizeof *now);
+  all_globals(now);
+  DefglobalData(guard->env)->WatchGlobals = s->watch_globals;
+  for (i = 0; i < n; i++) {
+    int touched = now[i]->watch, old = -1;
+    for (j = 0; j < s->global_count && old < 0; j++)
+      if (s->globals[j] == now[i]) old = s->watch[j];
+    if (parsed && touched &&
+        other_index(now[i]->header.whichModule->theModule) >= 0) {
+      char name[256];
+      snprintf(name, sizeof name, "?*%s*", now[i]->header.name->contents);
+      report(now[i], "defglobal", now[i]->header.whichModule->theModule,
+             name, "");
+    }
+    if (old < 0)
+      now[i]->watch = s->watch_globals;
+    else
+      now[i]->watch = old || (touched && s->watch_globals);
+  }
+  free(now);
+  free(s->globals);
+  free(s->watch);
+}
+
+static void snapshot_handlers(guard_snapshot *s) {
+  unsigned list = FindModuleItem(guard->env, "defclass")->moduleIndex;
+  size_t i, n = 0;
+  unsigned short k;
+  ConstructHeader *c;
+  for (i = 0; i < guard->other_count; i++)
+    for (c = first_item(guard->others[i], list); c != NULL; c = c->next) n++;
+  s->classes = guard_alloc(n, sizeof *s->classes);
+  s->actions = guard_alloc(n, sizeof *s->actions);
+  s->handler_count = guard_alloc(n, sizeof *s->handler_count);
+  for (n = 0, i = 0; i < guard->other_count; i++)
+    for (c = first_item(guard->others[i], list); c != NULL; c = c->next, n++) {
+      Defclass *cls = (Defclass *)c;
+      s->classes[n] = cls;
+      s->handler_count[n] = cls->handlerCount;
+      s->actions[n] = guard_alloc(cls->handlerCount, sizeof **s->actions);
+      for (k = 0; k < cls->handlerCount; k++)
+        s->actions[n][k] = cls->handlers[k].actions;
+    }
+  s->class_count = n;
+}
+
+/* A handler the parse added (InsertHandlerHeader appends it) or whose
+ * actions it replaced (the new actions are parsed while the old ones are
+ * still allocated, so their address differs). */
+static void compare_handlers(guard_snapshot *s, int parsed) {
+  size_t i;
+  unsigned short k;
+  for (i = 0; i < s->class_count; i++) {
+    Defclass *cls = s->classes[i];
+    for (k = 0; parsed && k < cls->handlerCount; k++) {
+      DefmessageHandler *hnd = &cls->handlers[k];
+      char suffix[256];
+      if (k < s->handler_count[i] && hnd->actions == s->actions[i][k])
+        continue;
+      snprintf(suffix, sizeof suffix, " %s %s", hnd->header.name->contents,
+               MessageHandlerData(guard->env)->hndquals[hnd->type]);
+      /* Keyed by the actions: the handler array moves when it grows. */
+      report(hnd->actions, "defmessage-handler",
+             cls->header.whichModule->theModule, cls->header.name->contents,
+             suffix);
+    }
+    free(s->actions[i]);
+  }
+  free(s->classes);
+  free(s->actions);
+  free(s->handler_count);
+}
+
+static bool guarded_parse(Environment *env, const char *source, size_t i) {
+  const guard_hook *h = &guard->hooks[i];
+  guard_snapshot s;
+  bool failed;
+  memset(&s, 0, sizeof s);
+  if (guard->depth++ == 0) guard->reported_count = 0;
+  if (h->kind == DEFINES_LIST)
+    snapshot_lists(h, &s);
+  else if (h->kind == DEFINES_GLOBALS)
+    snapshot_globals(&s);
+  else
+    snapshot_handlers(&s);
+  failed = h->parse(env, source);
+  if (h->kind == DEFINES_LIST) {
+    if (!failed) compare_lists(h, &s);
+    free_lists(&s);
+  } else if (h->kind == DEFINES_GLOBALS) {
+    compare_globals(&s, !failed);
+  } else {
+    compare_handlers(&s, !failed);
+  }
+  guard->depth--;
+  return failed;
+}
+
+#define HOOK(i)                                                        \
+  static bool hook_##i(Environment *env, const char *source) {        \
+    return guarded_parse(env, source, i);                              \
+  }
+HOOK(0) HOOK(1) HOOK(2) HOOK(3) HOOK(4) HOOK(5) HOOK(6) HOOK(7)
+HOOK(8) HOOK(9) HOOK(10) HOOK(11) HOOK(12) HOOK(13) HOOK(14) HOOK(15)
+static bool (*const hooks[GUARD_HOOKS])(Environment *, const char *) = {
+    hook_0,  hook_1,  hook_2,  hook_3,  hook_4,  hook_5,  hook_6,  hook_7,
+    hook_8,  hook_9,  hook_10, hook_11, hook_12, hook_13, hook_14, hook_15};
+
+/* Hooks every construct type but defmodule. Returns 0, or -1 (nothing
+ * hooked) when a type cannot be checked. */
+static int guard_install(module_guard *g, Environment *env,
+                         const clpd_package *pkg, const char *file) {
+  Construct *c;
+  Defmodule *m;
+  size_t n = 0;
+  memset(g, 0, sizeof *g);
+  g->env = env;
+  g->home = pkg->module;
+  g->file = file;
+  g->pkg = pkg->manifest.name;
+  for (m = GetNextDefmodule(env, NULL); m != NULL; m = GetNextDefmodule(env, m))
+    n++;
+  g->others = guard_alloc(n, sizeof *g->others);
+  for (m = GetNextDefmodule(env, NULL); m != NULL; m = GetNextDefmodule(env, m))
+    if (m != g->home) g->others[g->other_count++] = m;
+  for (c = ConstructData(env)->ListOfConstructs; c != NULL; c = c->next) {
+    guard_hook *h;
+    const char *list = c->constructName;
+    ModuleItem *item;
+    if (strcmp(c->constructName, "defmodule") == 0) continue;
+    if (g->hook_count == GUARD_HOOKS) {
+      free(g->others);
+      return -1;
+    }
+    h = &g->hooks[g->hook_count];
+    h->construct = c;
+    h->parse = c->parseFunction;
+    h->type = c->constructName;
+    if (strcmp(list, "defglobal") == 0) {
+      h->kind = DEFINES_GLOBALS;
+    } else if (strcmp(list, "defmessage-handler") == 0) {
+      h->kind = DEFINES_HANDLERS;
+    } else {
+      if (strcmp(list, "defmethod") == 0) list = "defgeneric";
+      if ((item = FindModuleItem(env, list)) == NULL) {
+        free(g->others);
+        return -1;
+      }
+      h->kind = DEFINES_LIST;
+      h->list = item->moduleIndex;
+    }
+    g->hook_count++;
+  }
+  for (n = 0; n < g->hook_count; n++)
+    g->hooks[n].construct->parseFunction = hooks[n];
+  guard = g;
+  return 0;
+}
+
+static void guard_remove(module_guard *g) {
+  size_t i;
+  for (i = 0; i < g->hook_count; i++)
+    g->hooks[i].construct->parseFunction = g->hooks[i].parse;
+  guard = NULL;
+  free(g->others);
+  free(g->reported);
+}
+
 /* Loads one file into the current (package) module. Returns 0 on success. */
 static int load_file(Environment *env, clpd_package *pkg, const char *file,
                      FILE *err) {
   capture cap = {NULL, 0, 0};
   size_t modules = module_count(env);
+  module_guard g;
   LoadError rc;
   struct stat st;
+  int failed = 0;
   FILE *probe = fopen(file, "r");
 
   /* Load reports nothing for a file it cannot open, and fopen succeeds on a
@@ -89,27 +451,35 @@ static int load_file(Environment *env, clpd_package *pkg, const char *file,
     return 1;
   }
   fclose(probe);
+  if (guard_install(&g, env, pkg, file) != 0) {
+    fprintf(err, "clpdaemon: %s: cannot check the modules of its constructs\n",
+            file);
+    return 1;
+  }
   if (!AddRouter(env, CAPTURE_ROUTER, 50, capture_query, capture_write, NULL,
                  NULL, NULL, &cap)) {
+    guard_remove(&g);
     fprintf(err, "clpdaemon: %s: cannot capture CLIPS messages\n", file);
     return 1;
   }
   rc = Load(env, file);
   DeleteRouter(env, CAPTURE_ROUTER);
+  guard_remove(&g);
   forward(&cap, pkg->manifest.name, err);
   free(cap.buf);
   if (rc != LE_NO_ERROR) {
     fprintf(err, "clpdaemon: %s: load failed\n", file);
-    return 1;
-  }
-  /* Building a defmodule makes it the current module; a file that defines
-   * one and switches back would still grow the module count. */
-  if (GetCurrentModule(env) != pkg->module || module_count(env) != modules) {
+    failed = 1;
+  } else if (module_count(env) != modules) {
+    /* A file that defines a defmodule and switches back still grows the
+     * module count; the constructs of the new module are not reported. */
     fprintf(err, "clpdaemon: %s: defmodule is not allowed in package files\n",
             file);
-    return 1;
+    failed = 1;
   }
-  return 0;
+  if (g.lines.buf != NULL) fputs(g.lines.buf, err);
+  free(g.lines.buf);
+  return failed || g.errors != 0;
 }
 
 /* The non-implied deftemplate `name` of the current module, or NULL. */
@@ -174,7 +544,8 @@ static TemplateSlot *slot_of(Deftemplate *t, const char *name) {
 static int type_allowed(Deftemplate *t, const char *slot,
                         clpd_orm_clips_type type) {
   static const char *const symbols[CLPD_ORM_CLIPS_TYPE_COUNT] = {
-      "INTEGER", "FLOAT", "STRING", "SYMBOL"};
+      [CLPD_ORM_INTEGER] = "INTEGER", [CLPD_ORM_FLOAT] = "FLOAT",
+      [CLPD_ORM_STRING] = "STRING", [CLPD_ORM_SYMBOL] = "SYMBOL"};
   CLIPSValue v;
   size_t i;
   if (!DeftemplateSlotTypes(t, slot, &v)) return 0;

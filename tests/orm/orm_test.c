@@ -400,6 +400,35 @@ static void test_shared_names(void) {
   clpd_orm_free(&m);
 }
 
+/* T9e (L87): clpd_sequence is the daemon's own counter table (the SQLite
+ * stand-in for sequences), reserved on every backend: a mapping cannot
+ * name it, and the template is not reported as missing its table. A
+ * sequence of that name stays allowed (it is no table). */
+static void test_reserved_table(void) {
+  clpd_orm m;
+  char eb[2048];
+  EXPECT(parse("o.table = clpd_sequence\n"
+               "o.owned = yes\n"
+               "o.slot.wf-id = wf_id text string error\n"
+               "p.table = clpd_sequence_x\n"
+               "p.owned = no\n"
+               "p.slot.wf-id = wf_id text string error\n"
+               "seq.n = clpd_sequence\n"
+               "seq.n.owned = yes\n",
+               &m, eb, sizeof eb) != 0);
+  EXPECT(err_is(eb, "clpdaemon: %s:1: o.table: table name 'clpd_sequence' is "
+                    "reserved (the daemon's sequence counter table)\n"));
+  clpd_orm_free(&m);
+  EXPECT(parse("p.table = clpd_sequence_x\n"
+               "p.owned = no\n"
+               "p.slot.wf-id = wf_id text string error\n"
+               "seq.n = clpd_sequence\n"
+               "seq.n.owned = yes\n",
+               &m, eb, sizeof eb) == 0);
+  EXPECT(err_is(eb, ""));
+  clpd_orm_free(&m);
+}
+
 static void test_missing_required(void) {
   clpd_orm m;
   char eb[4096];
@@ -526,6 +555,7 @@ int main(void) {
   test_values();
   test_keys();
   test_shared_names();
+  test_reserved_table();
   test_missing_required();
   test_kvfile_rules();
   test_type_names();

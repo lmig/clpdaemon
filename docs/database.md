@@ -96,7 +96,7 @@ The SQLite backend accepts PostgreSQL-style DDL type names: `TIMESTAMPTZ` and `J
 
 Limitation: SQLite gives `TIMESTAMPTZ` and `JSONB` columns NUMERIC affinity, so a numeric-looking string stored there can come back reformatted (`1e2` as `100.0`) and an expression over those columns comes back as a number. SQLite is for tests; the tables the ORM generates use SQLite type names without NUMERIC affinity, and `db-check-schema` rejects a NUMERIC-affinity column there ([`orm.md`](orm.md#sql-types)).
 
-SQLite has no sequences: the ORM's `db-create-sequence` and `db-nextval` keep one row per sequence in the table `clpd_sequence (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`, advanced with `UPDATE ... RETURNING`, which needs SQLite 3.35 or later ([`orm.md`](orm.md#sequence-functions)).
+SQLite has no sequences: the ORM's `db-create-sequence` and `db-nextval` keep one row per sequence in the table `clpd_sequence (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`, advanced with `UPDATE ... RETURNING`, which needs SQLite 3.35 or later, and only while the value is an INTEGER ([`orm.md`](orm.md#sequence-functions)). The name `clpd_sequence` is reserved: an ORM mapping cannot name a table so, on any backend.
 
 ## Tests
 

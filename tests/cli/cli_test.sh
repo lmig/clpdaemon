@@ -144,6 +144,23 @@ packages = lint'
 check "wf-id lint errors" 1 "" \
   "clpdaemon: lint@1: lint: template 'item' has no wf-id slot
 clpdaemon: lint@1: lint: rule 'r': pattern 3 (item) does not bind wf-id to a variable" -- --config lint.conf --check
+# Every construct of a package file must be in the package's module
+# (T9e, L87): a rule planted in another package's module, or a function in
+# MAIN, is a load error, also when the file switches back to its own
+# module.
+mkdir plant
+conf plant/package.conf 'definition = plant
+version = 1
+files = p.clp'
+conf plant/p.clp '(deftemplate go (slot wf-id))
+(defrule fibre-installation@v3::planted (order (wf-id ?w)) => )
+(deffunction MAIN::helper () 1)
+(defrule plant@1::back (go (wf-id ?w)) => )'
+conf plant.conf 'node_id = n1
+packages = pkg, plant'
+check "construct outside the package module" 1 "" \
+  "clpdaemon: plant/p.clp: defrule 'fibre-installation@v3::planted' is outside the package module plant@1
+clpdaemon: plant/p.clp: deffunction 'MAIN::helper' is outside the package module plant@1" -- --config plant.conf --check
 # A failing package does not stop the next one from being checked.
 conf both.conf 'node_id = n1
 packages = gone, dm'
@@ -1477,6 +1494,21 @@ files = bad.clp
 orm = /etc/clpdaemon/orm.conf'
 check "orm: absolute mapping path" 1 "" \
   "clpdaemon: ormbad/package.conf:4: orm: '/etc/clpdaemon/orm.conf' must be relative to the package directory" -- --config ormbad.conf --check
+# The daemon's counter table is a reserved table name (T9e, L87).
+mkdir ormres
+conf ormres/package.conf 'definition = res
+version = 1
+files = res.clp
+orm = orm.conf'
+conf ormres/res.clp '(deftemplate order (slot wf-id))'
+conf ormres/orm.conf 'order.table = clpd_sequence
+order.owned = yes
+order.slot.wf-id = wf_id text string error'
+conf ormres.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+packages = ormres"
+check "orm: reserved table name" 1 "" \
+  "clpdaemon: ormres/orm.conf:1: order.table: table name 'clpd_sequence' is reserved (the daemon's sequence counter table)" -- --config ormres.conf --check
 
 # --- ORM DDL functions (T9b, docs/orm.md#ddl-functions) -----------------------
 # Without a database the functions do not exist, so a package calling one

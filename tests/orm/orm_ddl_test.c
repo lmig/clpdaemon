@@ -43,6 +43,9 @@ clpd_db_status __real_clpd_db_exec(clpd_db *db, const char *sql,
  * instead, so it fails with the backend's own message (once). */
 static const char *fail_sql;
 #define MISSING_TABLE "clpd_missing_table"
+/* The next statement containing replace_sql runs replace_with instead,
+ * with the same parameters (once). */
+static const char *replace_sql, *replace_with;
 
 clpd_db_status __wrap_clpd_db_exec(clpd_db *db, const char *sql,
                                    const clpd_db_value *params, size_t n,
@@ -51,6 +54,10 @@ clpd_db_status __wrap_clpd_db_exec(clpd_db *db, const char *sql,
     fail_sql = NULL;
     return __real_clpd_db_exec(db, "SELECT 1 FROM " MISSING_TABLE, NULL, 0,
                                result);
+  }
+  if (replace_sql != NULL && strstr(sql, replace_sql) != NULL) {
+    replace_sql = NULL;
+    return __real_clpd_db_exec(db, replace_with, params, n, result);
   }
   return __real_clpd_db_exec(db, sql, params, n, result);
 }
@@ -1059,6 +1066,263 @@ static void test_sequence_db_errors(void) {
   EXPECT(!clpd_db_in_transaction(db));
 }
 
+/* The text of one query's rows (columns joined with ' ', rows with '\n')
+ * appended to out; "error: <message>" when it fails. */
+static void put_rows(const char *query, const clpd_db_value *p, size_t n,
+                     char *out, size_t cap) {
+  clpd_db_result *r = NULL;
+  size_t i, j, len;
+  if (__real_clpd_db_exec(db, query, p, n, &r) != CLPD_DB_OK) {
+    len = strlen(out);
+    snprintf(out + len, cap - len, "error: %s\n", clpd_db_error(db));
+    return;
+  }
+  for (i = 0; i < clpd_db_result_rows(r); i++) {
+    for (j = 0; j < clpd_db_result_columns(r); j++) {
+      const clpd_db_value *v = clpd_db_result_value(r, i, j);
+      len = strlen(out);
+      if (v->type == CLPD_DB_INTEGER)
+        snprintf(out + len, cap - len, "%s%lld", j ? " " : "",
+                 (long long)v->integer);
+      else if (v->type == CLPD_DB_FLOAT)
+        snprintf(out + len, cap - len, "%s%g", j ? " " : "", v->real);
+      else if (v->type == CLPD_DB_TEXT)
+        snprintf(out + len, cap - len, "%s%s", j ? " " : "",
+                 (const char *)v->data);
+      else
+        snprintf(out + len, cap - len, "%s?", j ? " " : "");
+    }
+    len = strlen(out);
+    snprintf(out + len, cap - len, "\n");
+  }
+  clpd_db_result_free(r);
+}
+
+/* What the database holds in the current schema, like a dump: every
+ * relation with its definition (SQLite) or kind (PostgreSQL), the rows of
+ * every table and the state of every sequence. */
+static void fingerprint(char *out, size_t cap) {
+  static const char *const lite_objects =
+      "SELECT type, name, coalesce(sql, '') FROM sqlite_master ORDER BY name";
+  static const char *const lite_tables =
+      "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name";
+  static const char *const pg_objects =
+      "SELECT c.relname, c.relkind FROM pg_catalog.pg_class c JOIN "
+      "pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname "
+      "= current_schema() ORDER BY 1";
+  static const char *const pg_tables =
+      "SELECT c.relname, c.relkind FROM pg_catalog.pg_class c JOIN "
+      "pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname "
+      "= current_schema() AND c.relkind IN ('r', 'S') ORDER BY 1";
+  clpd_db_result *r = NULL;
+  size_t i;
+  out[0] = '\0';
+  put_rows(pg ? pg_objects : lite_objects, NULL, 0, out, cap);
+  if (__real_clpd_db_exec(db, pg ? pg_tables : lite_tables, NULL, 0, &r) !=
+      CLPD_DB_OK) {
+    snprintf(out, cap, "error: %s", clpd_db_error(db));
+    return;
+  }
+  for (i = 0; i < clpd_db_result_rows(r); i++) {
+    const char *name = clpd_db_result_value(r, i, 0)->data;
+    char query[256];
+    if (pg && *(const char *)clpd_db_result_value(r, i, 1)->data == 'S')
+      snprintf(query, sizeof query, "SELECT last_value, is_called FROM "
+               "\"%s\"", name);
+    else
+      snprintf(query, sizeof query, "SELECT * FROM \"%s\" ORDER BY 1", name);
+    put_rows(query, NULL, 0, out, cap);
+  }
+  clpd_db_result_free(r);
+}
+
+/* T9e (L87): the follow-ups of db-nextval. PostgreSQL: a relation that is
+ * no sequence is a missing sequence (relkind 'S'). SQLite: a counter that
+ * is no INTEGER is never advanced and has its own message; the maximum
+ * value is an error and changes nothing. Both: the lookup after no value
+ * can fail, and a value that is no INTEGER is reported. */
+static void test_sequence_followups(void) {
+  static const char *const prefix =
+      "clpdaemon: db-nextval: sequence alias 'ticket_no': sequence "
+      "'solo_ticket_no_seq'";
+  char line[512], before[8192], after[8192];
+  long long value = seq_state("solo_ticket_no_seq");
+  EXPECT(value > 0);
+  if (pg) {
+    sql("DROP SEQUENCE solo_ticket_no_seq");
+    sql("CREATE TABLE solo_ticket_no_seq (n BIGINT)");
+    snprintf(line, sizeof line, "%s does not exist", prefix);
+    EXPECT(fails_in("solo@1", "(db-nextval ticket_no)", line));
+    EXPECT(rows("solo_ticket_no_seq") == 0);
+    sql("DROP TABLE solo_ticket_no_seq");
+    sql("CREATE SEQUENCE solo_ticket_no_seq");
+    snprintf(line, sizeof line, "SELECT setval('solo_ticket_no_seq', %lld)",
+             value);
+    sql(line);
+  } else {
+    static const char *const counters[] = {"5.5", "'abc'", "x'00'"};
+    static const char *const stored[] = {"real 5.5", "text abc", "blob ?"};
+    size_t i;
+    for (i = 0; i < 3; i++) {
+      char update[256], got[256] = "", want[64];
+      snprintf(update, sizeof update, "UPDATE clpd_sequence SET value = %s "
+               "WHERE name = 'solo_ticket_no_seq'", counters[i]);
+      sql(update);
+      snprintf(line, sizeof line, "%s: the counter value is not an INTEGER",
+               prefix);
+      EXPECT(fails_in("solo@1", "(db-nextval ticket_no)", line));
+      put_rows("SELECT typeof(value), CASE typeof(value) WHEN 'blob' THEN "
+               "'?' ELSE value END FROM clpd_sequence WHERE name = "
+               "'solo_ticket_no_seq'", NULL, 0, got, sizeof got);
+      snprintf(want, sizeof want, "%s\n", stored[i]);
+      EXPECT(same(counters[i], got, want));
+    }
+    /* The maximum value: an error, nothing changes. */
+    sql("UPDATE clpd_sequence SET value = 9223372036854775807 WHERE name = "
+        "'solo_ticket_no_seq'");
+    fingerprint(before, sizeof before);
+    snprintf(line, sizeof line, "%s has reached its maximum value", prefix);
+    EXPECT(fails_in("solo@1", "(db-nextval ticket_no)", line));
+    fingerprint(after, sizeof after);
+    EXPECT(same("the database after the maximum value", after, before));
+    EXPECT(seq_state("solo_ticket_no_seq") == INT64_MAX);
+    snprintf(line, sizeof line, "UPDATE clpd_sequence SET value = %lld "
+             "WHERE name = 'solo_ticket_no_seq'", value);
+    sql(line);
+  }
+  /* No value, then the lookup fails: its message. */
+  replace_sql = pg ? "nextval" : "UPDATE";
+  replace_with = pg ? "SELECT $1::text WHERE 1 = 0" : "SELECT $1 WHERE 1 = 0";
+  fail_sql = pg ? "pg_class" : "sqlite_master";
+  snprintf(line, sizeof line, "%s: ", prefix);
+  EXPECT(fails_db("solo@1", "(db-nextval ticket_no)", line));
+  EXPECT(replace_sql == NULL);
+  /* A value that is no INTEGER. */
+  replace_sql = pg ? "nextval" : "UPDATE";
+  replace_with = pg ? "SELECT $1::text" : "SELECT $1";
+  snprintf(line, sizeof line, "%s: the database returned no INTEGER", prefix);
+  EXPECT(fails_in("solo@1", "(db-nextval ticket_no)", line));
+  EXPECT(replace_sql == NULL);
+  EXPECT(seq_state("solo_ticket_no_seq") == value);
+  EXPECT(int_in("solo@1", "(db-nextval ticket_no)", value + 1));
+  /* SQLite: db-create-sequence creates the counter table, then the row; a
+   * failed INSERT leaves the table, without the row (docs/orm.md). */
+  if (!pg) {
+    sql("ALTER TABLE clpd_sequence RENAME TO clpd_sequence_saved");
+    fail_sql = "INSERT";
+    EXPECT(fails_db("solo@1", "(db-create-sequence ticket_no)",
+                    "clpdaemon: db-create-sequence: sequence alias "
+                    "'ticket_no': sequence 'solo_ticket_no_seq': "));
+    EXPECT(rows("clpd_sequence") == 0);
+    snprintf(line, sizeof line, "%s does not exist", prefix);
+    EXPECT(fails_in("solo@1", "(db-nextval ticket_no)", line));
+    sql("DROP TABLE clpd_sequence");
+    sql("ALTER TABLE clpd_sequence_saved RENAME TO clpd_sequence");
+    EXPECT(seq_state("solo_ticket_no_seq") == value + 1);
+  }
+  EXPECT(!clpd_db_in_transaction(db));
+}
+
+/* T9e (L87, the verifier's sweep): odd qualified names from a rule of
+ * another definition are refused by every function that changes the
+ * database, which stays as it was. */
+static void test_cross_definition_sweep(void) {
+  static const char *const names[] = {"\"shop@1::order \"", "\"::order\"",
+                                      "\"shop@1::\"", "shop@1::no",
+                                      "shop@1::order", "order"};
+  static const char *const shown_names[] = {"shop@1::order ", "::order",
+                                            "shop@1::", "shop@1::no",
+                                            "shop@1::order", "order"};
+  static const char *const udfs[] = {"db-create-table", "db-drop-table",
+                                     "db-create-sequence", "db-nextval"};
+  char before[8192], after[8192];
+  size_t i, j;
+  ddl.allow_drop = 1;
+  EXPECT(ok_true_in("shop@1", "(db-create-table order)"));
+  sql("INSERT INTO shop_order (wf_id, line_no, status, price) VALUES "
+      "('w7', 7, 'kept', '7')");
+  fingerprint(before, sizeof before);
+  for (i = 0; i < sizeof names / sizeof names[0]; i++) {
+    for (j = 0; j < sizeof udfs / sizeof udfs[0]; j++) {
+      char expr[128], line[512];
+      int table = j < 2, mapped = i >= 4;
+      snprintf(expr, sizeof expr, "(%s %s)", udfs[j], names[i]);
+      if (mapped && table)
+        snprintf(line, sizeof line, "clpdaemon: %s: template '%s' is not "
+                 "mapped by definition solo of the calling rule (mapped by "
+                 "shop@1%s)", udfs[j], shown_names[i],
+                 i == 5 ? ", shop@2" : "");
+      else
+        snprintf(line, sizeof line, "clpdaemon: %s: unknown %s '%s' (no "
+                 "loaded package maps it)", udfs[j],
+                 table ? "template" : "sequence alias", shown_names[i]);
+      EXPECT(fails_in("solo@1", expr, line));
+    }
+  }
+  fingerprint(after, sizeof after);
+  EXPECT(same("the database after the sweep", after, before));
+  sql("DROP TABLE shop_order");
+  ddl.allow_drop = 0;
+}
+
+/* PostgreSQL (the verifier's cases): with search_path = s1, s2 the
+ * functions act on s1 only, and s2's same-named table and sequence keep
+ * their rows and value; a schema name with a double quote is quoted. */
+static void test_schema_names(void) {
+  static const char *const weird_rows =
+      "SELECT count(*) FROM \"we\"\"ird\".\"solo_ticket\"";
+  char s2_before[2048] = "", s2_after[2048] = "", got[256] = "";
+  static const char *const s2_state =
+      "SELECT (SELECT count(*) FROM s2.solo_ticket), (SELECT last_value FROM "
+      "s2.solo_ticket_no_seq), (SELECT is_called FROM "
+      "s2.solo_ticket_no_seq)";
+  ddl.allow_drop = 1;
+  sql("DROP SCHEMA IF EXISTS s1 CASCADE");
+  sql("DROP SCHEMA IF EXISTS s2 CASCADE");
+  sql("DROP SCHEMA IF EXISTS \"we\"\"ird\" CASCADE");
+  sql("CREATE SCHEMA s1");
+  sql("CREATE SCHEMA s2");
+  sql("CREATE TABLE s2.solo_ticket (wf_id TEXT NOT NULL, title TEXT)");
+  sql("INSERT INTO s2.solo_ticket VALUES ('w1', 'kept')");
+  sql("CREATE SEQUENCE s2.solo_ticket_no_seq START 50");
+  sql("SELECT nextval('s2.solo_ticket_no_seq')");
+  put_rows(s2_state, NULL, 0, s2_before, sizeof s2_before);
+  sql("SET search_path = s1, s2");
+  EXPECT(ok_true_in("solo@1", "(db-drop-table ticket)"));
+  EXPECT(ok_true_in("solo@1", "(db-create-table ticket)"));
+  EXPECT(ok_true_in("solo@1", "(db-create-sequence ticket_no)"));
+  EXPECT(int_in("solo@1", "(db-nextval ticket_no)", 1));
+  EXPECT(ok_true_in("solo@1", "(db-drop-table ticket)"));
+  EXPECT(ok_true_in("solo@1", "(db-create-table ticket)"));
+  EXPECT(rows_in("s1", "solo_ticket") == 0);
+  sql("RESET search_path");
+  put_rows(s2_state, NULL, 0, s2_after, sizeof s2_after);
+  EXPECT(same("s2 after the calls", s2_after, s2_before));
+  EXPECT(same("s2 state", s2_before, "1 50 1\n"));
+  sql("CREATE SCHEMA \"we\"\"ird\"");
+  sql("SET search_path = \"we\"\"ird\"");
+  EXPECT(ok_true_in("solo@1", "(db-create-table ticket)"));
+  EXPECT(differences("(db-check-schema ticket)", ""));
+  EXPECT(ok_true_in("solo@1", "(db-create-sequence ticket_no)"));
+  EXPECT(int_in("solo@1", "(db-nextval ticket_no)", 1));
+  EXPECT(int_in("solo@1", "(db-nextval ticket_no)", 2));
+  put_rows(weird_rows, NULL, 0, got, sizeof got);
+  EXPECT(same("we\"ird rows", got, "0\n"));
+  EXPECT(ok_true_in("solo@1", "(db-drop-table ticket)"));
+  got[0] = '\0';
+  put_rows("SELECT count(*) FROM pg_catalog.pg_class c JOIN "
+           "pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE "
+           "n.nspname = 'we\"ird' AND c.relname = 'solo_ticket'",
+           NULL, 0, got, sizeof got);
+  EXPECT(same("we\"ird table dropped", got, "0\n"));
+  sql("RESET search_path");
+  EXPECT(rows("solo_ticket") == -1);
+  sql("DROP SCHEMA s1 CASCADE");
+  sql("DROP SCHEMA s2 CASCADE");
+  sql("DROP SCHEMA \"we\"\"ird\" CASCADE");
+  ddl.allow_drop = 0;
+}
+
 /* PostgreSQL: the sequence is created in and read from current_schema(),
  * never a same-named sequence of a later search_path schema; without a
  * current schema both functions are errors. */
@@ -1210,6 +1474,9 @@ int main(int argc, char **argv) {
   test_sequences();
   test_two_connections();
   test_sequence_db_errors();
+  test_sequence_followups();
+  test_cross_definition_sweep();
+  if (pg) test_schema_names();
   if (pg) test_sequence_search_path();
   test_refused_outside_rules();
   if (!pg) test_sqlite_version();
