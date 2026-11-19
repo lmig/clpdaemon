@@ -482,6 +482,34 @@ static void test_type_names(void) {
          strcmp(clpd_orm_null_name(CLPD_ORM_NULL_ERROR), "error") == 0);
 }
 
+/* T9b (L83): which CLIPS types each sql type holds, and the list the
+ * load-time message names. */
+static void test_type_fits(void) {
+  /* integer, float, string, symbol */
+  static const int fits[CLPD_ORM_SQL_TYPE_COUNT][4] = {
+      {1, 0, 0, 0}, /* bigint */
+      {0, 1, 0, 0}, /* double */
+      {0, 0, 1, 1}, /* text */
+      {0, 0, 1, 0}, /* bytea */
+      {1, 0, 0, 0}, /* boolean */
+      {0, 0, 1, 1}, /* timestamptz */
+      {0, 0, 1, 1}, /* jsonb */
+      {0, 1, 1, 1}, /* numeric */
+  };
+  static const char *const lists[] = {
+      "integer", "float", "string or symbol", "string", "integer",
+      "string or symbol", "string or symbol", "float, string or symbol"};
+  int i, j;
+  for (i = 0; i < CLPD_ORM_SQL_TYPE_COUNT; i++) {
+    for (j = 0; j < CLPD_ORM_CLIPS_TYPE_COUNT; j++)
+      EXPECT(clpd_orm_type_fits(i, j) == fits[i][j]);
+    EXPECT(clpd_orm_type_fits_list(i) != NULL &&
+           strcmp(clpd_orm_type_fits_list(i), lists[i]) == 0);
+  }
+  EXPECT(clpd_orm_type_fits(CLPD_ORM_SQL_TYPE_COUNT, CLPD_ORM_INTEGER) == 0);
+  EXPECT(clpd_orm_type_fits_list(CLPD_ORM_SQL_TYPE_COUNT) == NULL);
+}
+
 int main(void) {
   if (mkdtemp(root) == NULL) {
     perror("orm_test");
@@ -499,6 +527,7 @@ int main(void) {
   test_missing_required();
   test_kvfile_rules();
   test_type_names();
+  test_type_fits();
   rmdir(root);
   if (failures != 0) {
     fprintf(stderr, "%d orm checks failed\n", failures);

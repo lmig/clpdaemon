@@ -94,12 +94,13 @@ Out of memory anywhere in the database layer is fatal: the daemon writes `clpdae
 
 The SQLite backend accepts PostgreSQL-style DDL type names: `TIMESTAMPTZ` and `JSONB` columns hold TEXT, `BYTEA` holds BLOB. Foreign keys are on, and a busy database is waited for up to 5 s.
 
-Limitation: SQLite gives `TIMESTAMPTZ` and `JSONB` columns NUMERIC affinity, so a numeric-looking string stored there can come back reformatted (`1e2` as `100.0`) and an expression over those columns comes back as a number. SQLite is for tests; per-backend DDL type names belong to the ORM (T9).
+Limitation: SQLite gives `TIMESTAMPTZ` and `JSONB` columns NUMERIC affinity, so a numeric-looking string stored there can come back reformatted (`1e2` as `100.0`) and an expression over those columns comes back as a number. SQLite is for tests; the tables the ORM generates use SQLite type names without NUMERIC affinity, and `db-check-schema` rejects a NUMERIC-affinity column there ([`orm.md`](orm.md#sql-types)).
 
 ## Tests
 
 - `clpdaemon_db`, `clpdaemon_db_sqlite_suite`: the interface (out of memory included, through a link seam on the allocators) and the shared backend suite (`tests/db/db_suite.c`) on SQLite.
 - `clpdaemon_db_pg`: the same suite plus PostgreSQL-only cases (password through `PGPASSFILE`, type mapping, `CLPD_DB_LOST` after the backend is terminated, the default timeouts and their overrides, a long class-22 value that must not leak, out of memory while decoding a `bytea`; a TCP listener on `127.0.0.1` that never answers stands in for an unreachable server) against a throwaway cluster. `tests/db/pg_cluster.sh` creates it with `initdb` in a private temporary directory, starts it with `pg_ctl` on a Unix socket in that directory only (no TCP), creates the role and database with `psql`, runs the test, and stops and removes the cluster on every exit path. The programs come from `CLPD_PG_BINDIR` when it is set, from `PATH` otherwise; when `initdb`, `pg_ctl` or `psql` is missing the script exits 77 and ctest reports the test as SKIPPED, not failed.
+- `clpdaemon_orm_ddl`, `clpdaemon_orm_ddl_pg`: the ORM DDL functions ([`orm.md`](orm.md#ddl-functions)) on a temporary SQLite file and, through the same `tests/db/pg_cluster.sh`, on a throwaway PostgreSQL cluster (SKIPPED without the programs). The PostgreSQL tests share a ctest resource lock, so their clusters never run at the same time.
 - `clpdaemon_cli`: opening a SQLite database under `--check` and in a running daemon, the open error, an unreachable PostgreSQL server, and the rejected values.
 
 ```sh

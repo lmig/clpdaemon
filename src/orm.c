@@ -436,3 +436,95 @@ void clpd_orm_free(clpd_orm *orm) {
   free(orm->path);
   memset(orm, 0, sizeof *orm);
 }
+
+/* The CLIPS types each sql type holds (L83), one bit per clpd_orm_clips_type,
+ * and how messages list them. */
+#define FIT(c) (1u << (c))
+static const unsigned fits[CLPD_ORM_SQL_TYPE_COUNT] = {
+    FIT(CLPD_ORM_INTEGER),                                       /* bigint */
+    FIT(CLPD_ORM_FLOAT),                                         /* double */
+    FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),                 /* text */
+    FIT(CLPD_ORM_STRING),                                        /* bytea */
+    FIT(CLPD_ORM_INTEGER),                                       /* boolean */
+    FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),                 /* timestamptz */
+    FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL),                 /* jsonb */
+    FIT(CLPD_ORM_FLOAT) | FIT(CLPD_ORM_STRING) | FIT(CLPD_ORM_SYMBOL)}; /* numeric */
+static const char *const fit_lists[CLPD_ORM_SQL_TYPE_COUNT] = {
+    "integer", "float", "string or symbol", "string", "integer",
+    "string or symbol", "string or symbol", "float, string or symbol"};
+
+int clpd_orm_type_fits(clpd_orm_sql_type t, clpd_orm_clips_type c) {
+  if ((unsigned)t >= CLPD_ORM_SQL_TYPE_COUNT ||
+      (unsigned)c >= CLPD_ORM_CLIPS_TYPE_COUNT)
+    return 0;
+  return (fits[t] & FIT(c)) != 0;
+}
+
+const char *clpd_orm_type_fits_list(clpd_orm_sql_type t) {
+  return (unsigned)t < CLPD_ORM_SQL_TYPE_COUNT ? fit_lists[t] : NULL;
+}
+
+const clpd_orm_template *clpd_orm_template_of(const clpd_orm *orm,
+                                              const char *name) {
+  size_t i;
+  for (i = 0; i < orm->template_count; i++)
+    if (strcmp(orm->templates[i].name, name) == 0) return &orm->templates[i];
+  return NULL;
+}
+
+/* Column of key position i of t (0: wf-id), or NULL when that slot has no
+ * column line. */
+static const char *key_column(const clpd_orm_template *t, size_t i) {
+  const clpd_orm_column *c = clpd_orm_column_of(
+      t, i == 0 ? CLPD_ORM_WF_ID : t->key.items[i - 1]);
+  return c != NULL ? c->column : NULL;
+}
+
+static const clpd_orm_column *column_named(const clpd_orm_template *t,
+                                           const char *column) {
+  size_t i;
+  for (i = 0; i < t->column_count; i++)
+    if (strcmp(t->columns[i].column, column) == 0) return &t->columns[i];
+  return NULL;
+}
+
+/* 1 when the two lines give a column the same table definition: sql type,
+ * and NOT NULL (null policy error) or not. */
+static int same_column(const clpd_orm_column *a, const clpd_orm_column *b) {
+  return b != NULL && a->sql_type == b->sql_type &&
+         (a->null == CLPD_ORM_NULL_ERROR) == (b->null == CLPD_ORM_NULL_ERROR);
+}
+
+int clpd_orm_table_difference(const clpd_orm_template *a,
+                              const clpd_orm_template *b, char *buf,
+                              size_t n) {
+  size_t i;
+  if (a->owned != b->owned) {
+    snprintf(buf, n, "owned");
+    return 1;
+  }
+  if (a->key.count != b->key.count) {
+    snprintf(buf, n, "key");
+    return 1;
+  }
+  for (i = 0; i <= a->key.count; i++) {
+    const char *x = key_column(a, i), *y = key_column(b, i);
+    if (x == NULL || y == NULL || strcmp(x, y) != 0) {
+      snprintf(buf, n, "key");
+      return 1;
+    }
+  }
+  for (i = 0; i < a->column_count; i++) {
+    if (!same_column(&a->columns[i], column_named(b, a->columns[i].column))) {
+      snprintf(buf, n, "column '%s'", a->columns[i].column);
+      return 1;
+    }
+  }
+  for (i = 0; i < b->column_count; i++) {
+    if (column_named(a, b->columns[i].column) == NULL) {
+      snprintf(buf, n, "column '%s'", b->columns[i].column);
+      return 1;
+    }
+  }
+  return 0;
+}

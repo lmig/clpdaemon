@@ -1457,7 +1457,7 @@ conf ormbad/orm.conf 'order.table = shop_order
 order.owned = no
 order.key = n
 order.slot.wf-id = wf_id text string error
-order.slot.n = n bigint string error
+order.slot.n = n text string error
 order.slot.extra = extra text string nil
 seq.order_no = shop_order_no
 seq.order_no.owned = no'
@@ -1477,6 +1477,131 @@ files = bad.clp
 orm = /etc/clpdaemon/orm.conf'
 check "orm: absolute mapping path" 1 "" \
   "clpdaemon: ormbad/package.conf:4: orm: '/etc/clpdaemon/orm.conf' must be relative to the package directory" -- --config ormbad.conf --check
+
+# --- ORM DDL functions (T9b, docs/orm.md#ddl-functions) -----------------------
+# Without a database the functions do not exist, so a package calling one
+# does not load.
+mkdir ddlnodb
+conf ddlnodb/package.conf 'definition = nodb
+version = 1
+files = r.clp'
+conf ddlnodb/r.clp '(deftemplate go (slot wf-id))
+(defrule r (go (wf-id ?w)) => (db-create-table go))'
+conf ddlnodb.conf 'node_id = n1
+packages = ddlnodb'
+check "orm ddl: no functions without a database" 1 "" \
+  "clpdaemon: nodb@1: clips: [EXPRNPSR3] ddlnodb/r.clp, Line 2: Missing function declaration for 'db-create-table'.
+clpdaemon: nodb@1: clips: ERROR:
+clpdaemon: nodb@1: clips: (defrule nodb@1::r
+clpdaemon: nodb@1: clips:    (go (wf-id ?w))
+clpdaemon: nodb@1: clips:    =>
+clpdaemon: nodb@1: clips:    (db-create-table
+clpdaemon: ddlnodb/r.clp: load failed" -- --config ddlnodb.conf --check
+
+# A rule calls the functions on a sqlite database: the owned table is
+# created as the mapping says, the existing-table check reports a missing
+# table, and db-drop-table is refused while orm_allow_drop = no (one log
+# line, the rule halts), then drops the table once it is yes.
+mkdir ormddl
+conf ormddl/package.conf 'definition = ddl
+version = 1
+files = ddl.clp
+orm = orm.conf'
+conf ormddl/ddl.clp '(deftemplate order (slot wf-id) (slot line-no (type INTEGER)) (slot note))
+(deftemplate party (slot wf-id) (slot name))
+(deftemplate go (slot wf-id))
+(defrule ddl (go (wf-id ?w)) =>
+  (printout t "create " (db-create-table order) crlf)
+  (printout t "check " (length$ (db-check-schema order)) crlf)
+  (printout t "party " (implode$ (db-check-schema party)) crlf)
+  (bind ?d (db-drop-table order))
+  (printout t "drop " ?d crlf))
+(deffacts seed (go (wf-id w1)))'
+conf ormddl/orm.conf 'order.table = ddl_order
+order.owned = yes
+order.key = line-no
+order.slot.wf-id = wf_id text string error
+order.slot.line-no = line_no bigint integer error
+order.slot.note = note text string nil
+party.table = crm_party
+party.owned = no
+party.slot.wf-id = wf_id text string error
+party.slot.name = name text string default'
+# ddlrun <name> <conf> <stdout> <stderr>: runs the daemon until the last
+# stderr line before the stop, then stops it with SIGTERM.
+ddlrun() {
+  cases=$((cases + 1))
+  : >out.txt
+  : >err.txt
+  "$BIN" --config "$2" >out.txt 2>err.txt &
+  pid=$!
+  ok=1
+  wait_line err.txt "${4##*$NL}" || ok=0
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  out=$(cat out.txt; printf x) err=$(cat err.txt; printf x)
+  out=${out%x} err=${err%x}
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$out" != "$3$NL" ] ||
+    [ "$err" != "$4${NL}clpdaemon: received SIGTERM, stopping$NL" ]; then
+    fail "$1" "exit $rc (lines seen $ok), stdout [$out], stderr [$err]"
+  fi
+}
+rconf ddl.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/ddl.db
+packages = ormddl"
+ddlrun "orm ddl: create, check, drop refused" ddl.conf 'create TRUE
+check 0
+party "table '\''crm_party'\'' does not exist"' "clpdaemon: n1: running
+clpdaemon: db-drop-table: dropping tables is disabled (orm_allow_drop = no)
+[PRCCODE4] Execution halted during the actions of defrule 'ddl'."
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 ddl.db "SELECT type || ' ' || name || ': ' || coalesce(sql, '') FROM sqlite_master ORDER BY name" 2>&1)
+  want='table ddl_order: CREATE TABLE "ddl_order" ("wf_id" TEXT NOT NULL, "line_no" INTEGER NOT NULL, "note" TEXT, PRIMARY KEY ("wf_id", "line_no"))
+index sqlite_autoindex_ddl_order_1: '
+  [ "$got" = "$want" ] || fail "orm ddl: the generated table" "got [$got], want [$want]"
+  # A second run keeps the existing table and its row (IF NOT EXISTS), and
+  # the refused drop leaves both.
+  sqlite3 ddl.db "INSERT INTO ddl_order VALUES ('w1', 1, 'kept')"
+  ddlrun "orm ddl: existing owned table untouched" ddl.conf 'create TRUE
+check 0
+party "table '\''crm_party'\'' does not exist"' "clpdaemon: n1: running
+clpdaemon: db-drop-table: dropping tables is disabled (orm_allow_drop = no)
+[PRCCODE4] Execution halted during the actions of defrule 'ddl'."
+  cases=$((cases + 1))
+  got=$(sqlite3 ddl.db "SELECT wf_id || ' ' || line_no || ' ' || note FROM ddl_order" 2>&1)
+  [ "$got" = "w1 1 kept" ] || fail "orm ddl: the row is kept" "got [$got]"
+  # With orm_allow_drop = yes the same rule drops the table.
+  rconf ddldrop.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/ddl.db
+orm_allow_drop = yes
+packages = ormddl"
+  cases=$((cases + 1))
+  : >out.txt
+  : >err.txt
+  "$BIN" --config ddldrop.conf >out.txt 2>err.txt &
+  pid=$!
+  ok=1
+  wait_line out.txt "drop TRUE" || ok=0
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  left=$(sqlite3 ddl.db "SELECT name FROM sqlite_master WHERE name = 'ddl_order'" 2>&1)
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -n "$left" ] ||
+    [ "$(cat out.txt)" != "create TRUE
+check 0
+party \"table 'crm_party' does not exist\"
+drop TRUE" ] ||
+    [ "$(cat err.txt)" != "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping" ]; then
+    fail "orm ddl: drop allowed" "exit $rc (lines seen $ok), table [$left], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+else
+  echo "cli_test.sh: sqlite3 not found; the orm ddl catalog cases are skipped" >&2
+fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

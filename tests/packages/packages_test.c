@@ -432,12 +432,12 @@ static void test_orm_bind_errors(void) {
   write_file(a, "orm.conf",
              "order.table = o\norder.owned = yes\norder.key = n, nope, tags\n"
              "order.slot.wf-id = wf_id text string error\n"
-             "order.slot.n = n bigint string error\n"
-             "order.slot.f = f double integer nil\n"
-             "order.slot.s = s text symbol nil\n"
+             "order.slot.n = n text string error\n"
+             "order.slot.f = f bigint integer default\n"
+             "order.slot.s = s text symbol default\n"
              "order.slot.y = y text string nil\n"
-             "order.slot.lex = lex text integer nil\n"
-             "order.slot.num = num numeric symbol nil\n"
+             "order.slot.lex = lex bigint integer nil\n"
+             "order.slot.num = num text symbol default\n"
              "order.slot.any = any text symbol nil\n"
              "order.slot.tags = tags text string error\n"
              "order.slot.extra = extra text string nil\n"
@@ -449,7 +449,7 @@ static void test_orm_bind_errors(void) {
              "ok.table = ok\nok.owned = no\nok.key = n\n"
              "ok.slot.wf-id = wf_id text symbol error\n"
              "ok.slot.lex = lex text symbol nil\n"
-             "ok.slot.num = num numeric integer nil\n"
+             "ok.slot.num = num double float default\n"
              "ok.slot.any = any jsonb string nil\n"
              "ok.slot.n = n bigint integer error\n"
              "ok.slot.y = y text string default\n");
@@ -556,6 +556,135 @@ static void test_orm_ownership(void) {
   done(&r);
 }
 
+/* T9b (L83): the sql type must hold the clips type, null policy nil needs
+ * a slot that allows SYMBOL, a sequence cannot have the name of a mapped
+ * table (or a table that of a mapped sequence), per slot line in file
+ * order and then per name. */
+static void test_orm_mapping_checks(void) {
+  const char *dirs[2];
+  run r;
+  const char *v1 = package("chkshop", "definition = shop\nversion = 1\n"
+                                      "files = t.clp\norm = orm.conf\n");
+  const char *c = package("chk", "definition = chk\nversion = 1\n"
+                                 "files = t.clp\norm = orm.conf\n");
+  write_file(v1, "t.clp", orm_tmpl);
+  write_file(v1, "orm.conf", orm_map);
+  write_file(c, "t.clp",
+             "(deftemplate order (slot wf-id) (slot n (type INTEGER))\n"
+             "  (slot f (type FLOAT)) (slot s (type STRING)) (slot b)\n"
+             "  (slot x (type INTEGER FLOAT)) (slot y (type SYMBOL))\n"
+             "  (slot j))\n"
+             "(deftemplate item (slot wf-id))\n");
+  write_file(c, "orm.conf",
+             "order.table = chk_order\norder.owned = yes\n"
+             "order.slot.wf-id = wf_id text string error\n"
+             "order.slot.n = n bigint string nil\n"
+             "order.slot.f = f double float nil\n"
+             "order.slot.s = s bytea symbol default\n"
+             "order.slot.b = b boolean integer nil\n"
+             "order.slot.x = x numeric integer default\n"
+             "order.slot.y = y timestamptz symbol nil\n"
+             "order.slot.j = j jsonb float default\n"
+             "item.table = shop_order_no\nitem.owned = no\n"
+             "item.slot.wf-id = wf_id text string error\n"
+             "seq.own = chk_order\nseq.own.owned = yes\n"
+             "seq.other = shop_order\nseq.other.owned = no\n");
+  dirs[0] = v1;
+  dirs[1] = c;
+  load_db(&r, dirs, 2, 1);
+  EXPECT(r.rc != 0);
+  EXPECT(err_matches(&r,
+      "clpdaemon: chk@1: orm: template 'order': slot 'n': sql type bigint "
+      "cannot hold clips type string (expected integer)\n"
+      "clpdaemon: chk@1: orm: template 'order': slot 'n' is mapped as "
+      "string, which its type constraint does not allow\n"
+      "clpdaemon: chk@1: orm: template 'order': slot 'n' has null policy "
+      "nil, but its type constraint does not allow SYMBOL\n"
+      "clpdaemon: chk@1: orm: template 'order': slot 'f' has null policy "
+      "nil, but its type constraint does not allow SYMBOL\n"
+      "clpdaemon: chk@1: orm: template 'order': slot 's': sql type bytea "
+      "cannot hold clips type symbol (expected string)\n"
+      "clpdaemon: chk@1: orm: template 'order': slot 's' is mapped as "
+      "symbol, which its type constraint does not allow\n"
+      "clpdaemon: chk@1: orm: template 'order': slot 'x': sql type numeric "
+      "cannot hold clips type integer (expected float, string or symbol)\n"
+      "clpdaemon: chk@1: orm: template 'order': slot 'j': sql type jsonb "
+      "cannot hold clips type float (expected string or symbol)\n"
+      "clpdaemon: chk@1: orm: sequence 'chk_order' has the name of a table "
+      "mapped by chk@1\n"
+      "clpdaemon: chk@1: orm: sequence 'shop_order' has the name of a table "
+      "mapped by shop@1\n"
+      "clpdaemon: chk@1: orm: table 'shop_order_no' has the name of a "
+      "sequence mapped by shop@1\n"));
+  EXPECT(r.pkgs.count == 2 && r.pkgs.items[1].orm_templates == NULL);
+  done(&r);
+}
+
+/* Versions of one definition that share a table map it identically: the
+ * same owned flag, primary key columns, and columns with their sql types
+ * and NOT NULL (null policy error or not). Slot names, clips types and
+ * nil versus default may differ. Compared with the first earlier version
+ * mapping the table. */
+static void test_orm_versions_share_table(void) {
+  static const char *const maps[] = {
+      /* 2: owned */
+      "order.table = shop_order\norder.owned = no\norder.key = line-no\n",
+      /* 3: key */
+      "order.table = shop_order\norder.owned = yes\n",
+      /* 4: a column only in version 1 */
+      "order.table = shop_order\norder.owned = yes\norder.key = line-no\n",
+      /* 5: a column with another sql type */
+      "order.table = shop_order\norder.owned = yes\norder.key = line-no\n",
+      /* 6: NOT NULL */
+      "order.table = shop_order\norder.owned = yes\norder.key = line-no\n",
+      /* 7: identical table, nil instead of default, a string slot as
+       * symbol */
+      "order.table = shop_order\norder.owned = yes\norder.key = line-no\n"};
+  static const char *const note[] = {
+      "order.slot.note = note text string nil\n",
+      "order.slot.note = note text string nil\n",
+      "order.slot.note = note2 text string nil\n",
+      "order.slot.note = note numeric string nil\n",
+      "order.slot.note = note text string error\n",
+      "order.slot.note = note text symbol nil\n"};
+  const char *dirs[7];
+  char text[1024], dname[32], manifest[128];
+  run r;
+  size_t i;
+  dirs[0] = package("ver1", "definition = shop\nversion = 1\n"
+                            "files = t.clp\norm = orm.conf\n");
+  write_file(dirs[0], "t.clp", orm_tmpl);
+  write_file(dirs[0], "orm.conf", orm_map);
+  for (i = 0; i < 6; i++) {
+    snprintf(dname, sizeof dname, "ver%zu", i + 2);
+    snprintf(manifest, sizeof manifest, "definition = shop\nversion = %zu\n"
+             "files = t.clp\norm = orm.conf\n", i + 2);
+    dirs[i + 1] = package(dname, manifest);
+    write_file(dirs[i + 1], "t.clp", orm_tmpl);
+    snprintf(text, sizeof text,
+             "%sorder.slot.wf-id = wf_id text string error\n"
+             "order.slot.line-no = line_no bigint integer error\n"
+             "order.slot.status = status text symbol nil\n%s",
+             maps[i], note[i]);
+    write_file(dirs[i + 1], "orm.conf", text);
+  }
+  load_db(&r, dirs, 7, 1);
+  EXPECT(r.rc != 0);
+  EXPECT(err_matches(&r,
+      "clpdaemon: shop@2: orm: table 'shop_order' is mapped differently by "
+      "shop@1 (owned)\n"
+      "clpdaemon: shop@3: orm: table 'shop_order' is mapped differently by "
+      "shop@1 (key)\n"
+      "clpdaemon: shop@4: orm: table 'shop_order' is mapped differently by "
+      "shop@1 (column 'note')\n"
+      "clpdaemon: shop@5: orm: table 'shop_order' is mapped differently by "
+      "shop@1 (column 'note')\n"
+      "clpdaemon: shop@6: orm: table 'shop_order' is mapped differently by "
+      "shop@1 (column 'note')\n"));
+  EXPECT(r.pkgs.count == 7 && r.pkgs.items[6].orm_templates != NULL);
+  done(&r);
+}
+
 int main(void) {
   if (mkdtemp(root) == NULL) {
     perror("packages_test");
@@ -577,6 +706,8 @@ int main(void) {
   test_orm_bind_errors();
   test_orm_other_module();
   test_orm_ownership();
+  test_orm_mapping_checks();
+  test_orm_versions_share_table();
   if (failures != 0) {
     fprintf(stderr, "%d package checks failed (fixtures in %s)\n", failures, root);
     return 1;

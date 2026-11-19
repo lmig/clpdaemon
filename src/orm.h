@@ -121,4 +121,27 @@ const char *clpd_orm_null_name(clpd_orm_null n);
  * NUMERIC affinity (L76, L82). */
 const char *clpd_orm_backend_type(clpd_orm_sql_type t, const char *backend);
 
+/* 1 when a column of sql type t holds values of CLIPS type c (T9b, L83):
+ * bigint and boolean hold integer; double holds float; numeric holds
+ * float, string and symbol; text, timestamptz and jsonb hold string and
+ * symbol; bytea holds string. 0 otherwise or out of range. */
+int clpd_orm_type_fits(clpd_orm_sql_type t, clpd_orm_clips_type c);
+/* The CLIPS types t holds as messages name them ("integer", "string or
+ * symbol", "float, string or symbol", ...), or NULL out of range. */
+const char *clpd_orm_type_fits_list(clpd_orm_sql_type t);
+
+/* The mapped template `name` of orm, or NULL. */
+const clpd_orm_template *clpd_orm_template_of(const clpd_orm *orm,
+                                              const char *name);
+
+/* Compares the tables a and b map (versions of one definition sharing a
+ * table, docs/orm.md): the owned flag, the primary key columns in order,
+ * and every column with its sql type and NOT NULL (null policy error or
+ * not); slot names, clips types and nil versus default are not part of
+ * the table. Returns 0 when they are the same; otherwise 1 with the first
+ * difference written to buf: "owned", "key" or "column '<column>'". */
+int clpd_orm_table_difference(const clpd_orm_template *a,
+                              const clpd_orm_template *b, char *buf,
+                              size_t n);
+
 #endif

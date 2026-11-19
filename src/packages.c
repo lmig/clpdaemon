@@ -188,9 +188,11 @@ static int type_allowed(Deftemplate *t, const char *slot,
 }
 
 /* Checks one mapped template against its deftemplate, in this order: no
- * wf-id, the slot lines in file order (unknown slot, a clips type the
- * slot does not allow), key slots that are no slot of the template, then
- * the template's slots (multislot, unmapped). Returns the error count. */
+ * wf-id, the slot lines in file order (a clips type the sql type cannot
+ * hold, unknown slot, a clips type the slot does not allow, null policy
+ * nil on a slot that does not allow SYMBOL), key slots that are no slot of
+ * the template, then the template's slots (multislot, unmapped). Returns
+ * the error count. */
 static int bind_template(Deftemplate *d, clpd_orm_template *t,
                          const char *pkg, FILE *err) {
   TemplateSlot *s;
@@ -203,16 +205,35 @@ static int bind_template(Deftemplate *d, clpd_orm_template *t,
   }
   for (i = 0; i < t->column_count; i++) {
     const clpd_orm_column *c = &t->columns[i];
+    if (!clpd_orm_type_fits(c->sql_type, c->clips_type)) {
+      fprintf(err, ORM_PREFIX "template '%s': slot '%s': sql type %s cannot "
+                   "hold clips type %s (expected %s)\n", pkg, t->name,
+              c->slot, clpd_orm_sql_type_name(c->sql_type),
+              clpd_orm_clips_type_name(c->clips_type),
+              clpd_orm_type_fits_list(c->sql_type));
+      errors++;
+    }
     if ((s = slot_of(d, c->slot)) == NULL) {
       if (has_wf_id || strcmp(c->slot, CLPD_ORM_WF_ID) != 0) {
         fprintf(err, ORM_PREFIX "template '%s' has no slot '%s'\n", pkg,
                 t->name, c->slot);
         errors++;
       }
-    } else if (!s->multislot && !type_allowed(d, c->slot, c->clips_type)) {
+      continue;
+    }
+    if (s->multislot) continue; /* reported with the template's slots */
+    if (!type_allowed(d, c->slot, c->clips_type)) {
       fprintf(err, ORM_PREFIX "template '%s': slot '%s' is mapped as %s, "
                    "which its type constraint does not allow\n", pkg, t->name,
               c->slot, clpd_orm_clips_type_name(c->clips_type));
+      errors++;
+    }
+    /* A NULL column becomes the symbol nil in the slot (T10). */
+    if (c->null == CLPD_ORM_NULL_NIL &&
+        !type_allowed(d, c->slot, CLPD_ORM_SYMBOL)) {
+      fprintf(err, ORM_PREFIX "template '%s': slot '%s' has null policy nil, "
+                   "but its type constraint does not allow SYMBOL\n", pkg,
+              t->name, c->slot);
       errors++;
     }
   }
@@ -268,10 +289,59 @@ static const char *mapped_by(const clpd_packages *out, const char *name,
   return NULL;
 }
 
+/* The first package of out (earlier ones in load order, then the last one
+ * when self is nonzero) whose mapping names the table (or, with seq, the
+ * sequence) `name`, whatever its definition; or NULL. PostgreSQL keeps
+ * tables and sequences in one namespace, so a name cannot be both. */
+static const char *named_by(const clpd_packages *out, const char *name,
+                            int seq, int self) {
+  size_t i, j, n = out->count - (self ? 0 : 1);
+  for (i = 0; i < n; i++) {
+    const clpd_orm *o = out->items[i].orm;
+    if (o == NULL) continue;
+    if (seq) {
+      for (j = 0; j < o->sequence_count; j++)
+        if (strcmp(o->sequences[j].name, name) == 0)
+          return out->items[i].manifest.name;
+    } else {
+      for (j = 0; j < o->template_count; j++)
+        if (strcmp(o->templates[j].table, name) == 0)
+          return out->items[i].manifest.name;
+    }
+  }
+  return NULL;
+}
+
+/* Versions of one definition that share a table map it identically (T9b,
+ * L83): t against the first earlier version mapping the same table.
+ * Returns the error count. */
+static int check_shared_table(const clpd_packages *out,
+                              const clpd_orm_template *t, FILE *err) {
+  const clpd_package *pkg = &out->items[out->count - 1];
+  char what[CLPD_ORM_IDENT_MAX + 16];
+  size_t i, j;
+  for (i = 0; i + 1 < out->count; i++) {
+    const clpd_package *o = &out->items[i];
+    if (o->orm == NULL ||
+        strcmp(o->manifest.definition, pkg->manifest.definition) != 0)
+      continue;
+    for (j = 0; j < o->orm->template_count; j++) {
+      const clpd_orm_template *ot = &o->orm->templates[j];
+      if (strcmp(ot->table, t->table) != 0) continue;
+      if (clpd_orm_table_difference(ot, t, what, sizeof what) == 0) return 0;
+      fprintf(err, ORM_PREFIX "table '%s' is mapped differently by %s (%s)\n",
+              pkg->manifest.name, t->table, o->manifest.name, what);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* Reads the mapping file of the last package of out and checks it (T9a,
  * docs/orm.md): the file, a configured database, the package's own
  * deftemplates, then tables and sequences an earlier package of another
- * definition maps. Sets pkg->orm when the file is valid (so later packages
+ * definition maps, a sequence and a table with one name (T9b), and tables
+ * an earlier version maps differently (T9b). Sets pkg->orm when the file is valid (so later packages
  * see its tables) and pkg->orm_templates when every check passed. Returns
  * the error count. */
 static int check_orm(Environment *env, clpd_packages *out, int have_database,
@@ -325,6 +395,22 @@ static int check_orm(Environment *env, clpd_packages *out, int have_database,
       errors++;
     }
   }
+  for (i = 0; i < orm->sequence_count; i++) {
+    if ((other = named_by(out, orm->sequences[i].name, 0, 1)) != NULL) {
+      fprintf(err, ORM_PREFIX "sequence '%s' has the name of a table mapped "
+                   "by %s\n", name, orm->sequences[i].name, other);
+      errors++;
+    }
+  }
+  for (i = 0; i < orm->template_count; i++) {
+    if ((other = named_by(out, orm->templates[i].table, 1, 0)) != NULL) {
+      fprintf(err, ORM_PREFIX "table '%s' has the name of a sequence mapped "
+                   "by %s\n", name, orm->templates[i].table, other);
+      errors++;
+    }
+  }
+  for (i = 0; i < orm->template_count; i++)
+    errors += check_shared_table(out, &orm->templates[i], err);
   if (errors == 0)
     pkg->orm_templates = found;
   else

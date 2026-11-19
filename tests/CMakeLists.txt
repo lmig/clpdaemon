@@ -50,6 +50,21 @@ add_test(NAME clpdaemon_db_pg
   COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:db_pg_test>)
 set_tests_properties(clpdaemon_db_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 
+# ORM DDL functions (T9b): on a temporary SQLite file, and on a throwaway
+# PostgreSQL cluster (SKIPPED, exit 77, without initdb/pg_ctl/psql). The
+# PostgreSQL tests share one lock so their clusters never run at once.
+add_executable(orm_ddl_test orm/orm_ddl_test.c)
+target_link_libraries(orm_ddl_test PRIVATE clpd_core)
+target_include_directories(orm_ddl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+target_compile_options(orm_ddl_test PRIVATE ${CLPD_WARNINGS})
+add_test(NAME clpdaemon_orm_ddl COMMAND orm_ddl_test)
+set_tests_properties(clpdaemon_orm_ddl PROPERTIES TIMEOUT 30)
+add_test(NAME clpdaemon_orm_ddl_pg
+  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:orm_ddl_test>)
+set_tests_properties(clpdaemon_orm_ddl_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+set_tests_properties(clpdaemon_db_pg clpdaemon_orm_ddl_pg PROPERTIES
+  RESOURCE_LOCK clpd_pg_cluster)
+
 # Link seam for the reader-failure cases, this test binary only: the test
 # wraps poll and read (production objects are unchanged).
 target_link_options(fdcapture_test PRIVATE -Wl,--wrap=poll -Wl,--wrap=read)
