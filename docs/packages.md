@@ -13,6 +13,7 @@ version     = v3
 files       = templates.clp, rules.clp, functions.clp
 lint_exempt = template:catalog, rule:load-catalog
 ingest      = order, payment
+orm         = orm.conf
 ```
 
 | Key | Type | Default |
@@ -22,6 +23,7 @@ ingest      = order, payment
 | `files` | non-empty list of paths relative to the package directory, loaded in order | required |
 | `lint_exempt` | list of `template:<name>` and `rule:<name>` excluded from the `wf-id` lint | empty |
 | `ingest` | list of deftemplate names of the package that facts from outside may assert ([`ingest.md`](ingest.md)) | empty |
+| `orm` | path of the ORM mapping file, relative to the package directory (one path: a comma is part of it); needs `database` in the daemon configuration ([`orm.md`](orm.md)) | absent (no mapping) |
 
 The package is identified as `definition@version` (for example `fibre-installation@v3`).
 
@@ -30,13 +32,31 @@ The package is identified as `definition@version` (for example `fibre-installati
 At startup (FR-2), after the configuration and the CLIPS environment, the daemon loads the packages in the order of `packages`:
 
 1. It reads the manifest and creates the module `(defmodule definition@version)`; package files must not declare a `defmodule` of their own.
-2. It loads `files` in order into that module. Loading a package stops at its first failed file.
+2. It loads `files` in order into that module. Every construct a file defines must belong to the package's module (see [Package module](#package-module)). Loading a package stops at its first failed file.
 3. It runs the `wf-id` lint on the package (FR-7, see below).
 4. It checks the `ingest` list: every name must be a deftemplate of the package (not an implied one), and not listed by an earlier package (also one that failed to load).
+5. When `orm` is set, it reads and checks the mapping file against the package's deftemplates and the mappings of earlier packages ([`orm.md`](orm.md#loading)).
 
-Every package is checked even when an earlier one failed, so one run reports all errors; any error makes the daemon exit 1. With `--check`, the daemon stops after loading and linting. Otherwise it calls `Reset` once and enters the event loop.
+Every package is checked even when an earlier one failed, so one run reports all errors; any error makes the daemon exit 1. With `--check`, the daemon stops after loading, linting and checking the mappings. Otherwise it calls `Reset` once and enters the event loop.
 
 Before each cycle the daemon replaces the focus stack with MAIN under every package module, the first package on top, so one `Run` fires the rules of all packages (a rule of a non-MAIN module only fires with focus).
+
+## Package module
+
+A package file defines its constructs in the package's module only (T9e, L87): a construct in another package's module (`(defrule shop@1::x ...)` in a file of `crm@1`) or in MAIN (`(deffunction MAIN::f ...)`) is a load error, also under `--check`, so one package can never add or replace rules, facts, functions or globals of another. Naming the package's own module (`(defrule crm@1::x ...)`) is allowed.
+
+The check runs for every construct as CLIPS defines it, not only on the current module at the end of the file: a module-qualified name makes that module current in CLIPS, so a file can switch away and back. Each of these is reported, one line per construct, in definition order:
+
+- a new `deftemplate`, `defrule`, `deffacts`, `deffunction`, `defgeneric`, `defmethod` (named by its defgeneric), `defclass` or `definstances` in another module, and the redefinition of an existing one there (also with the same text);
+- every global a `defglobal` defines or redefines in another module, also when an initial value switches the current module (`(defglobal ?*a* = (set-current-module MAIN))`), and the constructs a `build` inside an initial value defines;
+- every `defmessage-handler` added to or redefined on a class of another module, also on a system class (`(defmessage-handler USER m () ...)`: the system classes belong to MAIN);
+- the unqualified constructs that follow a qualified one in another module (CLIPS puts them in the module that became current).
+
+Constructs in a module the file creates with `defmodule` are not reported: the `defmodule` message covers them.
+
+A file that ends with another module current although no line above was written (only a statement that names a module and defines nothing does that: `(defglobal MAIN)`) is also rejected (T9f, L88).
+
+The `defglobal` check does not use the watch flags of the globals, so loading leaves them, and the `:==` lines on stdout, exactly as plain CLIPS (also with `(watch globals)` on). Still, a `defglobal` initial value that runs `watch` or `unwatch` on `globals` or `all` (also for single globals, or with an item computed at run time), or that leaves global watching changed, rejects the file with one line and the globals the file defined in another module are still reported; watching other items (`(watch facts)`) is allowed. A value that makes CLIPS recompute the scope of the globals (a plugin function calling `GetNextDefglobalInScope`) cannot be checked and rejects the file.
 
 ## wf-id lint
 
@@ -66,6 +86,8 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | Empty `files` | `clpdaemon: <file>:<line>: files: expected at least one file` |
 | Absolute path in `files` | `clpdaemon: <file>:<line>: files: '<path>' must be relative to the package directory` |
 | Empty list item | `clpdaemon: <file>:<line>: <key>: empty list item` |
+| Empty `orm` | `clpdaemon: <file>:<line>: orm: expected a file` |
+| Absolute path in `orm` | `clpdaemon: <file>:<line>: orm: '<path>' must be relative to the package directory` |
 | Name repeated in `ingest` | `clpdaemon: <file>:<line>: ingest: '<name>' listed more than once` |
 | Bad exemption | `clpdaemon: <file>:<line>: lint_exempt: expected template:<name> or rule:<name>, got '<item>'` |
 | Required key absent | `clpdaemon: <file>: missing required key '<key>'` |
@@ -73,6 +95,10 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | CLIPS error or warning while loading | `clpdaemon: <definition@version>: clips: <CLIPS message line>`, one line per non-blank line CLIPS writes (CLIPS names the file and line) |
 | Package file failed to load | `clpdaemon: <file>: load failed`, after the CLIPS lines |
 | `defmodule` in a package file | `clpdaemon: <file>: defmodule is not allowed in package files` |
+| A construct outside the package module ([above](#package-module)) | `clpdaemon: <file>: <construct> '<module>::<name>' is outside the package module <definition@version>`, `<construct>` one of `deftemplate`, `defrule`, `deffacts`, `defglobal`, `deffunction`, `defgeneric`, `defmethod`, `defclass`, `definstances`, `defmessage-handler`; `<name>` is `?*<global>*` for a defglobal, the defgeneric for a defmethod, and `<class> <handler> <type>` for a message-handler (`'MAIN::USER hello primary'`) |
+| The constructs of a file cannot be checked (a construct type the loader cannot inspect, for example one a plugin added, or a defglobal value that recomputed the scope of the globals) | `clpdaemon: <file>: cannot check the modules of its constructs` |
+| A defglobal value changed the watch state of globals ([above](#package-module)) | `clpdaemon: <file>: cannot check the modules of its constructs (a defglobal value changed the watch state of globals)` |
+| A file ends in another module and no construct was reported ([above](#package-module)) | `clpdaemon: <file>: the file ends in module <module>, not the package module <definition@version>` |
 | Same `definition@version` twice | `clpdaemon: <dir>: package <definition@version> is already loaded from <first dir>` |
 | Exemption names an unknown construct | `clpdaemon: <pkg>: lint: lint_exempt names unknown template '<t>'` (or `unknown rule '<r>'`) |
 | Template without `wf-id` | `clpdaemon: <pkg>: lint: template '<t>' has no wf-id slot` |
@@ -82,4 +108,4 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | `ingest` names no deftemplate of the package | `clpdaemon: <pkg>: ingest names unknown template '<t>'` |
 | `ingest` names a template an earlier package lists | `clpdaemon: <pkg>: ingest names template '<t>', already listed by <first pkg>` |
 
-Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come last, in list order.
+A file's messages come in this order: the CLIPS lines, then `load failed`, the `defmodule` message or the end-module message, then the constructs outside the package module (the watch-state and cannot-check lines in definition order with them, before the globals of the same statement). Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come next, in list order, then the mapping messages ([`orm.md`](orm.md#messages)).

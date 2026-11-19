@@ -11,11 +11,12 @@ enum {
   KEY_FILES,
   KEY_LINT_EXEMPT,
   KEY_INGEST,
+  KEY_ORM,
   KEY_COUNT
 };
 
 static const char *const key_names[KEY_COUNT] = {
-    "definition", "version", "files", "lint_exempt", "ingest"};
+    "definition", "version", "files", "lint_exempt", "ingest", "orm"};
 
 typedef struct {
   clpd_manifest *m;
@@ -157,6 +158,16 @@ static void on_pair(clpd_kv *kv, char *key, char *value, void *ctx) {
     m->ingest = list;
     break;
   }
+  case KEY_ORM:
+    /* One path: a comma is part of it, not a list separator. */
+    if (*value == '\0') {
+      clpd_kv_error(kv, "orm: expected a file");
+      break;
+    }
+    if (!relative_path(kv, key, value, NULL)) break;
+    free(m->orm);
+    m->orm = join(st->dir, value);
+    break;
   default: break;
   }
 }
@@ -206,5 +217,6 @@ void clpd_manifest_free(clpd_manifest *m) {
   clpd_list_free(&m->exempt_templates);
   clpd_list_free(&m->exempt_rules);
   clpd_list_free(&m->ingest);
+  free(m->orm);
   memset(m, 0, sizeof *m);
 }

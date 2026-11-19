@@ -176,6 +176,46 @@ static void test_ingest(void) {
   clpd_manifest_free(&m);
 }
 
+/* T9a: orm names one mapping file relative to the package directory;
+ * absent by default. */
+static void test_orm(void) {
+  clpd_manifest m;
+  char eb[1024], want[sizeof dir + 64];
+  EXPECT(load("orm", "definition = a\nversion = 1\nfiles = a.clp\n"
+                     "orm = map/orm.conf\n",
+              &m, eb, sizeof eb) == 0);
+  EXPECT(strcmp(eb, "") == 0);
+  snprintf(want, sizeof want, "%s/map/orm.conf", dir);
+  EXPECT(m.orm != NULL && strcmp(m.orm, want) == 0);
+  clpd_manifest_free(&m);
+  EXPECT(m.orm == NULL);
+  EXPECT(load("orm0", "definition = a\nversion = 1\nfiles = a.clp\n",
+              &m, eb, sizeof eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && m.orm == NULL);
+  clpd_manifest_free(&m);
+  EXPECT(load("orm1", "definition = a\nversion = 1\nfiles = a.clp\n"
+                      "orm =\n",
+              &m, eb, sizeof eb) == 1);
+  EXPECT(err_is(eb, "clpdaemon: %s:4: orm: expected a file\n"));
+  EXPECT(m.orm == NULL);
+  clpd_manifest_free(&m);
+  EXPECT(load("orm2", "definition = a\nversion = 1\nfiles = a.clp\n"
+                      "orm = /etc/orm.conf\norm = b.conf\n",
+              &m, eb, sizeof eb) == 1);
+  EXPECT(err_is(eb, "clpdaemon: %s:4: orm: '/etc/orm.conf' must be relative "
+                    "to the package directory\n"
+                    "clpdaemon: %s:5: duplicate key 'orm' (first set on line "
+                    "4)\n"));
+  clpd_manifest_free(&m);
+  /* A comma is part of the path, not a list separator. */
+  EXPECT(load("orm3", "definition = a\nversion = 1\nfiles = a.clp\n"
+                      "orm = a, b.conf\n",
+              &m, eb, sizeof eb) == 0);
+  snprintf(want, sizeof want, "%s/a, b.conf", dir);
+  EXPECT(m.orm != NULL && strcmp(m.orm, want) == 0);
+  clpd_manifest_free(&m);
+}
+
 static void test_missing_manifest(void) {
   clpd_manifest m;
   char eb[1024], want[sizeof conf + 64];
@@ -198,6 +238,7 @@ int main(void) {
   test_file_paths();
   test_empty_exemption_name();
   test_ingest();
+  test_orm();
   test_missing_manifest();
   rmdir(root);
   if (failures != 0) {

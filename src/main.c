@@ -9,6 +9,7 @@
 #include "ingest.h"
 #include "log.h"
 #include "loop.h"
+#include "orm_ddl.h"
 #include "packages.h"
 #include "plugins.h"
 #include "trace.h"
@@ -121,8 +122,8 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
 }
 
 /* Startup after the configuration (FR-2): trace files, environment, the
- * database when one is configured (docs/database.md), plugins (load and
- * init), rule packages, then either the --check report or
+ * database when one is configured (docs/database.md) with the ORM DDL
+ * functions (docs/orm.md), plugins (load and init), rule packages, then either the --check report or
  * the admin socket (FR-20, unless admin_socket = none), the trace hooks, the plugins' after_load, Reset
  * once and the event loop; the socket file is removed on every path after
  * it was created.
@@ -140,6 +141,8 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_clips_trace *ct = NULL;
   clpd_admin *admin = NULL;
   clpd_db *db = NULL;
+  /* Context of the ORM DDL functions: lives as long as the environment. */
+  clpd_orm_ddl ddl = {NULL, &packages, cfg->orm_allow_drop};
   clpd_engine *engine;
   clpd_trace *trace;
   int rc;
@@ -173,12 +176,22 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
       clpd_trace_close(trace);
       return 1;
     }
+    /* The ORM DDL functions exist only with a database (T9b), before the
+     * packages that call them load; they see the packages loaded so far. */
+    ddl.db = db;
+    if (clpd_orm_ddl_register(clpd_engine_env(engine), &ddl) != 0) {
+      fputs("clpdaemon: cannot define the ORM functions\n", clpd_log());
+      clpd_engine_destroy(engine);
+      clpd_db_close(db);
+      clpd_trace_close(trace);
+      return 1;
+    }
   }
   rc = clpd_plugins_load(clpd_engine_env(engine), &cfg->plugins, cfg->node_id,
                          &plugins, clpd_log());
   if (rc == 0)
-    rc = clpd_packages_load(clpd_engine_env(engine), &cfg->packages,
-                            &packages, clpd_log());
+    rc = clpd_packages_load_ex(clpd_engine_env(engine), &cfg->packages,
+                               cfg->database != NULL, &packages, clpd_log());
   if (rc != 0) {
     rc = 1;
   } else if (check) {

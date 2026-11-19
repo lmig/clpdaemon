@@ -144,6 +144,23 @@ packages = lint'
 check "wf-id lint errors" 1 "" \
   "clpdaemon: lint@1: lint: template 'item' has no wf-id slot
 clpdaemon: lint@1: lint: rule 'r': pattern 3 (item) does not bind wf-id to a variable" -- --config lint.conf --check
+# Every construct of a package file must be in the package's module
+# (T9e, L87): a rule planted in another package's module, or a function in
+# MAIN, is a load error, also when the file switches back to its own
+# module.
+mkdir plant
+conf plant/package.conf 'definition = plant
+version = 1
+files = p.clp'
+conf plant/p.clp '(deftemplate go (slot wf-id))
+(defrule fibre-installation@v3::planted (order (wf-id ?w)) => )
+(deffunction MAIN::helper () 1)
+(defrule plant@1::back (go (wf-id ?w)) => )'
+conf plant.conf 'node_id = n1
+packages = pkg, plant'
+check "construct outside the package module" 1 "" \
+  "clpdaemon: plant/p.clp: defrule 'fibre-installation@v3::planted' is outside the package module plant@1
+clpdaemon: plant/p.clp: deffunction 'MAIN::helper' is outside the package module plant@1" -- --config plant.conf --check
 # A failing package does not stop the next one from being checked.
 conf both.conf 'node_id = n1
 packages = gone, dm'
@@ -1395,6 +1412,298 @@ daemon "database: running with a sqlite database" dbrun.conf TERM "clpdaemon: n1
 clpdaemon: received SIGTERM, stopping"
 cases=$((cases + 1))
 [ -f dbrun.db ] || fail "database: the daemon creates the sqlite file" "$(ls -l)"
+
+# --- ORM mapping (T9a, docs/orm.md) -------------------------------------------
+# The mapping is read and checked at package load, also under --check; it
+# needs a database.
+mkdir ormpkg
+conf ormpkg/package.conf 'definition = shop
+version = 1
+files = shop.clp
+orm = orm.conf'
+conf ormpkg/shop.clp '(deftemplate order (slot wf-id) (slot line-no (type INTEGER)) (slot status (type SYMBOL)))
+(defrule start ?o <- (order (wf-id ?w) (status new)) => (modify ?o (status started)))'
+conf ormpkg/orm.conf '# shop orders
+order.table = shop_order
+order.owned = yes
+order.key = line-no
+order.slot.wf-id = wf_id text string error
+order.slot.line-no = line_no bigint integer error
+order.slot.status = status text symbol default
+seq.order_no = shop_order_no
+seq.order_no.owned = yes'
+conf orm.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+orm_allow_drop = yes
+packages = ormpkg"
+check "orm: valid mapping under --check" 0 "clpdaemon: orm.conf: configuration OK" "" -- --config orm.conf --check
+conf ormnodb.conf 'node_id = n1
+packages = ormpkg'
+check "orm: mapping without a database" 1 "" \
+  "clpdaemon: shop@1: orm: a mapping needs a database (the configuration sets no database)" -- --config ormnodb.conf --check
+conf ormdrop.conf 'node_id = n1
+orm_allow_drop = true'
+check "orm: bad orm_allow_drop" 1 "" \
+  "clpdaemon: ormdrop.conf:2: orm_allow_drop: expected yes or no, got 'true'" -- --config ormdrop.conf --check
+# A package without orm loads unchanged with a database.
+conf ormplain.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+orm_allow_drop = no
+packages = pkg"
+check "orm: package without a mapping" 0 "clpdaemon: ormplain.conf: configuration OK" "" -- --config ormplain.conf --check
+mkdir ormbad
+conf ormbad/package.conf 'definition = bad
+version = 1
+files = bad.clp
+orm = orm.conf'
+conf ormbad/bad.clp '(deftemplate order (slot wf-id) (slot n (type INTEGER)) (slot note) (multislot tags))'
+conf ormbad/orm.conf 'order.table = shop_order
+order.owned = no
+order.key = n
+order.slot.wf-id = wf_id text string error
+order.slot.n = n bigint string error
+order.slot.extra = extra text string nil
+seq.order_no = shop_order_no
+seq.order_no.owned = maybe'
+conf ormbad.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+packages = ormbad"
+check "orm: mapping file error" 1 "" \
+  "clpdaemon: ormbad/orm.conf:8: seq.order_no.owned: expected yes or no, got 'maybe'" -- --config ormbad.conf --check
+conf ormbad/orm.conf 'order.table = shop_order
+order.owned = no
+order.key = n
+order.slot.wf-id = wf_id text string error
+order.slot.n = n text string error
+order.slot.extra = extra text string nil
+seq.order_no = shop_order_no
+seq.order_no.owned = no'
+conf ormtwo.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+packages = ormpkg, ormbad"
+check "orm: checks against the templates and another definition" 1 "" \
+  "clpdaemon: bad@1: orm: template 'order': slot 'n' is mapped as string, which its type constraint does not allow
+clpdaemon: bad@1: orm: template 'order' has no slot 'extra'
+clpdaemon: bad@1: orm: template 'order': slot 'note' is not mapped
+clpdaemon: bad@1: orm: template 'order': slot 'tags' is a multislot, which cannot be mapped
+clpdaemon: bad@1: orm: table 'shop_order' is already mapped by shop@1
+clpdaemon: bad@1: orm: sequence 'shop_order_no' is already mapped by shop@1" -- --config ormtwo.conf --check
+conf ormbad/package.conf 'definition = bad
+version = 1
+files = bad.clp
+orm = /etc/clpdaemon/orm.conf'
+check "orm: absolute mapping path" 1 "" \
+  "clpdaemon: ormbad/package.conf:4: orm: '/etc/clpdaemon/orm.conf' must be relative to the package directory" -- --config ormbad.conf --check
+# The daemon's counter table is a reserved table name (T9e, L87).
+mkdir ormres
+conf ormres/package.conf 'definition = res
+version = 1
+files = res.clp
+orm = orm.conf'
+conf ormres/res.clp '(deftemplate order (slot wf-id))'
+conf ormres/orm.conf 'order.table = clpd_sequence
+order.owned = yes
+order.slot.wf-id = wf_id text string error'
+conf ormres.conf "node_id = n1
+database = sqlite:$WORK/orm.db
+packages = ormres"
+check "orm: reserved table name" 1 "" \
+  "clpdaemon: ormres/orm.conf:1: order.table: table name 'clpd_sequence' is reserved (the daemon's sequence counter table)" -- --config ormres.conf --check
+
+# --- ORM DDL functions (T9b, docs/orm.md#ddl-functions) -----------------------
+# Without a database the functions do not exist, so a package calling one
+# does not load.
+mkdir ddlnodb
+conf ddlnodb/package.conf 'definition = nodb
+version = 1
+files = r.clp'
+conf ddlnodb/r.clp '(deftemplate go (slot wf-id))
+(defrule r (go (wf-id ?w)) => (db-create-table go))'
+conf ddlnodb.conf 'node_id = n1
+packages = ddlnodb'
+check "orm ddl: no functions without a database" 1 "" \
+  "clpdaemon: nodb@1: clips: [EXPRNPSR3] ddlnodb/r.clp, Line 2: Missing function declaration for 'db-create-table'.
+clpdaemon: nodb@1: clips: ERROR:
+clpdaemon: nodb@1: clips: (defrule nodb@1::r
+clpdaemon: nodb@1: clips:    (go (wf-id ?w))
+clpdaemon: nodb@1: clips:    =>
+clpdaemon: nodb@1: clips:    (db-create-table
+clpdaemon: ddlnodb/r.clp: load failed" -- --config ddlnodb.conf --check
+
+# A rule calls the functions on a sqlite database: the owned table is
+# created as the mapping says, the existing-table check reports a missing
+# table, and db-drop-table is refused while orm_allow_drop = no (one log
+# line, the rule halts), then drops the table once it is yes.
+mkdir ormddl
+conf ormddl/package.conf 'definition = ddl
+version = 1
+files = ddl.clp
+orm = orm.conf'
+conf ormddl/ddl.clp '(deftemplate order (slot wf-id) (slot line-no (type INTEGER)) (slot note))
+(deftemplate party (slot wf-id) (slot name))
+(deftemplate go (slot wf-id))
+(defrule ddl (go (wf-id ?w)) =>
+  (printout t "create " (db-create-table order) crlf)
+  (printout t "check " (length$ (db-check-schema order)) crlf)
+  (printout t "party " (implode$ (db-check-schema party)) crlf)
+  (bind ?d (db-drop-table order))
+  (printout t "drop " ?d crlf))
+(deffacts seed (go (wf-id w1)))'
+conf ormddl/orm.conf 'order.table = ddl_order
+order.owned = yes
+order.key = line-no
+order.slot.wf-id = wf_id text string error
+order.slot.line-no = line_no bigint integer error
+order.slot.note = note text string nil
+party.table = crm_party
+party.owned = no
+party.slot.wf-id = wf_id text string error
+party.slot.name = name text string default'
+# ddlrun <name> <conf> <stdout> <stderr>: runs the daemon until the last
+# stderr line before the stop, then stops it with SIGTERM.
+ddlrun() {
+  cases=$((cases + 1))
+  : >out.txt
+  : >err.txt
+  "$BIN" --config "$2" >out.txt 2>err.txt &
+  pid=$!
+  ok=1
+  wait_line err.txt "${4##*$NL}" || ok=0
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  out=$(cat out.txt; printf x) err=$(cat err.txt; printf x)
+  out=${out%x} err=${err%x}
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$out" != "$3$NL" ] ||
+    [ "$err" != "$4${NL}clpdaemon: received SIGTERM, stopping$NL" ]; then
+    fail "$1" "exit $rc (lines seen $ok), stdout [$out], stderr [$err]"
+  fi
+}
+rconf ddl.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/ddl.db
+packages = ormddl"
+ddlrun "orm ddl: create, check, drop refused" ddl.conf 'create TRUE
+check 0
+party "table '\''crm_party'\'' does not exist"' "clpdaemon: n1: running
+clpdaemon: db-drop-table: dropping tables is disabled (orm_allow_drop = no)
+[PRCCODE4] Execution halted during the actions of defrule 'ddl'."
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 ddl.db "SELECT type || ' ' || name || ': ' || coalesce(sql, '') FROM sqlite_master ORDER BY name" 2>&1)
+  want='table ddl_order: CREATE TABLE "ddl_order" ("wf_id" TEXT NOT NULL, "line_no" INTEGER NOT NULL, "note" TEXT, PRIMARY KEY ("wf_id", "line_no"))
+index sqlite_autoindex_ddl_order_1: '
+  [ "$got" = "$want" ] || fail "orm ddl: the generated table" "got [$got], want [$want]"
+  # A second run keeps the existing table and its row (IF NOT EXISTS), and
+  # the refused drop leaves both.
+  sqlite3 ddl.db "INSERT INTO ddl_order VALUES ('w1', 1, 'kept')"
+  ddlrun "orm ddl: existing owned table untouched" ddl.conf 'create TRUE
+check 0
+party "table '\''crm_party'\'' does not exist"' "clpdaemon: n1: running
+clpdaemon: db-drop-table: dropping tables is disabled (orm_allow_drop = no)
+[PRCCODE4] Execution halted during the actions of defrule 'ddl'."
+  cases=$((cases + 1))
+  got=$(sqlite3 ddl.db "SELECT wf_id || ' ' || line_no || ' ' || note FROM ddl_order" 2>&1)
+  [ "$got" = "w1 1 kept" ] || fail "orm ddl: the row is kept" "got [$got]"
+  # With orm_allow_drop = yes the same rule drops the table.
+  rconf ddldrop.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/ddl.db
+orm_allow_drop = yes
+packages = ormddl"
+  cases=$((cases + 1))
+  : >out.txt
+  : >err.txt
+  "$BIN" --config ddldrop.conf >out.txt 2>err.txt &
+  pid=$!
+  ok=1
+  wait_line out.txt "drop TRUE" || ok=0
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  left=$(sqlite3 ddl.db "SELECT name FROM sqlite_master WHERE name = 'ddl_order'" 2>&1)
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -n "$left" ] ||
+    [ "$(cat out.txt)" != "create TRUE
+check 0
+party \"table 'crm_party' does not exist\"
+drop TRUE" ] ||
+    [ "$(cat err.txt)" != "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping" ]; then
+    fail "orm ddl: drop allowed" "exit $rc (lines seen $ok), table [$left], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+  # A rule of another definition cannot drop (or create) the table, even
+  # with orm_allow_drop = yes (T9d, L84): one log line, the rule halts,
+  # the table and its row are kept.
+  mkdir ormown ormforeign
+  conf ormown/package.conf 'definition = own
+version = 1
+files = own.clp
+orm = orm.conf'
+  conf ormown/own.clp '(deftemplate item (slot wf-id) (slot note))'
+  conf ormown/orm.conf 'item.table = own_item
+item.owned = yes
+item.slot.wf-id = wf_id text string error
+item.slot.note = note text string nil'
+  conf ormforeign/package.conf 'definition = foreign
+version = 1
+files = foreign.clp'
+  conf ormforeign/foreign.clp '(deftemplate go (slot wf-id))
+(defrule r (go (wf-id ?w)) =>
+  (printout t "foreign" crlf)
+  (db-drop-table own@1::item)
+  (printout t "dropped" crlf))
+(deffacts seed (go (wf-id w1)))'
+  sqlite3 foreign.db "CREATE TABLE own_item (wf_id TEXT NOT NULL PRIMARY KEY, note TEXT); INSERT INTO own_item VALUES ('w1', 'kept')"
+  rconf foreign.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/foreign.db
+orm_allow_drop = yes
+packages = ormown, ormforeign"
+  ddlrun "orm ddl: another definition's table is refused" foreign.conf 'foreign' "clpdaemon: n1: running
+clpdaemon: db-drop-table: template 'own@1::item' is not mapped by definition foreign of the calling rule (mapped by own@1)
+[PRCCODE4] Execution halted during the actions of defrule 'r'."
+  cases=$((cases + 1))
+  got=$(sqlite3 foreign.db "SELECT wf_id || ' ' || note FROM own_item" 2>&1)
+  [ "$got" = "w1 kept" ] || fail "orm ddl: the other definition's row is kept" "got [$got]"
+  # Sequences (T9c): a rule creates the owned sequence (the SQLite counter
+  # row) and draws values; an unknown alias is one log line and halts the
+  # rule. A second run continues from the stored value.
+  mkdir ormseq
+  conf ormseq/package.conf 'definition = seq
+version = 1
+files = seq.clp
+orm = orm.conf'
+  conf ormseq/seq.clp '(deftemplate go (slot wf-id))
+(defrule r (go (wf-id ?w)) =>
+  (printout t "create " (db-create-sequence order_no) crlf)
+  (bind ?a (db-nextval order_no))
+  (printout t "next " ?a " " (db-nextval order_no) " " (integerp ?a) crlf)
+  (db-nextval nope)
+  (printout t "not reached" crlf))
+(deffacts seed (go (wf-id w1)))'
+  conf ormseq/orm.conf 'seq.order_no = seq_order_no
+seq.order_no.owned = yes'
+  rconf seq.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/seq.db
+packages = ormseq"
+  seqerr="clpdaemon: n1: running
+clpdaemon: db-nextval: unknown sequence alias 'nope' (no loaded package maps it)
+[PRCCODE4] Execution halted during the actions of defrule 'r'."
+  ddlrun "orm seq: create and nextval" seq.conf 'create TRUE
+next 1 2 TRUE' "$seqerr"
+  ddlrun "orm seq: values continue in a second run" seq.conf 'create TRUE
+next 3 4 TRUE' "$seqerr"
+  cases=$((cases + 1))
+  got=$(sqlite3 seq.db "SELECT name || ' ' || value FROM clpd_sequence; SELECT sql FROM sqlite_master WHERE name = 'clpd_sequence'" 2>&1)
+  want='seq_order_no 4
+CREATE TABLE "clpd_sequence" ("name" TEXT PRIMARY KEY, "value" INTEGER NOT NULL)'
+  [ "$got" = "$want" ] || fail "orm seq: the counter row" "got [$got], want [$want]"
+else
+  echo "cli_test.sh: sqlite3 not found; the orm ddl catalog cases are skipped" >&2
+fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]
