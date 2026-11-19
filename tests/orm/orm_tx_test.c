@@ -444,6 +444,16 @@ static void test_instance_table(void) {
     EXPECT(rc == 0);
   }
   sql("DROP VIEW workflow_instance");
+  /* The CREATE itself fails (L91 R3-002): -1 with the database's one-line
+   * message, nothing created. */
+  sql(pg ? "SET default_transaction_read_only = on" : "PRAGMA query_only = ON");
+  EXPECT(clpd_orm_tx_create_instance_table(db, msg, sizeof msg) == -1);
+  EXPECT(same("create error", msg,
+              pg ? "cannot execute CREATE TABLE in a read-only transaction "
+                   "(SQLSTATE 25006)"
+                 : "attempt to write a readonly database"));
+  sql(pg ? "SET default_transaction_read_only = off" : "PRAGMA query_only = OFF");
+  EXPECT(rows("workflow_instance") == -1);
   EXPECT(clpd_orm_tx_create_instance_table(db, msg, sizeof msg) == 0);
 }
 

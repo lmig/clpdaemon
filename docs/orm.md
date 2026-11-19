@@ -2,7 +2,7 @@
 
 A rule package can map its deftemplates to database tables and name the database sequences its rules use (S7, S11, FR-22). The mapping lives in a separate file named by the manifest key `orm` ([`packages.md`](packages.md#manifest)). Nothing in it is implicit: every slot of a mapped template gets its own line with the column, the SQL type, the CLIPS type and what a NULL becomes.
 
-The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b, T9e), the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23), and the [sequence functions](#sequence-functions) `db-create-sequence` and `db-nextval` (T9c, T9e). The [cycle transaction](database.md#cycle-transaction) (T10a) runs every statement of a cycle in one transaction; the per-cycle synchronization (T10b) builds on this model.
+The mapped templates of one workflow definition form its aggregate (FR-22); their tables carry the persistent state of each workflow instance. This page describes the file, the checks made when the package loads (T9a, T9b, T9e), the [DDL functions](#ddl-functions) `db-create-table`, `db-check-schema` and `db-drop-table` (T9b, T9d, FR-23), and the [sequence functions](#sequence-functions) `db-create-sequence` and `db-nextval` (T9c, T9e). The [cycle transaction](database.md#cycle-transaction) (T10a) runs every statement of a cycle in one transaction, and the [automatic synchronization](#automatic-synchronization) (T10b, FR-25) writes the changes of the mapped facts at the end of each cycle inside it.
 
 ## File format
 
@@ -39,7 +39,7 @@ seq.order_no.owned   = yes
 | `<tpl>.table` | table name, an [identifier](#identifiers); not `clpd_sequence`, reserved on every backend for the daemon's sequence counters ([below](#generated-sql)), nor `workflow_instance`, reserved for the daemon's instance table ([`database.md`](database.md#workflow_instance)) | required |
 | `<tpl>.owned` | `yes`: the table belongs to the daemon (`db-create-table` may create it, `db-drop-table` may drop it when `orm_allow_drop = yes`); `no`: an existing table, never created nor dropped | required |
 | `<tpl>.key` | comma-separated list of zero or more slots, the local key in order; `wf-id` is always the first key column and is not listed | empty (the key is `wf-id` alone) |
-| `<tpl>.sync` | `auto`: the cycle writes the template's facts to its table itself (automatic synchronization, FR-25, D7, T10b); `manual`: only the DML functions write them (T10d). T10a reads and checks the key; the synchronization comes with T10b | `auto` |
+| `<tpl>.sync` | `auto`: the cycle writes the template's facts to its table itself ([automatic synchronization](#automatic-synchronization), FR-25, D7); `manual`: the synchronization never writes them, only the DML functions do (T10d) | `auto` |
 | `<tpl>.slot.<slot>` | `<column> <sql-type> <clips-type> <null>`, four fields separated by spaces or tabs | one line required for every slot |
 
 The primary key of a table is `wf-id` followed by the local key (FR-22). Every slot of the deftemplate, `wf-id` included, needs its `<tpl>.slot.<slot>` line; key slots (`wf-id` and the slots in `<tpl>.key`) must use the null policy `error`. Two slots of one template cannot use the same column, and two templates of one file cannot use the same table. Multislots cannot be mapped.
@@ -48,7 +48,7 @@ The primary key of a table is `wf-id` followed by the local key (FR-22). Every s
 
 | Key | Value | Default |
 |---|---|---|
-| `seq.<alias>` | name of the database sequence, an [identifier](#identifiers); `<alias>` is the name rules use (`(db-nextval order_no)`, [below](#sequence-functions)) and is an identifier too | required |
+| `seq.<alias>` | name of the database sequence, an [identifier](#identifiers), not `workflow_instance` (PostgreSQL keeps tables and sequences in one namespace, so it is reserved for the daemon's instance table as a sequence name too); `<alias>` is the name rules use (`(db-nextval order_no)`, [below](#sequence-functions)) and is an identifier too | required |
 | `seq.<alias>.owned` | `yes`: the sequence belongs to the daemon (`db-create-sequence` may create it); `no`: an existing sequence, never created | required |
 
 Two aliases of one file cannot name the same sequence.
@@ -78,7 +78,7 @@ The SQL type is logical; each backend has its own column type, used by `db-creat
 
 ### Null policies
 
-What a NULL column becomes when a row is loaded into a fact (T10):
+What a NULL column becomes when a row is loaded into a fact (T10c); for the other direction, what the synchronization writes for `nil`, see the [write rules](#write-rules):
 
 | `null` | Effect |
 |---|---|
@@ -90,7 +90,7 @@ What a NULL column becomes when a row is loaded into a fact (T10):
 
 The mapping is read after the package's files, the `wf-id` lint and the `ingest` check ([`packages.md`](packages.md#loading)), at startup and under `--check`. A package with `orm` needs a database: without the `database` key in the configuration ([`database.md`](database.md)) it is an error. The checks are:
 
-1. The file itself: syntax, unknown or repeated keys, values (the reserved table names `clpd_sequence` and `workflow_instance` and the `sync` values included), required keys, null policy of key slots, a column, table or sequence used twice in the file.
+1. The file itself: syntax, unknown or repeated keys, values (the reserved table names `clpd_sequence` and `workflow_instance`, the reserved sequence name `workflow_instance` and the `sync` values included), required keys, null policy of key slots, a column, table or sequence used twice in the file.
 2. A configured `database`.
 3. Each mapped template, in file order: it is a deftemplate of the package; it has a `wf-id` slot; each slot line, in file order, has an SQL type that holds its CLIPS type, names a slot of the template, and that slot's type constraint allows the declared CLIPS type and, with null policy `nil`, SYMBOL; each key slot is a slot of the template; every slot of the template is mapped and none is a multislot.
 4. Tables, then sequences, already mapped by an earlier package of another definition. Versions of one definition (`shop@1` and `shop@2`) may map the same tables and sequences; two definitions may not. A package whose mapping file is valid claims its tables and sequences even if a later check failed. The mapping is not read when a file of the package fails to load (step 2 of [`packages.md`](packages.md#loading)).
@@ -110,6 +110,7 @@ Any error makes the daemon exit 1, like other package errors. Nothing is read fr
 | Bad table or sequence name | `clpdaemon: <file>:<line>: <key>: expected an identifier matching [a-z_][a-z0-9_]* (at most 63 bytes), got '<value>'` |
 | Table named `clpd_sequence` (on every backend) | `clpdaemon: <file>:<line>: <tpl>.table: table name 'clpd_sequence' is reserved (the daemon's sequence counter table)` |
 | Table named `workflow_instance` (on every backend) | `clpdaemon: <file>:<line>: <tpl>.table: table name 'workflow_instance' is reserved (the daemon's workflow instance table)` |
+| Sequence named `workflow_instance` (on every backend) | `clpdaemon: <file>:<line>: seq.<alias>: sequence name 'workflow_instance' is reserved (the daemon's workflow instance table)` |
 | Bad `sync` | `clpdaemon: <file>:<line>: <tpl>.sync: expected auto or manual, got '<value>'` |
 | Bad column name | `clpdaemon: <file>:<line>: <key>: column: expected an identifier matching [a-z_][a-z0-9_]* (at most 63 bytes), got '<column>'` |
 | Bad sequence alias | `clpdaemon: <file>:<line>: <key>: sequence alias: expected an identifier matching [a-z_][a-z0-9_]* (at most 63 bytes), got '<alias>'` |
@@ -257,12 +258,99 @@ The same log line, CLIPS evaluation error and `FALSE` as the [DDL errors](#error
 - The table name `clpd_sequence` is reserved on every backend (a mapping naming it fails to load), so a mapped table can never be the SQLite counter table.
 - PostgreSQL: only a sequence (`relkind = 'S'`) counts as existing in the lookup after a failed `nextval`. SQLite: the `UPDATE` also requires `typeof("value") = 'integer'`, so a counter of another type is never advanced and gets its own message instead of the maximum-value one.
 
+## Automatic synchronization
+
+With a `database`, every fact of a template mapped with `sync = auto` by a loaded package is written to its table by the cycle itself (T10b, FR-25, D7, L90): the daemon records the net change of each such fact since the last committed cycle and, at the end of the cycle (after `Run`, before the commit of the [cycle transaction](database.md#cycle-transaction)), sends the statements that bring the tables to the facts. Nothing has to be called from the rules. The hooks are always on: they do not depend on the trace, on `watch` or on any configuration key.
+
+What is never written: facts of a template with `sync = manual` (only the DML functions write those, T10d), of a template no mapping names (also a template of a mapped package that its mapping leaves out), ordered facts, and facts asserted or retracted while the daemon is loading from the database ([echo suppression](#echo-suppression)). Every slot of a mapped template is mapped ([loading](#loading), step 3), so every change of a fact of a synchronized template is a change of its row.
+
+### Net changes
+
+The daemon compares, per fact, the row the fact had at the last commit with the row it has at the end of the cycle (a modify keeps the fact's index, so several modifies of one fact are one change):
+
+| In the cycle (since the last commit) | Written |
+|---|---|
+| asserted | `INSERT` of the final values (asserted and then modified: still one `INSERT`) |
+| asserted, then retracted | nothing |
+| modified, the primary key unchanged | one `UPDATE` of the columns whose value differs, by the primary key; nothing when the values came back to the stored ones |
+| modified, a key slot changed (`wf-id` or a local key slot) | `DELETE` of the old key, then `INSERT` of the new row |
+| retracted | `DELETE` by the primary key |
+
+The primary key is the `wf_id` column followed by the local key columns (FR-22). An `UPDATE` that finds no row with the key (another writer deleted it, or the fact was loaded without being stored) inserts the row instead. A `DELETE` that finds no row is not an error.
+
+The facts that exist before the first cycle (the deffacts asserted by `Reset` at startup, facts asserted by a plugin's `init` or `after_load`) are changes since the last commit like any other: the first cycle inserts them. So is a fact asserted between cycles (a plugin's `cycle_end`): the next cycle writes it.
+
+Two facts of one template with the same primary key in working memory (they differ in another slot, so CLIPS keeps both) cannot both be stored: the second `INSERT` is a unique violation (`CLPD_DB_UNIQUE`) and the whole cycle is rolled back. The same holds for a fact whose key matches a row stored by another writer or by an earlier run of the daemon: a deffacts fact of a mapped template is inserted again at every start, so a restart against a database that already holds its row rolls the first cycle back (and retries it) until the fact or the row is gone (rehydration at startup comes with T11/T22).
+
+### Statements and order
+
+The statements are parameterized; the names come from the mapping, quoted, and on PostgreSQL qualified with `current_schema()` like the [DDL functions](#ddl-functions) (one `SELECT current_schema()` per cycle that writes):
+
+```sql
+INSERT INTO "public"."shop_order" ("wf_id", "line_no", "status", "amount", "placed_at") VALUES ($1, $2, $3, $4, $5)
+UPDATE "public"."shop_order" SET "status" = $1 WHERE "wf_id" = $2 AND "line_no" = $3
+DELETE FROM "public"."shop_order" WHERE "wf_id" = $1 AND "line_no" = $2
+INSERT INTO "public"."workflow_instance" ("wf_id", "definition", "version", "status", "created_at", "updated_at") VALUES ($1, $2, $3, 'active', now(), now()) ON CONFLICT ("wf_id") DO UPDATE SET "updated_at" = excluded."updated_at"
+```
+
+The `INSERT` lists every mapped column in file order; the `UPDATE` sets the changed non-key columns in file order. The changes are grouped per aggregate (workflow definition), the aggregates in the order their first package loaded; within an aggregate the `DELETE`s come first, then the `UPDATE`s, then the `INSERT`s (each in the order the facts first changed), so a key that moves from one fact to another never collides; then the `workflow_instance` row of each instance the aggregate wrote, in the order of the changes.
+
+### workflow_instance rows
+
+Each instance (`wf-id` value) a cycle writes gets its [`workflow_instance`](database.md#workflow_instance) row in the same transaction: the first write inserts it with `status = active` and the definition and version of the package of its first changed fact (parent, owner node and lease stay NULL until T21/T24); every write sets `updated_at`. An existing row keeps its definition, version, status and `created_at`. The `wf_id` is the text of the `wf-id` slot (a symbol or string as it is, an integer in decimal). A modify of `wf-id` touches both instances. An instance whose changes all cancel out is not written.
+
+The timestamps come from the database clock, so every node and every other writer share one clock: PostgreSQL `now()` (the start of the cycle transaction: every row of a cycle has the same time), stored as `TIMESTAMPTZ`; SQLite `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`, UTC with milliseconds, stored as TEXT (`2026-11-19T17:51:10.960Z`, the format of the trace timestamps).
+
+### Write rules
+
+A slot value is written per the column's declared CLIPS type and null policy:
+
+| Value | Column | Written |
+|---|---|---|
+| the symbol `nil` | null policy `nil` | NULL |
+| the symbol `nil` | null policy `default` or `error` | as any other symbol (text `nil` in a text column; in an `integer` or `float` column it is a type error, below) |
+| INTEGER | `integer` | an integer (`int8` on PostgreSQL); in a `boolean` column `0` is false and `1` is true, any other integer is an error |
+| FLOAT | `float` | a float (`float8`; in a `numeric` column PostgreSQL converts it) |
+| STRING or SYMBOL | `string` or `symbol` | text (in a `timestamptz`, `jsonb` or `numeric` column PostgreSQL parses it); in a `bytea` column the bytes of the string |
+| any other type (an INTEGER in a `float` column, a FLOAT or INTEGER in a `string` column, an instance name, a fact address, ...) | | an error |
+
+PostgreSQL may still refuse a written value: an integer above 2147483647 for an `int4` column of an existing table, text that is no valid timestamp or JSON, a string that is no valid UTF-8. That is a database error like any other (below). SQLite stores what it is given (its `INTEGER` holds 64 bits).
+
+### Echo suppression
+
+Facts asserted while the daemon loads rows from the database (the rehydration of T10c, `db-load` of T10d) mirror stored rows and must not be written back. Those loaders call `clpd_orm_sync_suspend` before and `clpd_orm_sync_resume` after (the calls nest): while suspended, an assert is not recorded, and a retract drops whatever was recorded for that fact (a rehydration discards it for the stored state). A later modify of a loaded fact is an `UPDATE` against the values it was loaded with.
+
+### Failures
+
+A write the database refuses, or a value the [write rules](#write-rules) cannot write, rolls the whole cycle back (the rules' DDL and the rows written before it included) through the [cycle transaction](database.md#cycle-transaction): one line names the write, the cycle transaction line follows, and the cycle is retried after the backoff. The recorded changes are kept, so the retry writes them again with whatever the next cycle adds (until T10c rehydrates the instances). When a statement of the cycle already failed (for example a rule's `db-nextval`), the synchronization sends nothing and the commit reports that failure.
+
+| Situation | Messages |
+|---|---|
+| The database refuses a write of a mapped table | `clpdaemon: sync: <pkg>::<template>: table '<table>': <database message>`, then `clpdaemon: cycle transaction failed: <database message>; retrying in <n> ms` |
+| The database refuses the instance row | `clpdaemon: sync: table 'workflow_instance': <database message>`, then the same cycle transaction line |
+| PostgreSQL has no current schema | `clpdaemon: sync: no current schema (the search_path names no existing schema)`, then `clpdaemon: cycle transaction failed: no current schema (the search_path names no existing schema); retrying in <n> ms` |
+| A value of another type than the declared one | `clpdaemon: sync: <pkg>::<template>: table '<table>': slot '<slot>' (column '<column>'): expected <clips-type>, got <TYPE>`, then `clpdaemon: cycle transaction failed: slot '<slot>' (column '<column>'): expected <clips-type>, got <TYPE>; retrying in <n> ms`; `<TYPE>` is `INTEGER`, `FLOAT`, `SYMBOL`, `STRING`, `INSTANCE-NAME`, `FACT-ADDRESS`, `INSTANCE-ADDRESS`, `EXTERNAL-ADDRESS` or `MULTIFIELD` |
+| An integer other than 0 or 1 in a `boolean` column | `clpdaemon: sync: <pkg>::<template>: table '<table>': slot '<slot>' (column '<column>'): a boolean column takes 0 or 1`, then the cycle transaction line with that reason |
+
+For example, two facts with one key on SQLite: `clpdaemon: sync: shop@1::order: table 'shop_order': UNIQUE constraint failed: shop_order.wf_id, shop_order.line_no`; on PostgreSQL `... duplicate key value violates unique constraint "shop_order_pkey" (SQLSTATE 23505)`. No message shows a slot value.
+
+### Decisions (T10b)
+
+- The facts before the first cycle (deffacts at `Reset`, startup) are written by the first cycle, like any change since the last commit (tested).
+- A fact asserted and modified in one cycle is one `INSERT` with the final values; asserted and retracted, nothing; several modifies, one `UPDATE` of the changed columns; a key change, `DELETE` + `INSERT`.
+- Two facts with one primary key: the second `INSERT` fails with a unique violation and the cycle is rolled back (documented above, tested); the same for a restart that inserts its deffacts again.
+- An `UPDATE` that finds no row inserts it; a `DELETE` that finds none is not an error.
+- A value of another type than the declared CLIPS type is an error (a string and a symbol are interchangeable); a `boolean` column takes only 0 and 1.
+- The timestamps of `workflow_instance` come from the database clock (above).
+- A modify is recorded through the assert and retract hooks (CLIPS 6.4.2 keeps the fact index), so no modify hook is needed; there is no unmapped slot to ignore, since every slot of a mapped template is mapped.
+- After a rolled-back cycle the recorded changes are kept for the retry (T10c will replace this by rehydration).
+
 ## Interface
 
-`src/orm.h` holds the CLIPS-free model and parser: `CLPD_ORM_SEQUENCE_TABLE` (the reserved `clpd_sequence`), `CLPD_ORM_INSTANCE_TABLE` (the reserved `workflow_instance`), `clpd_orm_sync` and `clpd_orm_sync_name` (each template's `sync`, `CLPD_ORM_SYNC_AUTO` by default), `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of`, `clpd_orm_sequence_of` (T9c) and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register` (all five functions), which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. `src/orm_tx.h` holds the cycle transaction (`clpd_orm_tx_begin` / `clpd_orm_tx_end`, the backoff `clpd_orm_tx_next_delay`) and `clpd_orm_tx_create_instance_table` ([`database.md`](database.md#cycle-transaction)). After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.
+`src/orm.h` holds the CLIPS-free model and parser: `CLPD_ORM_SEQUENCE_TABLE` (the reserved `clpd_sequence`), `CLPD_ORM_INSTANCE_TABLE` (the reserved `workflow_instance`), `clpd_orm_sync` and `clpd_orm_sync_name` (each template's `sync`, `CLPD_ORM_SYNC_AUTO` by default), `clpd_orm_parse` / `clpd_orm_free`, `clpd_orm_column_of`, `clpd_orm_resolve_key`, `clpd_orm_valid_ident`, the type and policy names, `clpd_orm_backend_type` (the table above), `clpd_orm_type_fits` / `clpd_orm_type_fits_list` (the list written into a caller buffer of `CLPD_ORM_TYPE_LIST_SIZE` bytes, derived from the same table as `clpd_orm_type_fits`), `clpd_orm_template_of`, `clpd_orm_sequence_of` (T9c) and `clpd_orm_table_difference`. `src/orm_ddl.h` holds `clpd_orm_ddl_register` (all five functions), which `main.c` calls right after the database opens with a context (database, packages, `orm_allow_drop`) that lives as long as the CLIPS environment. `src/orm_tx.h` holds the cycle transaction (`clpd_orm_tx_begin` / `clpd_orm_tx_end`, `clpd_orm_tx_abort` for a rollback that is no failed statement, the backoff `clpd_orm_tx_next_delay`), `clpd_orm_tx_current_schema` and `clpd_orm_tx_create_instance_table` ([`database.md`](database.md#cycle-transaction)). `src/orm_sync.h` holds the [automatic synchronization](#automatic-synchronization): `clpd_orm_sync_attach` / `clpd_orm_sync_detach` (the hooks; `main.c` attaches them after the packages load and before `after_load` and `Reset`), `clpd_orm_sync_suspend` / `clpd_orm_sync_resume` / `clpd_orm_sync_suspended` (echo suppression), `clpd_orm_sync_clear` and `clpd_orm_sync_end_cycle` (the flush and the commit, which replaces `clpd_orm_tx_end` at the end of a cycle). After a clean load, `clpd_package.orm` holds the mapping, `clpd_package.orm_templates` the deftemplates in mapping order, and each template's `key_columns` the indexes of `wf-id` and the local key columns.
 
 ### Decisions (T10a)
 
 - `<tpl>.sync = auto|manual`, default `auto` (D7); parsed and checked at load, exposed as `clpd_orm_template.sync`; the automatic synchronization itself is T10b. It is not part of the table, so versions sharing a table may differ in it.
-- `workflow_instance` is a reserved table name on every backend, like `clpd_sequence` (as a table name only: a sequence of that name is not refused).
+- `workflow_instance` is a reserved table name on every backend, like `clpd_sequence`; since T10b it is a reserved sequence name too (L91).
 - The DDL and sequence functions run inside the cycle transaction when a rule calls them: a rolled-back cycle undoes a create or a drop on both backends (tested), a PostgreSQL `nextval` stays used, a SQLite counter row is rolled back.

@@ -50,6 +50,14 @@ int clpd_orm_tx_begin(clpd_orm_tx *tx, FILE *log) {
   return 0;
 }
 
+int clpd_orm_tx_abort(clpd_orm_tx *tx, FILE *log, const char *message) {
+  clpd_db_status st;
+  if (tx->db == NULL) return 0;
+  st = clpd_db_rollback(tx->db);
+  return failed(tx, log, st == CLPD_DB_LOST ? CLPD_DB_LOST : CLPD_DB_ERROR,
+                message);
+}
+
 int clpd_orm_tx_end(clpd_orm_tx *tx, FILE *log) {
   clpd_db_status st;
   if (tx->db == NULL) return 0;
@@ -82,35 +90,41 @@ static void quote(const char *s, char *out) {
   *out = '\0';
 }
 
+int clpd_orm_tx_current_schema(clpd_db *db, char *out, char *msg,
+                               size_t n) {
+  clpd_db_result *r = NULL;
+  const clpd_db_value *v;
+  if (clpd_db_exec(db, "SELECT current_schema()", NULL, 0, &r) !=
+      CLPD_DB_OK) {
+    snprintf(msg, n, "%s", clpd_db_error(db));
+    return -1;
+  }
+  v = clpd_db_result_rows(r) == 1 ? clpd_db_result_value(r, 0, 0) : NULL;
+  if (v == NULL || v->type != CLPD_DB_TEXT) {
+    clpd_db_result_free(r);
+    snprintf(msg, n, "no current schema (the search_path names no existing "
+                     "schema)");
+    return -1;
+  }
+  /* PostgreSQL names have at most NAMEDATALEN - 1 bytes; out holds that
+   * many with every byte a doubled quote. */
+  if (v->size > CLPD_ORM_IDENT_MAX) {
+    clpd_db_result_free(r);
+    snprintf(msg, n, "the current schema name is too long");
+    return -1;
+  }
+  quote(v->data, out);
+  clpd_db_result_free(r);
+  return 0;
+}
+
 int clpd_orm_tx_create_instance_table(clpd_db *db, char *msg, size_t n) {
-  char sql[1024], schema[2 * CLPD_ORM_IDENT_MAX + 3];
+  char sql[1024], schema[CLPD_ORM_TX_SCHEMA_SIZE];
   snprintf(msg, n, "%s", "");
   if (strcmp(clpd_db_backend(db), "postgresql") == 0) {
     /* The schema db-check-schema and the DDL functions use, so a table of
      * that name in a later search_path schema is never the one kept. */
-    clpd_db_result *r = NULL;
-    const clpd_db_value *v;
-    if (clpd_db_exec(db, "SELECT current_schema()", NULL, 0, &r) !=
-        CLPD_DB_OK) {
-      snprintf(msg, n, "%s", clpd_db_error(db));
-      return -1;
-    }
-    v = clpd_db_result_rows(r) == 1 ? clpd_db_result_value(r, 0, 0) : NULL;
-    if (v == NULL || v->type != CLPD_DB_TEXT) {
-      clpd_db_result_free(r);
-      snprintf(msg, n, "no current schema (the search_path names no existing "
-                       "schema)");
-      return -1;
-    }
-    /* PostgreSQL names have at most NAMEDATALEN - 1 bytes; schema holds
-     * that many with every byte a doubled quote. */
-    if (v->size > CLPD_ORM_IDENT_MAX) {
-      clpd_db_result_free(r);
-      snprintf(msg, n, "the current schema name is too long");
-      return -1;
-    }
-    quote(v->data, schema);
-    clpd_db_result_free(r);
+    if (clpd_orm_tx_current_schema(db, schema, msg, n) != 0) return -1;
     snprintf(sql, sizeof sql,
              "CREATE TABLE IF NOT EXISTS %s.\"" CLPD_ORM_INSTANCE_TABLE
              "\"" INSTANCE_COLUMNS("TIMESTAMPTZ"), schema);

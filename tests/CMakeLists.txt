@@ -72,8 +72,25 @@ set_tests_properties(clpdaemon_orm_tx PROPERTIES TIMEOUT 60)
 add_test(NAME clpdaemon_orm_tx_pg
   COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:orm_tx_test>)
 set_tests_properties(clpdaemon_orm_tx_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+# Automatic synchronization (T10b): the same pair, SQLite and PostgreSQL.
+add_executable(orm_sync_test orm/orm_sync_test.c)
+target_link_libraries(orm_sync_test PRIVATE clpd_core)
+target_include_directories(orm_sync_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+target_compile_options(orm_sync_test PRIVATE ${CLPD_WARNINGS})
+add_test(NAME clpdaemon_orm_sync COMMAND orm_sync_test)
+set_tests_properties(clpdaemon_orm_sync PROPERTIES TIMEOUT 60)
+add_test(NAME clpdaemon_orm_sync_pg
+  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:orm_sync_test>)
+set_tests_properties(clpdaemon_orm_sync_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+# A running daemon against PostgreSQL (T10b): the synchronization, and the
+# admin socket served during the backoff after a lost server.
+add_test(NAME clpdaemon_cli_pg
+  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh /bin/sh
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/cli_pg_test.sh $<TARGET_FILE:clpdaemon>
+    $<TARGET_FILE:admin_client>)
+set_tests_properties(clpdaemon_cli_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 set_tests_properties(clpdaemon_db_pg clpdaemon_orm_ddl_pg clpdaemon_orm_tx_pg
-  PROPERTIES RESOURCE_LOCK clpd_pg_cluster)
+  clpdaemon_orm_sync_pg clpdaemon_cli_pg PROPERTIES RESOURCE_LOCK clpd_pg_cluster)
 
 # Link seam for the reader-failure cases, this test binary only: the test
 # wraps poll and read (production objects are unchanged).
@@ -90,6 +107,9 @@ target_link_options(orm_ddl_test PRIVATE -Wl,--wrap=clpd_db_exec)
 # orm_tx_test wraps begin, commit and reconnect.
 target_link_options(orm_tx_test PRIVATE -Wl,--wrap=clpd_db_begin_atomic
   -Wl,--wrap=clpd_db_commit -Wl,--wrap=clpd_db_reconnect)
+# The statements of the automatic synchronization (T10b): orm_sync_test
+# wraps clpd_db_exec to record them and to make one fail.
+target_link_options(orm_sync_test PRIVATE -Wl,--wrap=clpd_db_exec)
 
 # The loader test dlopens the plugins built in <build>/plugins, which take
 # their CLIPS symbols from the test executable.

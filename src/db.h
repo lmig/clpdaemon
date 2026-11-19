@@ -112,6 +112,9 @@ clpd_db_status clpd_db_begin_atomic(clpd_db *db);
 clpd_db_status clpd_db_commit(clpd_db *db);
 clpd_db_status clpd_db_rollback(clpd_db *db);
 int clpd_db_in_transaction(const clpd_db *db);
+/* 1 when an atomic transaction is open and one of its statements failed
+ * (it is rolled back already; commit will return that failure), else 0. */
+int clpd_db_atomic_failed(const clpd_db *db);
 
 /* Replaces the connection of db with a new one opened with spec (the spec
  * db was opened with), keeping the handle, for example after

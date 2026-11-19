@@ -444,6 +444,16 @@ static void test_reserved_instance_table(void) {
   EXPECT(err_is(eb, "clpdaemon: %s:1: o.table: table name 'workflow_instance' "
                     "is reserved (the daemon's workflow instance table)\n"));
   clpd_orm_free(&m);
+  /* T10b (L91): also as a sequence name (PostgreSQL keeps tables and
+   * sequences in one namespace); a similar name is fine. */
+  EXPECT(parse("seq.n = workflow_instance\n"
+               "seq.n.owned = no\n"
+               "seq.m = workflow_instance_seq\n"
+               "seq.m.owned = yes\n",
+               &m, eb, sizeof eb) != 0);
+  EXPECT(err_is(eb, "clpdaemon: %s:1: seq.n: sequence name 'workflow_instance' "
+                    "is reserved (the daemon's workflow instance table)\n"));
+  clpd_orm_free(&m);
 }
 
 /* T10a (L90): <tpl>.sync = auto|manual, default auto. */

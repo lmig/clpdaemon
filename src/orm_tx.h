@@ -16,6 +16,7 @@
 #include <stdio.h>
 
 #include "db.h"
+#include "orm.h"
 
 typedef struct {
   clpd_db *db;      /* NULL: no database; begin and end do nothing */
@@ -43,12 +44,26 @@ int clpd_orm_tx_begin(clpd_orm_tx *tx, FILE *log);
  * or the commit itself did; the same line is logged and retry_ms set. */
 int clpd_orm_tx_end(clpd_orm_tx *tx, FILE *log);
 
+/* Rolls the open cycle transaction back for a reason that is no failed
+ * statement (a value the synchronization cannot write, src/orm_sync.h):
+ * the same line as a failure, with message as <message>, and the same
+ * wait. Returns -1 (0 without a database). */
+int clpd_orm_tx_abort(clpd_orm_tx *tx, FILE *log, const char *message);
+
 /* The wait after a failure: initial_ms after a commit (prev 0), otherwise
  * prev doubled, never above max_ms. */
 int clpd_orm_tx_next_delay(int prev, int initial_ms, int max_ms);
 
+/* PostgreSQL: current_schema() quoted ("name", any '"' doubled) into out,
+ * which holds CLPD_ORM_TX_SCHEMA_SIZE bytes; the schema the DDL functions,
+ * workflow_instance and the synchronization name. Returns 0, or -1 with a
+ * one-line message in msg (the query failed, no schema of the search_path
+ * exists, or the name is too long). */
+#define CLPD_ORM_TX_SCHEMA_SIZE (2 * CLPD_ORM_IDENT_MAX + 3)
+int clpd_orm_tx_current_schema(clpd_db *db, char *out, char *msg, size_t n);
+
 /* CREATE TABLE IF NOT EXISTS for workflow_instance (one row per workflow
- * instance, written from T10b on), in autocommit; on PostgreSQL qualified
+ * instance, written by the synchronization, src/orm_sync.h), in autocommit; on PostgreSQL qualified
  * with current_schema() like the DDL functions (docs/orm.md). Columns, in
  * order (PostgreSQL / SQLite types):
  *   wf_id TEXT NOT NULL (the primary key), definition TEXT NOT NULL,

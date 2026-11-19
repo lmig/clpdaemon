@@ -457,6 +457,8 @@ const char *clpd_db_error(const clpd_db *db) {
 
 int clpd_db_in_transaction(const clpd_db *db) { return db->in_tx; }
 
+int clpd_db_atomic_failed(const clpd_db *db) { return doomed(db); }
+
 static clpd_db_result *result_new(void) {
   clpd_db_result *r = xrealloc(NULL, sizeof *r);
   memset(r, 0, sizeof *r);

@@ -374,6 +374,12 @@ static void on_sequence(clpd_kv *kv, clpd_orm *orm, char *key, char *value) {
     return;
   }
   if (duplicate(kv, key, &s->name_line) || !ident(kv, key, "", value)) return;
+  /* PostgreSQL keeps tables and sequences in one namespace (T10b, L91). */
+  if (strcmp(value, CLPD_ORM_INSTANCE_TABLE) == 0) {
+    clpd_kv_error(kv, "%s: sequence name '%s' is reserved (the daemon's "
+                      "workflow instance table)", key, value);
+    return;
+  }
   for (i = 0; i < orm->sequence_count; i++) {
     const clpd_orm_sequence *o = &orm->sequences[i];
     if (o != s && o->name != NULL && strcmp(o->name, value) == 0) {

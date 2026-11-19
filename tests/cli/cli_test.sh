@@ -1891,5 +1891,74 @@ packages = txpkg"
   chmod 0644 txro.db
 fi
 
+# --- automatic synchronization (T10b, docs/orm.md#automatic-synchronization) --
+# The deffacts fact is written by the first cycle (the rule that creates
+# the tables runs first in it), a rule's assert of a mapped auto template
+# is an INSERT, a fact of a manual template is not written, two modifies
+# in one cycle (pay, then ship) are one UPDATE; an injected fact with the
+# primary key of a stored row is a unique violation that rolls the cycle
+# back.
+mkdir syncpkg
+conf syncpkg/package.conf 'definition = sync
+version = 1
+files = s.clp
+orm = orm.conf
+ingest = go, order'
+conf syncpkg/s.clp '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot line-no (type INTEGER)) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id) (slot text))
+(deffacts seed (boot (wf-id w0)) (order (wf-id w1) (line-no 1) (status new)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order) (db-create-table memo))
+(defrule add (go (wf-id ?w) (act add)) => (assert (order (wf-id ?w) (line-no 2) (status new))) (assert (memo (wf-id ?w) (text "m"))))
+(defrule pay (go (wf-id ?w) (act pay)) ?o <- (order (wf-id ?w) (line-no 1) (status new)) => (modify ?o (status paid)))
+(defrule ship ?o <- (order (wf-id ?w) (status paid)) => (modify ?o (status shipped)))'
+conf syncpkg/orm.conf 'order.table = sync_order
+order.owned = yes
+order.key = line-no
+order.slot.wf-id = wf_id text symbol error
+order.slot.line-no = line_no bigint integer error
+order.slot.status = status text symbol default
+memo.table = sync_memo
+memo.owned = yes
+memo.sync = manual
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.text = body text string nil'
+rconf syncrun.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 60000
+cycle_retry_max_ms = 60000
+database = sqlite:$WORK/syncrun.db
+packages = syncpkg"
+SYNCDUP='UNIQUE constraint failed: sync_order.wf_id, sync_order.line_no'
+cases=$((cases + 1))
+start syncrun.conf admin.sock
+wait_status admin.sock ' cycles=1 ' || ok=0
+acase "sync: inject add" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"add"}}}\n'
+wait_status admin.sock ' cycles=2 ' || ok=0
+acase "sync: inject pay" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"pay"}}}\n'
+wait_status admin.sock ' cycles=3 ' || ok=0
+acase "sync: inject a duplicate key" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"line-no":1,"status":{"sym":"dup"}}}\n'
+wait_line err.txt "clpdaemon: cycle transaction failed: $SYNCDUP; retrying in 60000 ms" || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: sync: sync@1::order: table 'sync_order': $SYNCDUP
+clpdaemon: cycle transaction failed: $SYNCDUP; retrying in 60000 ms
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "sync: a running daemon writes its facts" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 syncrun.db "SELECT wf_id || '|' || line_no || '|' || status FROM sync_order ORDER BY line_no; SELECT count(*) FROM sync_memo; SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || coalesce(parent_wf_id, owner_node, lease_until, '-') || '|' || (created_at < updated_at) || '|' || (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z') FROM workflow_instance" 2>&1)
+  want='w1|1|shipped
+w1|2|new
+0
+w1|sync|1|active|-|1|1'
+  [ "$got" = "$want" ] || fail "sync: the rows after the cycles" "got [$got], want [$want]"
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]
