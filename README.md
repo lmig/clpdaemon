@@ -30,13 +30,16 @@ Directories are created by the task that introduces them.
 
 ## Build
 
-Prerequisites: CMake >= 3.20 and a C99 compiler (GCC). On the reference development machine the tools come from a user-level Homebrew installation (`/home/linuxbrew/.linuxbrew/bin`).
+Prerequisites: CMake >= 3.20, a C99 compiler (GCC), pkg-config, and the development files of SQLite 3 (`sqlite3.pc`) and libpq (`libpq.pc`), both required. Optional, for the PostgreSQL test `clpdaemon_db_pg`: `initdb`, `pg_ctl` and `psql` in `PATH` or in `CLPD_PG_BINDIR`; without them the test is SKIPPED ([`docs/database.md`](docs/database.md#tests)). On the reference development machine the tools come from a user-level Homebrew installation (`/home/linuxbrew/.linuxbrew/bin`).
 
 ```sh
+export PKG_CONFIG_PATH=/home/linuxbrew/.linuxbrew/opt/libpq/lib/pkgconfig:/home/linuxbrew/.linuxbrew/lib/pkgconfig
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+`PKG_CONFIG_PATH` is needed only when pkg-config does not find the two libraries on its own: the first entry is the `lib/pkgconfig` directory of a keg-only libpq (Homebrew does not link it into its prefix, so its `libpq.pc` is only there), the second the package manager's shared `lib/pkgconfig` directory, where `sqlite3.pc` lives. Use the equivalent directories of your installation; with system packages (for example `libsqlite3-dev` and `libpq-dev`) it can be left unset. The sanitizer build below needs the same variable.
 
 CLIPS is vendored unmodified under `vendor/clips/` (see its README).
 
@@ -61,3 +64,5 @@ Command line, configuration keys, defaults and exact error messages: [`docs/conf
 Admin socket (inject a test fact, status, reopen the trace files): [`docs/admin-socket.md`](docs/admin-socket.md); fact ingestion: [`docs/ingest.md`](docs/ingest.md).
 
 C plugins (contract, lifecycle, building one): [`docs/plugins.md`](docs/plugins.md); the example plugin builds as `build/plugins/clpd_example.so`.
+
+Database (the `database` key, PostgreSQL and the test-only SQLite backend, password files, the PostgreSQL test): [`docs/database.md`](docs/database.md).

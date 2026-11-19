@@ -258,6 +258,10 @@ wait_exit() {
 daemon() {
   name=$1 dconf=$2 sigs=$3 want_err=$4 mode=${5:-}
   cases=$((cases + 1))
+  # Truncated here, not only by the background child's redirection, so the
+  # wait below never reads a stale running line from the previous case.
+  : >out.txt
+  : >err.txt
   if [ "$mode" = ignore-int ]; then
     sh -c 'trap "" INT; exec "$0" --config "$1"' "$BIN" "$dconf" >out.txt 2>err.txt &
   else
@@ -676,6 +680,8 @@ RUN='timeout 10' check "plugin error aborts a run too" 1 "" \
 # expects exit 0, empty stdout and the exact stderr.
 plugdaemon() {
   cases=$((cases + 1))
+  : >out.txt # truncated before the start, as in daemon()
+  : >err.txt
   "$BIN" --config "$2" >out.txt 2>err.txt &
   pid=$!
   ok=1
@@ -1102,6 +1108,8 @@ wait_reply() {
 # start <conf> <socket>: starts the daemon in the background (pid) and waits
 # for its running line and its socket; ok=0 when either is missing.
 start() {
+  : >out.txt # truncated before the start, as in daemon()
+  : >err.txt
   "$BIN" --config "$1" >out.txt 2>err.txt &
   pid=$!
   ok=1
@@ -1315,6 +1323,78 @@ if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$ticks" -gt 20 ] || [ -e emf.sock ] ||
 clpdaemon: received SIGTERM, stopping" ]; then
   fail "admin socket out of file descriptors" "exit $rc, lines seen $ok, CPU ticks in 1 s $ticks, stderr [$(cat err.txt)]"
 fi
+
+# --- database (T8d, docs/database.md) ----------------------------------------
+# The database opens after the configuration loads and before the plugins'
+# init, also under --check; a configuration without `database` is covered by
+# every case above.
+conf dbok.conf "node_id = n1
+database = sqlite:$WORK/dbok.db
+plugins = $PLUGINS/clpd_example.so"
+check "database: sqlite opens under --check" 0 "clpdaemon: dbok.conf: configuration OK" \
+  "clpdaemon: example: init
+clpdaemon: example: shutdown" -- --config dbok.conf --check
+cases=$((cases + 1))
+[ -f dbok.db ] || fail "database: --check creates the sqlite file" "$(ls -l)"
+
+# A missing directory: exit 1 before any plugin init, and the message never
+# shows the spec (the path).
+conf dbmiss.conf "node_id = n1
+database = sqlite:$WORK/nodir-secret/x.db
+plugins = $PLUGINS/clpd_example.so"
+check "database: cannot open" 1 "" \
+  "clpdaemon: cannot open the database: cannot open the SQLite database: unable to open database file" \
+  -- --config dbmiss.conf --check
+cases=$((cases + 1))
+if grep -q 'nodir-secret' err.txt || [ -e nodir-secret ]; then
+  fail "database: the open error does not show the path" "stderr [$(cat err.txt)]"
+fi
+
+# PostgreSQL that cannot be reached (no server on that socket directory):
+# exit 1 with the one-line message; no cluster is started here.
+mkdir pgnone
+conf dbpg.conf "node_id = n1
+database = host=$WORK/pgnone port=1 dbname=clpd user=clpd connect_timeout=2"
+cases=$((cases + 1))
+timeout 10 "$BIN" --config dbpg.conf --check >out.txt 2>err.txt
+rc=$?
+if [ "$rc" != 1 ] || [ -s out.txt ] || [ "$(wc -l <err.txt | tr -d ' ')" != 1 ] ||
+  ! grep -q '^clpdaemon: cannot open the database: cannot connect to PostgreSQL' err.txt; then
+  fail "database: unreachable PostgreSQL" "exit $rc, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# Rejected specs (T8a): file:line, the exact message, never the value.
+dberr() {
+  conf "$1.conf" "node_id = n1
+database = $2"
+  check "database: rejected spec $1" 1 "" "clpdaemon: $1.conf:2: database: $3" -- --config "$1.conf" --check
+}
+PWMSG='the connection string must not contain a password (use a password file, see PGPASSFILE)'
+dberr dbempty '' 'expected a connection string'
+dberr dbnopath 'sqlite:' 'expected sqlite:<path>'
+dberr dbbad 'not a s3cr3t conninfo' 'invalid PostgreSQL connection string'
+dberr dbpw 'host=/tmp password=s3cr3t' "$PWMSG"
+dberr dbsslpw 'host=/tmp sslpassword=s3cr3t' "$PWMSG"
+dberr dburipw 'postgresql://clpd:s3cr3t@localhost/clpd' "$PWMSG"
+# A password inside a dbname that is itself a connection string (L78).
+for v in "dbnamepw host=/tmp dbname='postgresql://u:s3cr3t@h/d'" \
+    "dbnamekvpw host=/tmp dbname='host=h password=s3cr3t'"; do
+  dberr "${v%% *}" "${v#* }" "$PWMSG"
+  cases=$((cases + 1))
+  if grep -q s3cr3t err.txt; then
+    fail "database: a nested password is not echoed" "stderr [$(cat err.txt)]"
+  fi
+done
+
+# A running daemon with a sqlite database starts and stops gracefully.
+rconf dbrun.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/dbrun.db"
+daemon "database: running with a sqlite database" dbrun.conf TERM "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+cases=$((cases + 1))
+[ -f dbrun.db ] || fail "database: the daemon creates the sqlite file" "$(ls -l)"
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]
