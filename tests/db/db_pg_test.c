@@ -347,13 +347,14 @@ static void test_session_timeouts(void) {
   clpd_db_close(db);
 }
 
-/* Waits on a row another connection holds: CLPD_DB_ERROR (55P03) after the
- * lock timeout, and the connection stays usable. */
+/* Waits on a row another connection holds: CLPD_DB_TRANSIENT (55P03,
+ * T10f) after the lock timeout, and the connection stays usable. */
 static void wait_for_lock(clpd_db *db, double min, double max) {
   double start;
   clpd_db_value v;
   start = now();
-  EXPECT(run(db, "UPDATE pg_lock SET n = 2 WHERE id = 1") == CLPD_DB_ERROR);
+  EXPECT(run(db, "UPDATE pg_lock SET n = 2 WHERE id = 1") ==
+         CLPD_DB_TRANSIENT);
   start = now() - start;
   EXPECT(start >= min && start <= max);
   EXPECT(one_line(clpd_db_error(db)));
@@ -383,7 +384,7 @@ static void case_lock_timeout(void) {
     /* Inside a transaction: the statement fails, rollback ends it. */
     EXPECT(clpd_db_begin(fast) == CLPD_DB_OK);
     EXPECT(run(fast, "UPDATE pg_lock SET n = 2 WHERE id = 1") ==
-           CLPD_DB_ERROR);
+           CLPD_DB_TRANSIENT);
     EXPECT(contains(clpd_db_error(fast), "55P03"));
     EXPECT(clpd_db_rollback(fast) == CLPD_DB_OK);
     wait_for_lock(fast, 0.15, 3.0);
@@ -401,8 +402,8 @@ static void case_lock_timeout(void) {
   clpd_db_close(holder);
 }
 
-/* A statement over statement_timeout is CLPD_DB_ERROR (57014); the
- * connection stays usable. */
+/* A statement over statement_timeout is CLPD_DB_TRANSIENT (57014, T10f);
+ * the connection stays usable. */
 static void case_statement_timeout(void) {
   char spec[1024];
   clpd_db *db;
@@ -414,7 +415,7 @@ static void case_statement_timeout(void) {
   EXPECT(db != NULL);
   if (db == NULL) return;
   start = now();
-  EXPECT(run(db, "SELECT pg_sleep(20)") == CLPD_DB_ERROR);
+  EXPECT(run(db, "SELECT pg_sleep(20)") == CLPD_DB_TRANSIENT);
   start = now() - start;
   EXPECT(start >= 0.25 && start <= 3.0);
   EXPECT(one_line(clpd_db_error(db)));
@@ -574,6 +575,57 @@ static void test_aborted_commit(void) {
   clpd_db_close(db);
 }
 
+/* T10f: the status of a server error by its SQLSTATE, raised on demand by
+ * a PL/pgSQL function. Contention (40001 serialization failure, 40P01
+ * deadlock, 55P03 lock not available, 57014 query canceled) is
+ * CLPD_DB_TRANSIENT, 23505 stays CLPD_DB_UNIQUE and anything else (42P01)
+ * CLPD_DB_ERROR; the message is the usual "<primary> (SQLSTATE <code>)".
+ * In an atomic transaction a transient failure rolls back like any other
+ * and commit returns it with its message. */
+static void test_transient_codes(void) {
+  static const struct {
+    const char *code;
+    clpd_db_status st;
+  } cases[] = {
+      {"40001", CLPD_DB_TRANSIENT}, {"40P01", CLPD_DB_TRANSIENT},
+      {"55P03", CLPD_DB_TRANSIENT}, {"57014", CLPD_DB_TRANSIENT},
+      {"23505", CLPD_DB_UNIQUE},    {"42P01", CLPD_DB_ERROR},
+  };
+  clpd_db *db = open_db(conninfo);
+  clpd_db_value p, v;
+  char want[128];
+  size_t i;
+  EXPECT(db != NULL);
+  if (db == NULL) return;
+  EXPECT(run(db, "CREATE TEMP TABLE pg_tr (id BIGINT PRIMARY KEY)") ==
+         CLPD_DB_OK);
+  EXPECT(run(db, "CREATE FUNCTION pg_temp.clpd_raise(code text) RETURNS "
+                 "void LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''clpd "
+                 "raised'' USING ERRCODE = code; END'") == CLPD_DB_OK);
+  for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    p = clpd_db_text(cases[i].code);
+    snprintf(want, sizeof want, "clpd raised (SQLSTATE %s)", cases[i].code);
+    EXPECT(clpd_db_exec(db, "SELECT pg_temp.clpd_raise($1)", &p, 1, NULL) ==
+           cases[i].st);
+    if (strcmp(clpd_db_error(db), want) != 0) {
+      fprintf(stderr, "  %s: got [%s]\n", cases[i].code, clpd_db_error(db));
+      EXPECT(0);
+    }
+    /* Inside an atomic transaction: rolled back, commit returns it. */
+    EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+    EXPECT(run(db, "INSERT INTO pg_tr (id) VALUES (1)") == CLPD_DB_OK);
+    EXPECT(clpd_db_exec(db, "SELECT pg_temp.clpd_raise($1)", &p, 1, NULL) ==
+           cases[i].st);
+    EXPECT(clpd_db_atomic_failed(db) == 1);
+    EXPECT(clpd_db_commit(db) == cases[i].st);
+    EXPECT(strcmp(clpd_db_error(db), want) == 0);
+    EXPECT(clpd_db_in_transaction(db) == 0);
+    EXPECT(scalar(db, "SELECT count(*) FROM pg_tr", NULL, 0, &v, NULL, 0));
+    EXPECT(v.type == CLPD_DB_INTEGER && v.integer == 0);
+  }
+  clpd_db_close(db);
+}
+
 /* Terminates the backend of `victim` from `admin` and waits until it is
  * gone. */
 static void terminate(clpd_db *admin, clpd_db *victim) {
@@ -716,6 +768,7 @@ int main(int argc, char **argv) {
   test_password_file();
   test_types_and_messages();
   test_aborted_commit();
+  test_transient_codes();
   test_lost();
   test_atomic_lost_reconnect();
   test_long_class22();

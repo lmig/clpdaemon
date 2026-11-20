@@ -6,8 +6,9 @@
  * waits for an exponential backoff (cycle_retry_initial_ms doubled up to
  * cycle_retry_max_ms, indefinitely; reset by a committed cycle); after
  * CLPD_DB_LOST the connection is reopened with the same spec before the
- * next attempt. The wait itself belongs to the event loop
- * (clpd_loop_defer), so signals and the admin socket are served meanwhile.
+ * next attempt (CLPD_DB_TRANSIENT, contention, only waits; T10f). The
+ * wait itself belongs to the event loop (clpd_loop_defer), so signals and
+ * the admin socket are served meanwhile.
  * Also the daemon's workflow_instance table (CLPD_ORM_INSTANCE_TABLE). */
 #ifndef CLPD_ORM_TX_H
 #define CLPD_ORM_TX_H
@@ -24,6 +25,9 @@ typedef struct {
   int initial_ms, max_ms;
   int retry_ms;  /* the wait after the last failure; 0 after a commit */
   int reconnect; /* a status was CLPD_DB_LOST: reconnect before begin */
+  /* The status of the last failed attempt (the first failure of a
+   * rolled-back cycle, src/db.h); CLPD_DB_OK after init and a commit. */
+  clpd_db_status failure;
 } clpd_orm_tx;
 
 /* db and spec stay owned by the caller and must outlive tx; 1 <= initial_ms

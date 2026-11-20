@@ -2288,5 +2288,103 @@ else
   echo "cli_test.sh: sqlite3 not found; the T10e A1 and audit cases are skipped" >&2
 fi
 
+# --- transient contention (T10f) --------------------------------------------
+# Another connection holds an EXCLUSIVE lock on the database file while the
+# daemon must reload an instance a rolled-back cycle evicted: the reload
+# SELECT fails with "database is locked" (SQLITE_BUSY after the 5 s busy
+# timeout), which is transient: w1 is not isolated, the start of the
+# cycle is retried, and once the lock is released w1 is reloaded and its
+# rule's modify is written. The first failure (w1's rule, a missing
+# sequence) counts for w1; the two reload failures that follow neither
+# count nor reset, so with instance_isolate_after = 2 three failures in a
+# row isolate nothing.
+if command -v sqlite3 >/dev/null 2>&1; then
+  mkdir tfpkg
+  conf tfpkg/package.conf 'definition = tf
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order'
+  conf tfpkg/a.clp '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))
+(defrule fail (go (wf-id ?w)) ?o <- (order (wf-id ?w)) => (modify ?o (status touched)) (db-nextval missing_no))
+(defrule stored ?o <- (order (wf-id ?w) (status stored)) => (modify ?o (status cured)))'
+  conf tfpkg/orm.conf 'order.table = tf_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+seq.missing_no = tf_missing_seq
+seq.missing_no.owned = yes'
+  rconf tf.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 1000
+cycle_retry_max_ms = 1000
+instance_isolate_after = 2
+database = sqlite:$WORK/tf.db
+packages = tfpkg"
+  cases=$((cases + 1))
+  start tf.conf admin.sock
+  wait_status admin.sock ' cycles=1 ' || ok=0
+  acase "tf: inject w1" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"status":{"sym":"new"}}}\n'
+  wait_status admin.sock ' cycles=2 ' || ok=0
+  sqlite3 tf.db "UPDATE tf_order SET status = 'stored' WHERE wf_id = 'w1'"
+  acase "tf: inject a go" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"}}}\n'
+  TFFAIL='clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 1000 ms'
+  wait_line err.txt "$TFFAIL" || ok=0
+  # The lock, taken during the 1 s wait before the reload and held for 15 s:
+  # the reloads at about 1 s and 7 s wait 5 s each and fail, the one at
+  # about 13 s gets the database when the lock is released.
+  printf '%s\n' '.timeout 5000' 'BEGIN EXCLUSIVE;' '.shell touch tflocked' \
+    '.shell sleep 15' 'COMMIT;' | sqlite3 tf.db >tfholder.txt 2>&1 &
+  hpid=$!
+  n=0
+  while [ ! -e tflocked ]; do
+    n=$((n + 1))
+    [ "$n" -gt 40 ] && { ok=0; break; }
+    sleep 0.05
+  done
+  wait "$hpid"
+  hrc=$?
+  n=0
+  while [ "$(sqlite3 tf.db "SELECT status FROM tf_order WHERE wf_id = 'w1'" 2>/dev/null)" != cured ]; do
+    n=$((n + 1))
+    [ "$n" -gt 400 ] && { ok=0; break; }
+    sleep 0.05
+  done
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  TFRH="clpdaemon: rehydrate: instance 'w1': tf@1::order: table 'tf_order': database is locked"
+  TFRETRY='clpdaemon: cycle transaction failed: database is locked; retrying in 1000 ms'
+  k=$(grep -cxF "$TFRH" err.txt)
+  want="clpdaemon: n1: running
+clpdaemon: db-nextval: sequence alias 'missing_no': sequence 'tf_missing_seq': no such table: clpd_sequence
+[PRCCODE4] Execution halted during the actions of defrule 'fail'.
+$TFFAIL"
+  i=0
+  while [ "$i" -lt "$k" ]; do
+    want="$want
+$TFRH
+$TFRETRY"
+    i=$((i + 1))
+  done
+  want="$want
+clpdaemon: received SIGTERM, stopping"
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$hrc" != 0 ] || [ "$k" -lt 2 ] || [ -s out.txt ] ||
+    [ "$(cat err.txt)" != "$want" ] || grep -q 'is no longer synchronized' err.txt; then
+    fail "tf: a locked reload is retried, not isolated" "exit $rc, lines seen $ok, holder exit $hrc [$(cat tfholder.txt)], reload failures $k, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+  cases=$((cases + 1))
+  got=$(sqlite3 tf.db "SELECT wf_id || '|' || status FROM tf_order ORDER BY wf_id; SELECT count(*) FROM workflow_instance WHERE wf_id = 'w1'" 2>&1)
+  want='w1|cured
+1'
+  [ "$got" = "$want" ] || fail "tf: the stored rows" "got [$got], want [$want]"
+else
+  echo "cli_test.sh: sqlite3 not found; the T10f case is skipped" >&2
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

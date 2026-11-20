@@ -101,10 +101,12 @@ void clpd_orm_sync_clear(clpd_orm_syncer *s);
  *   table '<table>': <message>
  * retracts what that instance loaded and isolates it (the line of
  * clpd_orm_sync_end_cycle follows); the others go on and the cycle runs.
- * A SELECT that lost the connection logs the same line and then the cycle
- * transaction line (clpd_orm_tx_fail): the cycle must not run, the
- * instances not reloaded yet stay pending for the next start. On
- * PostgreSQL a failed SELECT current_schema() logs
+ * A SELECT that lost the connection or failed with transient contention
+ * (CLPD_DB_TRANSIENT, T10f) logs the same line, retracts what that
+ * instance loaded and then logs the cycle transaction line
+ * (clpd_orm_tx_fail): the cycle must not run, that instance and the ones
+ * not reloaded yet stay pending for the next start, and nothing is
+ * isolated. On PostgreSQL a failed SELECT current_schema() logs
  * "clpdaemon: rehydrate: <message>" and fails the start the same way.
  * Returns 0 when the cycle may run, -1 when it must wait tx->retry_ms. s
  * may be NULL (only the begin). */
@@ -119,9 +121,10 @@ int clpd_orm_sync_begin_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
  * the cycle back; a value that cannot be written (docs/orm.md) logs the
  * same line with its reason instead of <message> and rolls the cycle back
  * through clpd_orm_tx_abort. Either way the cycle transaction line of
- * src/orm_tx.h follows. When the refused write (not CLPD_DB_LOST) or the
- * value belongs to instance <wf-id>, its changes are dropped, its facts are
- * no longer recorded until the syncer is detached, and
+ * src/orm_tx.h follows. When the refused write (neither CLPD_DB_LOST nor
+ * CLPD_DB_TRANSIENT, T10f) or the value belongs to instance <wf-id>, its
+ * changes are dropped, its facts are no longer recorded until the syncer
+ * is detached, and
  *   clpdaemon: sync: instance '<wf-id>' is no longer synchronized: <reason>
  * follows. Then (T10c) every instance the cycle touched, and that one, is
  * evicted (see above); an isolated one logs
@@ -129,15 +132,18 @@ int clpd_orm_sync_begin_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
  *   longer synchronized
  * instead of waiting for a reload. Poison retry (T10e,
  * docs/database.md#poison-retry): a rolled-back cycle whose first failure
- * came from a statement of a rule (not CLPD_DB_LOST) is attributed to the
- * rule's instance (the wf-id of its first basis fact that has one; none:
- * not attributed); an instance with isolate_after attributed cycles since
- * the last commit is isolated and evicted the same way, its line's
- * <reason> being "<message> (<n> rolled-back cycles in a row)". A commit
- * resets the counts. Every <wf-id> is shown with control characters as
- * '?', at most 200 bytes. Returns 0 when the cycle committed (the changes
- * are forgotten), -1 when it was rolled back (the changes of the
- * instances it did not touch are kept). s may be NULL. */
+ * came from a statement of a rule is attributed to the rule's instance
+ * (the wf-id of its first basis fact that has one; none: not attributed),
+ * unless that failure was CLPD_DB_LOST or CLPD_DB_TRANSIENT (T10f: such a
+ * cycle is retried, counted for nobody, and resets no count); an instance
+ * with isolate_after attributed cycles since the last commit is isolated
+ * and evicted the same way, its line's <reason> being
+ * "<message> (<n> rolled-back cycles in a row)" (a long <message> is cut,
+ * never the suffix). A commit resets the counts. Every <wf-id> is shown
+ * with control characters as '?', at most 200 bytes. Returns 0 when the
+ * cycle committed (the changes are forgotten), -1 when it was rolled back
+ * (the changes of the instances it did not touch are kept). s may be
+ * NULL. */
 int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
 
 #endif

@@ -28,7 +28,15 @@
  *   violation; CLPD_DB_LOST means the connection is gone (the retry policy
  *   belongs to the caller, FR-26; clpd_db_reconnect reopens it) and any
  *   open transaction is over (an atomic one still needs its commit or
- *   rollback call).
+ *   rollback call). CLPD_DB_TRANSIENT (T10f) is contention that a later
+ *   retry of the same work may not meet: PostgreSQL SQLSTATE 40001
+ *   (serialization failure), 40P01 (deadlock detected), 55P03 (lock not
+ *   available, lock_timeout) and 57014 (query canceled,
+ *   statement_timeout); SQLite SQLITE_BUSY and SQLITE_LOCKED ("database
+ *   is locked", any extended code of the two). Its message is the
+ *   backend's, unchanged; it rolls an atomic transaction back like any
+ *   failure, the connection stays usable, and a caller that does not tell
+ *   it apart must treat it as a failure like CLPD_DB_ERROR.
  * - Results: clpd_db_exec copies every row into a clpd_db_result owned by
  *   the caller, freed with clpd_db_result_free. Names and values returned
  *   by the accessors stay valid until that result is freed, independent of
@@ -46,7 +54,8 @@ typedef enum {
   CLPD_DB_OK = 0,
   CLPD_DB_ERROR,  /* any other failure; see clpd_db_error */
   CLPD_DB_UNIQUE, /* unique or primary-key violation */
-  CLPD_DB_LOST    /* connection lost */
+  CLPD_DB_LOST,     /* connection lost */
+  CLPD_DB_TRANSIENT /* lock, deadlock, serialization or timeout contention */
 } clpd_db_status;
 
 typedef enum {

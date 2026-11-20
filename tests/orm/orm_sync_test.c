@@ -14,7 +14,7 @@
  * back with SELECT after each cycle. clpd_db_exec is wrapped (-Wl,--wrap,
  * this test binary only) to record the statements the sync and the loader
  * send and to make one of them fail on demand (or report a lost
- * connection). */
+ * connection or transient contention, T10f). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "db_backend.h"
@@ -50,9 +50,11 @@ enum { SHOP, CRM }; /* package indexes, in load order */
 
 /* Seam: while recording, every statement but SELECT current_schema() is
  * appended to stmts, one per line; the fail_at-th of them (1-based) is
- * replaced by a statement that fails on the database, and the lost_at-th
- * returns CLPD_DB_LOST with "injected lost connection" without running. */
-static int recording, fail_at, lost_at, seen;
+ * replaced by a statement that fails on the database, the lost_at-th
+ * returns CLPD_DB_LOST with "injected lost connection" and the
+ * transient_at-th CLPD_DB_TRANSIENT with "injected transient failure"
+ * (T10f), both without running it. */
+static int recording, fail_at, lost_at, transient_at, seen;
 static char stmts[16384];
 
 clpd_db_status __real_clpd_db_exec(clpd_db *d, const char *sql,
@@ -61,6 +63,24 @@ clpd_db_status __real_clpd_db_exec(clpd_db *d, const char *sql,
 clpd_db_status __wrap_clpd_db_exec(clpd_db *d, const char *sql,
                                    const clpd_db_value *params, size_t n,
                                    clpd_db_result **result);
+
+/* An injected failure with status st: inside an atomic transaction that
+ * has no failure yet, the transaction is rolled back as for a real one
+ * (the failing statement runs) and st with message becomes its first
+ * failure, which the commit returns (src/db.h). */
+static clpd_db_status inject(clpd_db *d, clpd_db_status st,
+                             const char *message, clpd_db_result **result) {
+  if (d->in_tx && d->atomic && d->failed == CLPD_DB_OK) {
+    __real_clpd_db_exec(d, "SELECT * FROM clpd_injected_failure", NULL, 0,
+                        NULL);
+    d->failed = st;
+    snprintf(d->failed_error, sizeof d->failed_error, "%s", message);
+  }
+  if (result != NULL) *result = NULL;
+  clpd_db_set_error(d, "%s", message);
+  return st;
+}
+
 clpd_db_status __wrap_clpd_db_exec(clpd_db *d, const char *sql,
                                    const clpd_db_value *params, size_t n,
                                    clpd_db_result **result) {
@@ -70,11 +90,11 @@ clpd_db_status __wrap_clpd_db_exec(clpd_db *d, const char *sql,
     if (++seen == fail_at)
       return __real_clpd_db_exec(d, "SELECT * FROM clpd_injected_failure",
                                  NULL, 0, result);
-    if (seen == lost_at) {
-      if (result != NULL) *result = NULL;
-      clpd_db_set_error(d, "injected lost connection");
-      return CLPD_DB_LOST;
-    }
+    if (seen == lost_at)
+      return inject(d, CLPD_DB_LOST, "injected lost connection", result);
+    if (seen == transient_at)
+      return inject(d, CLPD_DB_TRANSIENT, "injected transient failure",
+                    result);
   }
   return __real_clpd_db_exec(d, sql, params, n, result);
 }
@@ -351,6 +371,7 @@ static void close_log(char *log, size_t cap) {
   recording = 0;
   fail_at = 0;
   lost_at = 0;
+  transient_at = 0;
   clpd_log_set(NULL);
   fflush(cycle_log);
   rewind(cycle_log);
@@ -1471,6 +1492,137 @@ static void test_poison_retry(void) {
   sql("DELETE FROM shop_order WHERE wf_id IN ('p1', 'p2')");
 }
 
+/* T10f: transient contention (CLPD_DB_TRANSIENT: a lock, deadlock,
+ * serialization or timeout failure) and a lost connection never isolate an
+ * instance. A rule statement failing that way rolls the cycle back and is
+ * retried, counted for no instance even with instance_isolate_after = 1;
+ * a transient failure between two attributed ones neither counts nor
+ * resets the count. A sync write failing that way isolates nothing: the
+ * retry writes the row. A reload SELECT failing that way fails the start
+ * of the cycle (no reconnect) and the next start reloads the instance. */
+static void test_transient(void) {
+  char log[4096], want[4096], got[8192], line[1024], reason[1024];
+  const char *missing =
+      pg ? "relation \"public.shop_missing_seq\" does not exist (SQLSTATE "
+           "42P01)"
+         : "no such table: clpd_sequence";
+  const char *tr = "injected transient failure";
+  int rc;
+#define NEXTVAL_LINE(msg, ms)                                               \
+  snprintf(line, sizeof line,                                              \
+           "clpdaemon: db-nextval: sequence alias 'missing_no': sequence "  \
+           "'shop_missing_seq': %s\n"                                       \
+           "clpdaemon: cycle transaction failed: %s; retrying in %d ms\n",  \
+           (msg), (msg), (ms))
+
+  /* A rule statement, transient or lost, with isolate_after 1. */
+  clpd_orm_sync_set_isolate_after(syncer, 1);
+  begin_cycle();
+  act(SHOP, "(assert (go (wf-id t1) (act fail)))");
+  transient_at = seen + 1;
+  EXPECT(end_cycle(log, sizeof log) == 1);
+  NEXTVAL_LINE(tr, 100);
+  EXPECT(same("transient rule statement", log, line));
+  EXPECT(tx.reconnect == 0);
+  facts_of("t1", got, sizeof got);
+  EXPECT(same("transient: evicted", got, ""));
+  EXPECT(cycle(NULL, log, sizeof log) == 0);
+  EXPECT(same("transient: the retry log", log, ""));
+  EXPECT(same("transient: reloaded, not isolated", stmts,
+              expect_sql(RELOAD_SHOP)));
+  begin_cycle();
+  act(SHOP, "(assert (go (wf-id l1) (act fail)))");
+  lost_at = seen + 1;
+  EXPECT(end_cycle(log, sizeof log) == 1);
+  NEXTVAL_LINE("injected lost connection", 100);
+  EXPECT(same("lost rule statement", log, line));
+  EXPECT(tx.reconnect == 1);
+  EXPECT(cycle(NULL, log, sizeof log) == 0);
+  EXPECT(same("lost: the retry log", log, ""));
+  EXPECT(same("lost: reloaded, not isolated", stmts,
+              expect_sql(RELOAD_SHOP)));
+  EXPECT(tx.reconnect == 0 && tx.retry_ms == 0);
+  forget("t1");
+  forget("l1");
+
+  /* Between two attributed failures a transient one neither counts nor
+   * resets: the second attributed failure isolates with isolate_after 2. */
+  clpd_orm_sync_set_isolate_after(syncer, 2);
+  sql("INSERT INTO shop_order (wf_id, line_no, status) VALUES ('q1', 1, "
+      "'poison')");
+  EXPECT(cycle("(assert (go (wf-id q1) (act fail)))", log, sizeof log) == 1);
+  NEXTVAL_LINE(missing, 100);
+  EXPECT(same("q1: first attributed failure", log, line));
+  begin_cycle();
+  transient_at = seen + 1;
+  EXPECT(end_cycle(log, sizeof log) == 1);
+  NEXTVAL_LINE(tr, 200);
+  EXPECT(same("q1: transient, not counted", log, line));
+  begin_cycle();
+  EXPECT(end_cycle(log, sizeof log) == 1);
+  NEXTVAL_LINE(missing, 400);
+  snprintf(want, sizeof want, "%s", line);
+  snprintf(reason, sizeof reason, "%s (2 rolled-back cycles in a row)",
+           missing);
+  isolated(want, sizeof want, "q1", reason);
+  not_reloaded(want, sizeof want, "q1");
+  EXPECT(same("q1: the second attributed failure isolates", log, want));
+  EXPECT(cycle(NULL, log, sizeof log) == 0);
+  EXPECT(same("q1: committed", log, ""));
+  forget("q1");
+  sql("DELETE FROM shop_order WHERE wf_id = 'q1'");
+  clpd_orm_sync_set_isolate_after(syncer, 3);
+
+  /* A sync write. */
+  act(SHOP, "(assert (order (wf-id t2) (line-no 1)))");
+  begin_cycle();
+  transient_at = seen + 1;
+  EXPECT(end_cycle(log, sizeof log) == 1);
+  refused(want, sizeof want, "shop@1::order: table 'shop_order'", tr);
+  EXPECT(same("transient sync write", log, want));
+  EXPECT(cycle(NULL, log, sizeof log) == 0);
+  EXPECT(same("transient sync write: the retry log", log, ""));
+  EXPECT(same("transient sync write: the retry writes t2", stmts,
+              expect_sql(INS_ORDER INSTANCE)));
+  query("SELECT wf_id, line_no FROM shop_order WHERE wf_id = 't2'", got,
+        sizeof got);
+  EXPECT(same("transient sync write: the row", got, "'t2' 1"));
+  forget("t2");
+
+  /* A reload SELECT. */
+  sql("INSERT INTO shop_order (wf_id, line_no, status) VALUES ('t3', 1, "
+      "'u')");
+  EXPECT(cycle("(progn (assert (go (wf-id t3) (act none))) "
+               "(assert (go (wf-id t9) (act fail))))",
+               log, sizeof log) == 1);
+  transient_at = 1;
+  rc = try_begin(log, sizeof log);
+  if (rc == 0) end_cycle(log, sizeof log);
+  EXPECT(rc == -1);
+  EXPECT(same("transient reload log", log,
+              "clpdaemon: rehydrate: instance 't3': shop@1::order: table "
+              "'shop_order': injected transient failure\n"
+              "clpdaemon: cycle transaction failed: injected transient "
+              "failure; retrying in 200 ms\n"));
+  EXPECT(tx.reconnect == 0);
+  EXPECT(clpd_db_in_transaction(db) == 0);
+  facts_of("t3", got, sizeof got);
+  EXPECT(same("transient reload: nothing loaded yet", got, ""));
+  begin_cycle();
+  EXPECT(end_cycle(log, sizeof log) == 0);
+  EXPECT(same("transient reload: the retry log", log, ""));
+  EXPECT(same("transient reload: reloaded on the retry", stmts,
+              expect_sql(RELOAD_SHOP RELOAD_SHOP)));
+  facts_of("t3", got, sizeof got);
+  EXPECT(same("transient reload: reloaded", got,
+              "order(wf-id \"t3\" line-no 1 status u amount nil note nil "
+              "paid 0 data \"\")"));
+  forget("t3");
+  forget("t9");
+  sql("DELETE FROM shop_order WHERE wf_id IN ('t2', 't3')");
+#undef NEXTVAL_LINE
+}
+
 /* An existing workflow_instance row keeps its definition, version, status
  * and created_at; only updated_at changes. */
 static void test_existing_instance(void) {
@@ -1546,6 +1698,7 @@ int main(int argc, char **argv) {
   test_failed_flush();
   test_rule_failure();
   test_poison_retry();
+  test_transient();
   test_load();
   test_rehydrate();
   test_rehydrate_ingest();

@@ -15,6 +15,12 @@
 # retry (db-nextval of a missing sequence, a duplicate db-insert) and the
 # other instance is written; the automatic synchronization against an
 # audit trigger on a table that is not owned.
+# T10f: another session holds a lock on a table a rule writes for longer
+# than instance_isolate_after failures (lock_timeout lowered through
+# options): transient failures, never an isolation, and the rows are
+# written once the lock is released; a rule statement whose connection is
+# lost (its backend terminated while it waits) with instance_isolate_after
+# = 1 isolates nothing either.
 set -u
 
 U='usage: cli_pg_test.sh <clpdaemon> <admin-client> <conninfo> <password>'
@@ -291,6 +297,120 @@ pg_a1 a1n "pg a1 nextval" '(db-nextval missing_no)' \
   'relation "public.pga1_missing_seq" does not exist (SQLSTATE 42P01)'
 pg_a1 a1i "pg a1 insert" '(db-insert memo wf-id ?w text "x")' \
   'duplicate key value violates unique constraint "pga1_memo_pkey" (SQLSTATE 23505)'
+
+# T10f: transient contention never isolates. Another session holds an
+# EXCLUSIVE lock on pgtf_memo (reads allowed, writes wait), so the rule's
+# db-insert fails after lock_timeout; the rolled-back cycle reloads w1,
+# whose stored poison row fires the rule again, and so on while the lock
+# is held (the rules modify w1 before their db-insert, so every
+# rolled-back cycle touched w1 and its retry reloads it). With
+# instance_isolate_after = 2 and lock_timeout = 100 ms the lock outlasts
+# several failures: none isolates w1 (55P03 is transient), and after the
+# release the rule's row and its modify are written.
+# With mode lost the lock is held while the daemon's backend waits and
+# that backend is terminated instead: a lost rule statement with
+# instance_isolate_after = 1 isolates nothing; after the reconnect the
+# retry waits for the lock (lock_timeout 5 s) and writes the rows.
+# pg_tf <tag> <name> <mode: timeout|lost>
+pg_tf() {
+  tf=$1 tfname=$2 tfmode=$3
+  mkdir "${tf}pkg"
+  printf '%s\n' 'definition = pgtf
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order' >"${tf}pkg"/package.conf
+  printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id) (slot text))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order) (db-create-table memo))
+(defrule fail (go (wf-id ?w) (act fail)) ?o <- (order (wf-id ?w)) => (modify ?o (status touched)) (db-insert memo wf-id ?w text "x"))
+(defrule poison ?o <- (order (wf-id ?w) (status poison)) => (modify ?o (status cured)) (db-insert memo wf-id ?w text "x"))' >"${tf}pkg"/a.clp
+  printf '%s\n' 'order.table = pgtf_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+memo.table = pgtf_memo
+memo.owned = yes
+memo.sync = manual
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.text = body text string nil' >"${tf}pkg"/orm.conf
+  if [ "$tfmode" = lost ]; then
+    tfdb=$CONNINFO tfafter=1 tfhold=4
+  else
+    tfdb="$CONNINFO options='-c lock_timeout=100'" tfafter=2 tfhold=2
+  fi
+  printf '%s\n' "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 100
+cycle_retry_max_ms = 100
+instance_isolate_after = $tfafter
+admin_socket = $WORK/admin.sock
+database = $tfdb
+packages = ${tf}pkg" >"$tf.conf"
+  q 'DROP TABLE IF EXISTS pgtf_order' >/dev/null
+  q 'DROP TABLE IF EXISTS pgtf_memo' >/dev/null
+  q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+  : >inject.txt
+  "$BIN" --config "$tf.conf" >out.txt 2>err.txt &
+  pid=$!
+  cases=$((cases + 1))
+  wait_q "SELECT count(*) FROM information_schema.tables WHERE table_name = 'pgtf_memo'" 1 ||
+    fail "$tfname: the tables" "stderr [$(cat err.txt)]"
+  "$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"status":{"sym":"new"}}}\n' >>inject.txt 2>&1
+  wait_q "SELECT status FROM pgtf_order WHERE wf_id = 'w1'" new ||
+    fail "$tfname: w1 written" "stderr [$(cat err.txt)]"
+  q "UPDATE pgtf_order SET status = 'poison' WHERE wf_id = 'w1'" >/dev/null
+  # The other session: the lock, held for tfhold seconds.
+  "$PSQL" -X -q -A -t -v ON_ERROR_STOP=1 -d "$CONNINFO application_name=clpd_holder" \
+    -c 'BEGIN' -c 'LOCK TABLE pgtf_memo IN EXCLUSIVE MODE' \
+    -c "SELECT pg_sleep($tfhold)" -c 'COMMIT' >holder.txt 2>&1 &
+  hpid=$!
+  wait_q "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation WHERE c.relname = 'pgtf_memo' AND l.mode = 'ExclusiveLock' AND l.granted" 1 ||
+    fail "$tfname: the lock is held" "holder [$(cat holder.txt)]"
+  "$ADMIN" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"fail"}}}\n' >>inject.txt 2>&1
+  if [ "$tfmode" = lost ]; then
+    # The daemon's backend waits for the lock: terminate it.
+    wait_q "SELECT count(*) FROM pg_stat_activity WHERE usename = 'clpd_test' AND application_name <> 'clpd_holder' AND wait_event_type = 'Lock'" 1 ||
+      fail "$tfname: the daemon waits for the lock" "stderr [$(cat err.txt)]"
+    qa "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = 'clpd_test' AND application_name <> 'clpd_holder' AND wait_event_type = 'Lock'" >/dev/null
+  fi
+  wait "$hpid"
+  hrc=$?
+  cases=$((cases + 1))
+  wait_q "SELECT status FROM pgtf_order WHERE wf_id = 'w1'" cured ||
+    fail "$tfname: w1 written after the release" "holder exit $hrc [$(cat holder.txt)], stderr [$(cat err.txt)]"
+  stop_daemon "$tfname"
+  if [ "$tfmode" = lost ]; then
+    tfmsg='connection to the database lost'
+    tfwant=1
+  else
+    tfmsg='canceling statement due to lock timeout (SQLSTATE 55P03)'
+    tfwant=$((tfafter + 1))
+  fi
+  fails=$(grep -c "^clpdaemon: cycle transaction failed: $tfmsg.*; retrying in 100 ms\$" err.txt)
+  # Every other line: running, the rule's failure lines, the stop line.
+  rest=$(grep -v -e "^clpdaemon: cycle transaction failed: $tfmsg.*; retrying in 100 ms\$" \
+    -e "^clpdaemon: db-insert: template 'memo': table 'pgtf_memo': $tfmsg" \
+    -e "^\[PRCCODE4\] Execution halted during the actions of defrule '\(fail\|poison\)'\.\$" err.txt)
+  cases=$((cases + 1))
+  [ "$hrc" = 0 ] && [ "$fails" -ge "$tfwant" ] &&
+    [ "$rest" = "clpdaemon: n1: running${NL}clpdaemon: received SIGTERM, stopping" ] &&
+    ! grep -q 'is no longer synchronized\|is not reloaded' err.txt &&
+    [ "$(cat inject.txt)" = "OK queued${NL}OK queued" ] && [ ! -s out.txt ] ||
+    fail "$tfname: no isolation" "holder exit $hrc, failures $fails (want >= $tfwant), inject [$(cat inject.txt)], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  cases=$((cases + 1))
+  got=$(q "SELECT wf_id || '|' || status FROM pgtf_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM pgtf_memo")
+  [ "$got" = "w1|cured${NL}w1|x" ] || fail "$tfname: the stored rows" "got [$got]"
+  q 'DROP TABLE IF EXISTS pgtf_order' >/dev/null
+  q 'DROP TABLE IF EXISTS pgtf_memo' >/dev/null
+  q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+}
+pg_tf tft "pg t10f lock timeout" timeout
+pg_tf tfl "pg t10f lost rule statement" lost
 
 # T10b against an audit trigger on a table that is not owned, created
 # beforehand: one U for two modifies, nothing for a modify back to the

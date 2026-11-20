@@ -15,6 +15,7 @@ void clpd_orm_tx_init(clpd_orm_tx *tx, clpd_db *db, const char *spec,
   tx->max_ms = max_ms;
   tx->retry_ms = 0;
   tx->reconnect = 0;
+  tx->failure = CLPD_DB_OK;
 }
 
 int clpd_orm_tx_next_delay(int prev, int initial_ms, int max_ms) {
@@ -27,6 +28,7 @@ int clpd_orm_tx_next_delay(int prev, int initial_ms, int max_ms) {
 static int failed(clpd_orm_tx *tx, FILE *log, clpd_db_status st,
                   const char *message) {
   if (st == CLPD_DB_LOST) tx->reconnect = 1;
+  tx->failure = st;
   tx->retry_ms = clpd_orm_tx_next_delay(tx->retry_ms, tx->initial_ms,
                                         tx->max_ms);
   fprintf(log, "clpdaemon: cycle transaction failed: %s; retrying in %d ms\n",
@@ -78,6 +80,7 @@ int clpd_orm_tx_end(clpd_orm_tx *tx, FILE *log) {
   st = clpd_db_commit(tx->db);
   if (st != CLPD_DB_OK) return failed(tx, log, st, clpd_db_error(tx->db));
   tx->retry_ms = 0;
+  tx->failure = CLPD_DB_OK;
   return 0;
 }
 

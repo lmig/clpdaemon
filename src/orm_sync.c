@@ -25,10 +25,13 @@
  * instance of each firing rule (the wf-id of its first basis fact that
  * has one, as the trace's rule wf-id); the rule during whose actions the
  * cycle transaction got its first failure is the one the rolled-back
- * cycle is attributed to (not when that failure lost the connection).
- * Each instance counts its attributed rolled-back cycles until a commit;
- * at instance_isolate_after it is isolated and evicted like the instance
- * of a failed write. */
+ * cycle is attributed to (not when that failure lost the connection or was
+ * transient contention, T10f: retryable() failures are the server's or
+ * another writer's, not the instance's). Each instance counts its
+ * attributed rolled-back cycles until a commit; at instance_isolate_after
+ * it is isolated and evicted like the instance of a failed write. A
+ * retryable failure neither counts nor resets, and never isolates through
+ * a write or a reload either. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "orm_sync.h"
@@ -126,6 +129,13 @@ static void *xrealloc(void *p, size_t n) {
 }
 
 static char *xstrdup(const char *s);
+
+/* 1 for a failure that says nothing about the instance (T10f): a lost
+ * connection or transient contention (src/db.h). Such a failure never
+ * isolates, never counts toward instance_isolate_after, and is retried. */
+static int retryable(clpd_db_status st) {
+  return st == CLPD_DB_LOST || st == CLPD_DB_TRANSIENT;
+}
 
 /* --- instances ---------------------------------------------------------- */
 
@@ -741,7 +751,7 @@ static int run(flush_ctx *fc, const row *r, int64_t *affected) {
                                    affected != NULL ? &res : NULL);
   if (st != CLPD_DB_OK) {
     report(fc, r, clpd_db_error(fc->s->db));
-    if (st != CLPD_DB_LOST) mark(fc, r);
+    if (!retryable(st)) mark(fc, r);
     return F_DB;
   }
   if (affected != NULL) *affected = clpd_db_result_affected(res);
@@ -1127,16 +1137,17 @@ static void isolate_instance(clpd_orm_syncer *s, const char *wf,
 
 /* After a rolled-back cycle: the instance whose write failed for good, if
  * any, is isolated; so is the instance the cycle is attributed to (a
- * rule's statement failed first, the connection was not lost: lost 0)
- * once it reaches isolate_after attributed cycles since the last commit
- * (T10e). Then every instance the cycle touched, and those, is evicted
- * (T10c): its facts retracted (mapped or not) and its recorded changes
- * dropped; an isolated one is not reloaded (logged), the others wait in
- * pending, with the packages whose templates carried them, for the next
- * cycle's start. */
-static void rolled_back(clpd_orm_syncer *s, const char *why, int lost,
+ * rule's statement failed first, and that failure was not retryable:
+ * uncounted 0) once it reaches isolate_after attributed cycles since the
+ * last commit (T10e, T10f). Then every instance the cycle touched, and
+ * those, is evicted (T10c): its facts retracted (mapped or not) and its
+ * recorded changes dropped; an isolated one is not reloaded (logged), the
+ * others wait in pending, with the packages whose templates carried them,
+ * for the next cycle's start. */
+static void rolled_back(clpd_orm_syncer *s, const char *why, int uncounted,
                         FILE *log) {
-  char shown_wf[SHOWN_MAX + 1], **wfs, reason[1200];
+  /* The suffix always fits: the message is cut, never the suffix (T10f). */
+  char shown_wf[SHOWN_MAX + 1], **wfs, reason[1200], suffix[64];
   wfset ev = {NULL, 0, 0}, pk = {NULL, 0, 0};
   size_t i, n = 0;
   if (s == NULL) return;
@@ -1149,11 +1160,14 @@ static void rolled_back(clpd_orm_syncer *s, const char *why, int lost,
     isolate_instance(s, s->failed, why, log);
     s->failed[0] = '\0';
   }
-  if (s->blamed != NULL && !lost && !is_isolated(s, s->blamed)) {
+  if (s->blamed != NULL && !uncounted && !is_isolated(s, s->blamed)) {
     int count = strike_add(s, s->blamed);
     if (count >= s->isolate_after) {
-      snprintf(reason, sizeof reason, "%s (%d rolled-back cycle%s in a row)",
-               why, count, count == 1 ? "" : "s");
+      int room;
+      snprintf(suffix, sizeof suffix, " (%d rolled-back cycle%s in a row)",
+               count, count == 1 ? "" : "s");
+      room = (int)(sizeof reason - 1 - strlen(suffix));
+      snprintf(reason, sizeof reason, "%.*s%s", room, why, suffix);
       wfset_add(&ev, s->blamed, NULL);
       isolate_instance(s, s->blamed, reason, log);
     }
@@ -1199,10 +1213,11 @@ static void rolled_back(clpd_orm_syncer *s, const char *why, int lost,
 /* Reloads the pending instances, in order, outside the cycle transaction
  * (autocommit): their facts retracted first, then every mapped template of
  * each package that carried them (src/orm_load.h). A SELECT that fails
- * with a lost connection ends the attempt (that instance and the rest stay
- * pending, nothing of it loaded); any other failure isolates the instance
- * (its partial load retracted) and the next one goes on. Returns 0, or -1
- * after the cycle transaction line (clpd_orm_tx_fail). */
+ * with a lost connection or transient contention (retryable, T10f) ends
+ * the attempt (that instance and the rest stay pending, nothing of it
+ * loaded; the next attempt reloads it); any other failure isolates the
+ * instance (its partial load retracted) and the next one goes on. Returns
+ * 0, or -1 after the cycle transaction line (clpd_orm_tx_fail). */
 static int rehydrate(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
   char schema[CLPD_ORM_TX_SCHEMA_SIZE + 2] = "", msg[1024],
        shown_wf[SHOWN_MAX + 1], **wfs;
@@ -1249,7 +1264,7 @@ static int rehydrate(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
               shown(wf, shown_wf), pkg->manifest.name, t->name, t->table, msg);
       fflush(log);
       retract_instances(s, &wf, 1, NULL);
-      if (st == CLPD_DB_LOST) {
+      if (retryable(st)) {
         free(done);
         return clpd_orm_tx_fail(tx, log, st, msg);
       }
@@ -1291,9 +1306,10 @@ int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
   rc = clpd_orm_tx_end(tx, log);
   if (rc != 0) {
     snprintf(why, sizeof why, "%s", clpd_db_error(tx->db));
-    /* The first failure's status is the commit's: a lost connection set
-     * the reconnect (src/orm_tx.h) and is attributed to nobody. */
-    rolled_back(s, why, tx->reconnect, log);
+    /* The first failure's status is the commit's (tx->failure): a lost
+     * connection (it set the reconnect, src/orm_tx.h) or transient
+     * contention is counted for nobody (T10f). */
+    rolled_back(s, why, retryable(tx->failure), log);
   } else if (s != NULL) {
     clpd_orm_sync_clear(s);
     wfset_clear(&s->touched);
