@@ -503,7 +503,10 @@ cx_lock_case() {
   cx_start "$2" 100
   cx_seed "$2" "$1"
   q "UPDATE pgcx_order SET status = 'poison' WHERE wf_id = '$1'" >/dev/null
-  cx_hold "$2" pgcx_order "$3" 1.5 "$4"
+  # A lock that was not granted already failed "the lock"; the verdict
+  # below would only repeat it as a wrong one, so it is skipped.
+  locked=1
+  cx_hold "$2" pgcx_order "$3" 1.5 "$4" || locked=0
   cx_inject "{\"template\":\"go\",\"slots\":{\"wf-id\":{\"sym\":\"$1\"},\"act\":{\"sym\":\"touch\"}}}"
   wait "$hpid"
   hrc=$?
@@ -516,9 +519,11 @@ cx_lock_case() {
   reloads=$(grep -c "^clpdaemon: rehydrate: instance '$1': pgcx@1::order: table 'pgcx_order': $CXLT\$" err.txt)
   if [ "$1" = b1 ]; then want_reloads=2; else want_reloads=0; fi
   cases=$((cases + 1))
-  [ "$hrc" = 0 ] && [ "$held" = 0 ] && [ "$fails" -ge 3 ] && [ "$reloads" -ge "$want_reloads" ] &&
-    [ "$(grep -c "$CXISO" err.txt)" = 0 ] && ! grep -q 'is not reloaded' err.txt ||
-    fail "$2: no isolation" "holder exit $hrc, isolations while held $held, failures $fails (want >= 3), reload failures $reloads (want >= $want_reloads), stderr [$(cat err.txt)]"
+  if [ "$locked" = 1 ]; then
+    [ "$hrc" = 0 ] && [ "$held" = 0 ] && [ "$fails" -ge 3 ] && [ "$reloads" -ge "$want_reloads" ] &&
+      [ "$(grep -c "$CXISO" err.txt)" = 0 ] && ! grep -q 'is not reloaded' err.txt ||
+      fail "$2: no isolation" "holder exit $hrc, isolations while held $held, failures $fails (want >= 3), reload failures $reloads (want >= $want_reloads), stderr [$(cat err.txt)]"
+  fi
   cases=$((cases + 1))
   got=$(q "SELECT wf_id || '|' || status FROM pgcx_order ORDER BY wf_id; SELECT count(*) FROM pgcx_memo")
   [ "$got" = "$1|cured${NL}0" ] || fail "$2: the stored rows" "got [$got]"
@@ -542,8 +547,14 @@ cx_inject '{"template":"go","slots":{"wf-id":{"sym":"d1"},"act":{"sym":"dup"}}}'
 cases=$((cases + 1))
 wait_has err.txt "clpdaemon: cycle transaction failed: $CXDUP; retrying in 1000 ms" ||
   fail "$D: the first UNIQUE" "stderr [$(cat err.txt)]"
-if cx_hold "$D" pgcx_memo EXCLUSIVE 3 ExclusiveLock &&
-  [ "$(grep -c '^clpdaemon: cycle transaction failed: ' err.txt)" != 1 ]; then
+# A lock not granted or taken too late already failed "the lock"; the
+# order check below would only repeat it as a wrong verdict, so it is
+# skipped (like case SD).
+locked=1
+if ! cx_hold "$D" pgcx_memo EXCLUSIVE 3 ExclusiveLock; then
+  locked=0
+elif [ "$(grep -c '^clpdaemon: cycle transaction failed: ' err.txt)" != 1 ]; then
+  locked=0
   fail "$D: the lock" "not taken before the first retry, stderr [$(cat err.txt)]"
 fi
 wait "$hpid"
@@ -559,9 +570,11 @@ t=$(grep -c "^clpdaemon: cycle transaction failed: $CXLT; retrying in 1000 ms\$"
 seq=$(grep -e '^clpdaemon: cycle transaction failed: ' -e "$CXISO" err.txt |
   sed -e "s/.*$CXLT.*/T/" -e 's/.*(SQLSTATE 23505); retrying.*/U/' -e "s/^clpdaemon: sync: instance .*/I/" | uniq | tr -d '\n')
 cases=$((cases + 1))
-[ "$hrc" = 0 ] && [ "$held" = 0 ] && [ "$u" = 2 ] && [ "$t" -ge 2 ] && [ "$seq" = UTUI ] &&
-  [ "$(grep -c "$CXISO" err.txt)" = 1 ] && grep -qxF "$CXDISO" err.txt ||
-  fail "$D: isolated after the second UNIQUE only" "holder exit $hrc, isolations while held $held, unique $u (want 2), lock timeouts $t (want >= 2), order [$seq] (want UTUI), stderr [$(cat err.txt)]"
+if [ "$locked" = 1 ]; then
+  [ "$hrc" = 0 ] && [ "$held" = 0 ] && [ "$u" = 2 ] && [ "$t" -ge 2 ] && [ "$seq" = UTUI ] &&
+    [ "$(grep -c "$CXISO" err.txt)" = 1 ] && grep -qxF "$CXDISO" err.txt ||
+    fail "$D: isolated after the second UNIQUE only" "holder exit $hrc, isolations while held $held, unique $u (want 2), lock timeouts $t (want >= 2), order [$seq] (want UTUI), stderr [$(cat err.txt)]"
+fi
 cases=$((cases + 1))
 got=$(q "SELECT wf_id || '|' || status FROM pgcx_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM pgcx_memo")
 [ "$got" = "d1|dup${NL}d2|new${NL}d1|x" ] || fail "$D: the stored rows" "got [$got]"
