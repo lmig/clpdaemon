@@ -191,7 +191,7 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_db *db = NULL;
   clpd_orm_syncer *sync = NULL;
   /* Context of the ORM DDL functions: lives as long as the environment. */
-  clpd_orm_ddl ddl = {NULL, &packages, cfg->orm_allow_drop};
+  clpd_orm_ddl ddl = {NULL, &packages, cfg->orm_allow_drop, NULL};
   clpd_engine *engine;
   clpd_trace *trace;
   int rc;
@@ -266,6 +266,9 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     rc = 1;
   } else {
     clpd_fdcapture *cap = NULL;
+    /* The DML functions suspend it while loading and note the instances
+     * they write (T10d); no rule has run yet. */
+    ddl.sync = sync;
     if (clpd_trace_active(trace) &&
         (cap = clpd_fdcapture_start(trace, clpd_log())) == NULL) {
       rc = 1;
@@ -293,6 +296,7 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_admin_close(admin);
   clpd_clips_trace_detach(ct);
   clpd_orm_sync_detach(sync); /* before the packages it points into */
+  ddl.sync = NULL;
   clpd_packages_free(&packages);
   clpd_engine_destroy(engine);
   clpd_db_close(db); /* NULL when no database is configured */

@@ -7,19 +7,23 @@
  * inside the cycle transaction when a rule calls them (T10a; after a
  * failed statement there, the rest of the cycle's statements are refused,
  * so db-nextval's lookup reports the database's message), in autocommit
- * otherwise. */
+ * otherwise. The DML functions (src/orm_dml.c, T10d) share the caller
+ * scope and the messages through clpd_orm_ddl_resolve_template and
+ * clpd_orm_ddl_fail. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "orm_ddl.h"
 
 #include "log.h"
+#include "orm_dml.h"
 
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
-#define NAME_SHOWN 200 /* bytes of a template argument shown in messages */
+#define NAME_SHOWN (CLPD_ORM_DDL_NAME_SIZE - 1) /* bytes of an argument
+                                                * shown in messages */
 
 typedef struct {
   char *s;
@@ -701,5 +705,32 @@ int clpd_orm_ddl_register(Environment *env, clpd_orm_ddl *ddl) {
       AddUDF(env, "db-nextval", "bl", 1, 1, "sy", next_value,
              "clpd_orm_nextval", ddl) != AUE_NO_ERROR)
     return -1;
-  return 0;
+  return clpd_orm_dml_register(env, ddl);
+}
+
+int clpd_orm_ddl_resolve_template(UDFContext *ctx, UDFValue *ret,
+                                  const clpd_package **pkg,
+                                  const clpd_orm_template **t,
+                                  char name[CLPD_ORM_DDL_NAME_SIZE]) {
+  target tg;
+  if (!resolve_own(ctx, ret, NAMES_TEMPLATE, &tg)) return 0;
+  *pkg = tg.pkg;
+  *t = tg.t;
+  memcpy(name, tg.name, sizeof tg.name);
+  return 1;
+}
+
+void clpd_orm_ddl_fail(UDFContext *ctx, UDFValue *ret, const char *name,
+                       const clpd_orm_template *t, const char *fmt, ...) {
+  target tg;
+  va_list ap;
+  memset(&tg, 0, sizeof tg);
+  if (t != NULL) {
+    tg.kind = NAMES_TEMPLATE;
+    tg.t = t;
+    snprintf(tg.name, sizeof tg.name, "%s", name);
+  }
+  va_start(ap, fmt);
+  vfail(ctx, ret, t != NULL ? &tg : NULL, fmt, ap);
+  va_end(ap);
 }

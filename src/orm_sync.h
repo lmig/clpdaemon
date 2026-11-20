@@ -57,6 +57,29 @@ void clpd_orm_sync_suspend(clpd_orm_syncer *s);
 void clpd_orm_sync_resume(clpd_orm_syncer *s);
 int clpd_orm_sync_suspended(const clpd_orm_syncer *s);
 
+/* The DML functions (T10d, src/orm_dml.h) wrote rows of instance wf (the
+ * text of its wf-id value) of a template of pkg: while a cycle is open the
+ * instance counts as touched, so a rollback evicts and reloads it like an
+ * instance whose facts changed. NULL is accepted. */
+void clpd_orm_sync_touch(clpd_orm_syncer *s, const char *wf,
+                         const clpd_package *pkg);
+
+/* The parameter for the value v in column c, by the write rules of the
+ * synchronization (docs/orm.md#write-rules; the DML functions use them
+ * too): the symbol nil in a null nil column is NULL; otherwise v must have
+ * the column's CLIPS type (a string and a symbol for either lexeme type),
+ * a boolean column takes 0 or 1. TEXT and BLOB parameters point into v's
+ * lexeme. Returns 0, or -1 with the reason in why:
+ *   slot '<slot>' (column '<column>'): expected <clips-type>, got <TYPE>
+ *   slot '<slot>' (column '<column>'): a boolean column takes 0 or 1 */
+int clpd_orm_sync_param(const CLIPSValue *v, const clpd_orm_column *c,
+                        clpd_db_value *out, char *why, size_t n);
+
+/* The name messages give a CLIPS type code (INTEGER, FLOAT, SYMBOL,
+ * STRING, INSTANCE-NAME, FACT-ADDRESS, INSTANCE-ADDRESS, EXTERNAL-ADDRESS,
+ * MULTIFIELD, VOID). */
+const char *clpd_orm_sync_type_name(unsigned short type);
+
 /* Forgets every recorded change (they will not be written). NULL is
  * accepted. */
 void clpd_orm_sync_clear(clpd_orm_syncer *s);

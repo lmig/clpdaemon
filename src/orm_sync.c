@@ -940,6 +940,39 @@ int clpd_orm_sync_suspended(const clpd_orm_syncer *s) {
   return s != NULL && s->suspended > 0;
 }
 
+void clpd_orm_sync_touch(clpd_orm_syncer *s, const char *wf,
+                         const clpd_package *pkg) {
+  if (s != NULL && s->cycle_open) wfset_add(&s->touched, wf, pkg);
+}
+
+int clpd_orm_sync_param(const CLIPSValue *v, const clpd_orm_column *c,
+                        clpd_db_value *out, char *why, size_t n) {
+  sval sv;
+  memset(&sv, 0, sizeof sv);
+  sv.type = v->header->type;
+  switch (sv.type) {
+  case INTEGER_TYPE:
+    sv.i = v->integerValue->contents;
+    break;
+  case FLOAT_TYPE:
+    sv.f = v->floatValue->contents;
+    break;
+  case SYMBOL_TYPE:
+  case STRING_TYPE:
+  case INSTANCE_NAME_TYPE:
+    /* Not copied: the parameter points into the lexeme. */
+    sv.s = (char *)v->lexemeValue->contents;
+    break;
+  default:
+    break;
+  }
+  return to_param(&sv, c, out, why, n);
+}
+
+const char *clpd_orm_sync_type_name(unsigned short type) {
+  return type_name(type);
+}
+
 /* Drops the recorded changes of instance wf. */
 static void drop_instance(clpd_orm_syncer *s, const char *wf) {
   size_t i;

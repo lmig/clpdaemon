@@ -2025,5 +2025,57 @@ if command -v sqlite3 >/dev/null 2>&1; then
   [ "$got" = 'w1|new' ] || fail "rehydrate: the stored row is unchanged" "got [$got]"
 fi
 
+# --- DML functions (T10d, docs/orm.md#dml-functions) -------------------------
+# A rule of a running daemon writes, counts and loads the rows of its
+# sync = manual template inside the cycle, which commits; a write to a
+# sync = auto template is one log line and halts the rule.
+mkdir dmlpkg
+conf dmlpkg/package.conf 'definition = dml
+version = 1
+files = d.clp
+orm = orm.conf'
+conf dmlpkg/d.clp '(deftemplate go (slot wf-id))
+(deftemplate memo (slot wf-id) (slot n (type INTEGER)) (slot text))
+(deftemplate order (slot wf-id))
+(defrule r (go (wf-id ?w)) =>
+  (db-create-table memo)
+  (printout t "insert " (db-insert memo wf-id ?w n 1 text "hi") crlf)
+  (printout t "update " (db-update memo (create$ wf-id ?w n 1) text "ho") crlf)
+  (printout t "count " (db-count memo (create$ wf-id ?w)) crlf)
+  (printout t "load " (db-load memo (create$ wf-id ?w)) " facts " (length$ (find-all-facts ((?m memo)) TRUE)) crlf)
+  (printout t "delete " (db-delete memo (create$ wf-id ?w n 2)) crlf)
+  (db-insert order wf-id ?w)
+  (printout t "not reached" crlf))
+(deffacts seed (go (wf-id w1)))'
+conf dmlpkg/orm.conf 'memo.table = dml_memo
+memo.owned = yes
+memo.sync = manual
+memo.key = n
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.n = n bigint integer error
+memo.slot.text = body text string nil
+order.table = dml_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error'
+rconf dml.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/dml.db
+packages = dmlpkg"
+ddlrun "orm dml: a rule writes, counts and loads its rows" dml.conf 'insert TRUE
+update 1
+count 1
+load 1 facts 1
+delete 0' "clpdaemon: n1: running
+clpdaemon: db-insert: template 'order': table 'dml_order' has sync = auto: only the automatic synchronization writes it
+[PRCCODE4] Execution halted during the actions of defrule 'r'."
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 dml.db "SELECT wf_id || '|' || n || '|' || body FROM dml_memo; SELECT count(*) FROM workflow_instance" 2>&1)
+  want='w1|1|ho
+0'
+  [ "$got" = "$want" ] || fail "orm dml: the committed row" "got [$got], want [$want]"
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]
