@@ -1,14 +1,15 @@
 #!/bin/sh
 # Runs a PostgreSQL backend test (T8c) against a throwaway cluster.
-# usage: pg_cluster.sh <test-binary>
+# usage: pg_cluster.sh <test-binary> [<arg>...]
 #
 # The cluster lives in a private temporary directory: initdb + pg_ctl, a
 # Unix socket in that directory only (listen_addresses=''), scram-sha-256
 # password authentication for local connections. A role with a password
-# gets a 0600 password file exported as PGPASSFILE, and the binary runs as
-#   <test-binary> "host=<dir> port=<port> dbname=clpd_test user=clpd_test" \
-#     <password>
-# (the conninfo has no password). The cluster is stopped and the directory
+# gets a 0600 password file exported as PGPASSFILE (it also holds the
+# password of the superuser clpd_admin), and the binary runs as
+#   <test-binary> [<arg>...] \
+#     "host=<dir> port=<port> dbname=clpd_test user=clpd_test" <password>
+# (the conninfo has no password; a script runs as /bin/sh <script> ...). The cluster is stopped and the directory
 # removed on every exit path.
 #
 # The PostgreSQL programs come from CLPD_PG_BINDIR when it is set, from
@@ -16,8 +17,9 @@
 # 77 (ctest SKIP_RETURN_CODE: the test is reported SKIPPED).
 set -u
 
-U='usage: pg_cluster.sh <test-binary>'
+U='usage: pg_cluster.sh <test-binary> [<arg>...]'
 BIN=${1:?$U}
+shift
 case $BIN in /*) ;; *) BIN=$PWD/$BIN ;; esac
 
 find_tool() {
@@ -116,7 +118,7 @@ EOF
   fail "cannot create the test role and database"
 }
 
-"$BIN" "host=$WORK port=$PORT dbname=clpd_test user=clpd_test" "$TEST_PW"
+"$BIN" "$@" "host=$WORK port=$PORT dbname=clpd_test user=clpd_test" "$TEST_PW"
 rc=$?
 if [ "$rc" != 0 ] && [ -s "$WORK/server.log" ]; then
   echo "--- server log (tail) ---" >&2

@@ -1,5 +1,8 @@
 /* clpdaemon entry point: command line, configuration (T2), plugins (T6),
- * the database (T8d) and the event loop running engine cycles (T3). */
+ * the database (T8d) and the event loop running engine cycles (T3) inside
+ * the cycle transaction (T10a), which ends with the automatic
+ * synchronization of the mapped facts (T10b); a rolled-back cycle's
+ * instances are rehydrated when the next one starts (T10c). */
 #include "admin.h"
 #include "clips_trace.h"
 #include "config.h"
@@ -10,6 +13,8 @@
 #include "log.h"
 #include "loop.h"
 #include "orm_ddl.h"
+#include "orm_sync.h"
+#include "orm_tx.h"
 #include "packages.h"
 #include "plugins.h"
 #include "trace.h"
@@ -37,31 +42,51 @@ typedef struct {
   clpd_plugins *plugins;
   clpd_clips_trace *ct;
   clpd_admin *admin;
+  clpd_loop *loop;
+  clpd_orm_tx tx; /* the cycle transaction; no database: does nothing */
+  clpd_orm_syncer *sync; /* NULL without a database */
   int max_rules;
   unsigned long cycles; /* run so far (admin `status`) */
 } cycle_ctx;
 
-/* One cycle: assert the facts queued so far (docs/ingest.md; a rejected one
- * is logged under the plugin or admin socket that posted it), the plugins'
- * cycle_begin,
- * focus every package module, Run with
- * the rule limit, the plugins' cycle_end, then write the partial output
- * lines the cycle left. Run stops on an evaluation error and leaves
- * HaltExecution set (it clears the error flags when the next Run starts),
- * so the cycle is not ok exactly when HaltExecution is set after Run; a halt
- * on a stop signal (HaltRules) is not an error. That halt is left to the
- * loop, which reads the signal next. */
+/* One cycle, with a database inside the cycle transaction (T10a,
+ * docs/database.md#cycle-transaction): reload the instances a rolled-back
+ * cycle evicted, then begin (src/orm_sync.h, T10c), assert the facts queued so
+ * far (docs/ingest.md; a rejected one is logged under the plugin or admin
+ * socket that posted it), the plugins' cycle_begin, focus every package
+ * module, Run with the rule limit, write the changes of the mapped facts
+ * and commit (src/orm_sync.h), the plugins' cycle_end, then write the
+ * partial output lines the cycle left. Run stops on an
+ * evaluation error and leaves HaltExecution set (it clears the error flags
+ * when the next Run starts), so the cycle is not ok when HaltExecution is
+ * set after Run or when the cycle transaction was rolled back; a halt on a
+ * stop signal (HaltRules), or a rule's (halt), is not an error and
+ * commits. That halt is left to the loop, which reads the signal next.
+ * When the reload loses the connection or the begin fails nothing else
+ * runs (the queued facts wait) but the
+ * admin listener is resumed, as after every cycle (a failed reconnect may
+ * have freed the descriptor it waited for); when the begin or the commit
+ * fails, the loop runs the next cycle after the backoff (clpd_loop_defer),
+ * serving signals and the admin socket meanwhile. */
 static void run_cycle(void *ctx) {
   cycle_ctx *c = ctx;
   Environment *env = clpd_engine_env(c->engine);
+  int committed;
+  if (clpd_orm_sync_begin_cycle(c->sync, &c->tx, clpd_log()) != 0) {
+    clpd_admin_resume(c->admin);
+    clpd_loop_defer(c->loop, c->tx.retry_ms);
+    return;
+  }
   clpd_ingest_drain(env, c->packages, clpd_admin_post_rejected, c->plugins);
   clpd_plugins_cycle_begin(c->plugins);
   clpd_packages_focus(env, c->packages);
   clpd_engine_run_cycle(c->engine, c->max_rules);
-  clpd_plugins_cycle_end(c->plugins, !GetHaltExecution(env));
+  committed = clpd_orm_sync_end_cycle(c->sync, &c->tx, clpd_log()) == 0;
+  clpd_plugins_cycle_end(c->plugins, committed && !GetHaltExecution(env));
   clpd_clips_trace_flush(c->ct);
   clpd_admin_resume(c->admin);
   c->cycles++;
+  if (!committed) clpd_loop_defer(c->loop, c->tx.retry_ms);
 }
 
 static void reopen_trace(void *ctx) { clpd_trace_reopen(ctx, clpd_log()); }
@@ -73,7 +98,8 @@ static void wake_loop(void *loop) { clpd_loop_notify(loop); }
  * exit code. */
 static int serve(const clpd_config *cfg, clpd_engine *engine,
                  const clpd_packages *packages, clpd_plugins *plugins,
-                 clpd_trace *trace, clpd_clips_trace *ct, clpd_admin *admin) {
+                 clpd_trace *trace, clpd_clips_trace *ct, clpd_admin *admin,
+                 clpd_db *db, clpd_orm_syncer *sync) {
   FILE *log = clpd_log();
   cycle_ctx ctx;
   clpd_admin_state as;
@@ -107,6 +133,10 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   ctx.plugins = plugins;
   ctx.ct = ct;
   ctx.admin = admin;
+  ctx.loop = loop;
+  clpd_orm_tx_init(&ctx.tx, db, cfg->database, cfg->cycle_retry_initial_ms,
+                   cfg->cycle_retry_max_ms);
+  ctx.sync = sync;
   ctx.max_rules = cfg->max_rules_per_cycle;
   fprintf(log, "clpdaemon: %s: running\n", cfg->node_id);
   sig = clpd_loop_run(loop, run_cycle, &ctx);
@@ -121,12 +151,30 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   return sig < 0 ? 1 : 0;
 }
 
+/* The workflow_instance table (T10a), when a database is configured and a
+ * package has an ORM mapping; never under --check, which writes nothing.
+ * Returns 0, or -1 after logging the failure. */
+static int create_instance_table(clpd_db *db, const clpd_packages *p) {
+  char msg[512];
+  size_t i;
+  for (i = 0; i < p->count && p->items[i].orm == NULL; i++) {
+  }
+  if (db == NULL || i == p->count) return 0;
+  if (clpd_orm_tx_create_instance_table(db, msg, sizeof msg) == 0) return 0;
+  fprintf(clpd_log(),
+          "clpdaemon: cannot create the workflow_instance table: %s\n", msg);
+  return -1;
+}
+
 /* Startup after the configuration (FR-2): trace files, environment, the
  * database when one is configured (docs/database.md) with the ORM DDL
  * functions (docs/orm.md), plugins (load and init), rule packages, then either the --check report or
- * the admin socket (FR-20, unless admin_socket = none), the trace hooks, the plugins' after_load, Reset
- * once and the event loop; the socket file is removed on every path after
- * it was created.
+ * the workflow_instance table (T10a) and the synchronization hooks (T10b),
+ * the admin socket (FR-20, unless admin_socket = none), the trace hooks,
+ * the plugins' after_load, Reset once and the event loop; the socket file
+ * is removed on every path after it was created. The synchronization hooks
+ * come before after_load and Reset, so the facts asserted there (deffacts
+ * included) are changes the first cycle writes.
  * --check opens the trace files too, so it reports paths the daemon could
  * not write. The trace hooks come after loading, so package load
  * diagnostics keep going to stderr, and before Reset, so the facts Reset
@@ -141,8 +189,9 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_clips_trace *ct = NULL;
   clpd_admin *admin = NULL;
   clpd_db *db = NULL;
+  clpd_orm_syncer *sync = NULL;
   /* Context of the ORM DDL functions: lives as long as the environment. */
-  clpd_orm_ddl ddl = {NULL, &packages, cfg->orm_allow_drop};
+  clpd_orm_ddl ddl = {NULL, &packages, cfg->orm_allow_drop, NULL};
   clpd_engine *engine;
   clpd_trace *trace;
   int rc;
@@ -196,6 +245,14 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     rc = 1;
   } else if (check) {
     printf("clpdaemon: %s: configuration OK\n", config_path);
+  } else if (create_instance_table(db, &packages) != 0) {
+    rc = 1;
+  } else if (db != NULL && clpd_orm_sync_attach(clpd_engine_env(engine), db,
+                                                &packages, &sync) != 0) {
+    fputs("clpdaemon: cannot attach the ORM synchronization to the CLIPS "
+          "environment\n",
+          clpd_log());
+    rc = 1;
   } else if (cfg->admin_socket != NULL &&
              (admin = clpd_admin_bind(cfg->admin_socket,
                                       cfg->admin_socket_mode,
@@ -209,13 +266,18 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     rc = 1;
   } else {
     clpd_fdcapture *cap = NULL;
+    /* The DML functions suspend it while loading and note the instances
+     * they write (T10d); no rule has run yet. */
+    ddl.sync = sync;
+    /* The poison retry (T10e, docs/database.md#cycle-transaction). */
+    clpd_orm_sync_set_isolate_after(sync, cfg->instance_isolate_after);
     if (clpd_trace_active(trace) &&
         (cap = clpd_fdcapture_start(trace, clpd_log())) == NULL) {
       rc = 1;
     } else {
       clpd_plugins_after_load(plugins);
       Reset(clpd_engine_env(engine));
-      rc = serve(cfg, engine, &packages, plugins, trace, ct, admin);
+      rc = serve(cfg, engine, &packages, plugins, trace, ct, admin, db, sync);
       /* Shut down before the capture stops, so what the plugins print in
        * shutdown still reaches the trace; the call after this block is
        * then a no-op (it covers the paths that never got here). */
@@ -235,6 +297,8 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   }
   clpd_admin_close(admin);
   clpd_clips_trace_detach(ct);
+  clpd_orm_sync_detach(sync); /* before the packages it points into */
+  ddl.sync = NULL;
   clpd_packages_free(&packages);
   clpd_engine_destroy(engine);
   clpd_db_close(db); /* NULL when no database is configured */

@@ -309,6 +309,97 @@ static void test_transactions(const char *spec) {
   clpd_db_close(other);
 }
 
+#define ROLLED_BACK "the transaction was rolled back after an earlier error"
+
+/* All-or-nothing transactions (T10a): the first failing statement rolls
+ * everything back at once on both backends (SQLite included), later
+ * statements run nothing, commit returns the first failure. */
+static void test_atomic(const char *spec) {
+  clpd_db *other = NULL;
+  char msg[512], first[512];
+  const char *ins = "INSERT INTO clpd_suite_atomic (id) VALUES ($1)";
+  clpd_db_status st;
+
+  CHECK(run(db, "CREATE TABLE clpd_suite_atomic (id BIGINT PRIMARY KEY)") ==
+        CLPD_DB_OK);
+  CHECK(clpd_db_open(spec, &other, msg, sizeof msg) == CLPD_DB_OK);
+
+  /* A unique violation after a good insert: nothing is kept. */
+  CHECK(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  CHECK(clpd_db_in_transaction(db) == 1);
+  CHECK(clpd_db_begin_atomic(db) == CLPD_DB_ERROR);
+  CHECK(clpd_db_begin(db) == CLPD_DB_ERROR);
+  CHECK(run1(db, ins, clpd_db_int(1)) == CLPD_DB_OK);
+  CHECK(run1(db, ins, clpd_db_int(1)) == CLPD_DB_UNIQUE);
+  snprintf(first, sizeof first, "%s", clpd_db_error(db));
+  CHECK(first[0] != '\0');
+  CHECK(clpd_db_in_transaction(db) == 1);
+  /* Rolled back already: another connection never sees the row, and a
+   * later statement runs nothing (no autocommit on SQLite either). */
+  if (other != NULL) CHECK(count(other, "clpd_suite_atomic") == 0);
+  CHECK(run1(db, ins, clpd_db_int(2)) == CLPD_DB_ERROR);
+  CHECK(strcmp(clpd_db_error(db), ROLLED_BACK) == 0);
+  CHECK(count(db, "clpd_suite_atomic") == -1); /* refused too */
+  if (other != NULL) CHECK(count(other, "clpd_suite_atomic") == 0);
+  st = clpd_db_commit(db);
+  CHECK(st == CLPD_DB_UNIQUE);
+  CHECK(strcmp(clpd_db_error(db), first) == 0);
+  CHECK(clpd_db_in_transaction(db) == 0);
+  CHECK(count(db, "clpd_suite_atomic") == 0);
+
+  /* DDL is undone as well, and rollback after the failure is OK. */
+  CHECK(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  CHECK(run(db, "CREATE TABLE clpd_suite_atomic2 (id BIGINT)") == CLPD_DB_OK);
+  CHECK(run(db, "SELECT nothing FROM clpd_suite_missing") == CLPD_DB_ERROR);
+  CHECK(clpd_db_rollback(db) == CLPD_DB_OK);
+  CHECK(clpd_db_in_transaction(db) == 0);
+  CHECK(count(db, "clpd_suite_atomic2") == -1);
+  if (other != NULL) CHECK(count(other, "clpd_suite_atomic2") == -1);
+
+  /* A statement the checker rejects counts as the first failure. */
+  CHECK(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  CHECK(run1(db, ins, clpd_db_int(3)) == CLPD_DB_OK);
+  CHECK(run(db, "SELECT 1; SELECT 2") == CLPD_DB_ERROR);
+  CHECK(clpd_db_commit(db) == CLPD_DB_ERROR);
+  CHECK(strcmp(clpd_db_error(db), "only one SQL statement is allowed") == 0);
+  CHECK(count(db, "clpd_suite_atomic") == 0);
+
+  /* Without a failure it commits like clpd_db_begin, DDL included. */
+  CHECK(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  CHECK(run1(db, ins, clpd_db_int(4)) == CLPD_DB_OK);
+  CHECK(run(db, "CREATE TABLE clpd_suite_atomic2 (id BIGINT)") == CLPD_DB_OK);
+  CHECK(clpd_db_commit(db) == CLPD_DB_OK);
+  CHECK(clpd_db_in_transaction(db) == 0);
+  if (other != NULL) CHECK(count(other, "clpd_suite_atomic") == 1);
+  if (other != NULL) CHECK(count(other, "clpd_suite_atomic2") == 0);
+  /* The next atomic transaction starts clean; a plain rollback works. */
+  CHECK(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  CHECK(run1(db, ins, clpd_db_int(5)) == CLPD_DB_OK);
+  CHECK(clpd_db_rollback(db) == CLPD_DB_OK);
+  CHECK(count(db, "clpd_suite_atomic") == 1);
+  /* A plain transaction keeps its old behavior (no refusal after an
+   * error): only rollback is portable, so roll back. */
+  CHECK(clpd_db_begin(db) == CLPD_DB_OK);
+  CHECK(run(db, "SELECT nothing FROM clpd_suite_missing") == CLPD_DB_ERROR);
+  CHECK(clpd_db_rollback(db) == CLPD_DB_OK);
+  CHECK(run(db, "DROP TABLE clpd_suite_atomic2") == CLPD_DB_OK);
+
+  /* Reconnect: the handle keeps working with a new connection, and an
+   * open transaction is rolled back. */
+  CHECK(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  CHECK(run1(db, ins, clpd_db_int(6)) == CLPD_DB_OK);
+  CHECK(clpd_db_reconnect(db, spec, msg, sizeof msg) == CLPD_DB_OK);
+  CHECK(strcmp(msg, "") == 0);
+  CHECK(clpd_db_in_transaction(db) == 0);
+  CHECK(count(db, "clpd_suite_atomic") == 1);
+  CHECK(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  CHECK(run1(db, ins, clpd_db_int(7)) == CLPD_DB_OK);
+  CHECK(clpd_db_commit(db) == CLPD_DB_OK);
+  CHECK(count(db, "clpd_suite_atomic") == 2);
+  CHECK(run(db, "DROP TABLE clpd_suite_atomic") == CLPD_DB_OK);
+  clpd_db_close(other);
+}
+
 static void test_rejected_sql(void) {
   static const char *const bad_one[] = {
       "SELECT id FROM clpd_suite_tx WHERE id = $1 OR id = $2",
@@ -384,6 +475,8 @@ static void drop_tables(void) {
   CHECK(run(db, "DROP TABLE IF EXISTS clpd_suite_types") == CLPD_DB_OK);
   CHECK(run(db, "DROP TABLE IF EXISTS clpd_suite_uniq") == CLPD_DB_OK);
   CHECK(run(db, "DROP TABLE IF EXISTS clpd_suite_tx") == CLPD_DB_OK);
+  CHECK(run(db, "DROP TABLE IF EXISTS clpd_suite_atomic") == CLPD_DB_OK);
+  CHECK(run(db, "DROP TABLE IF EXISTS clpd_suite_atomic2") == CLPD_DB_OK);
 }
 
 int clpd_db_suite(const char *spec) {
@@ -404,6 +497,7 @@ int clpd_db_suite(const char *spec) {
   test_unique();
   test_affected_names_empty();
   test_transactions(spec);
+  test_atomic(spec);
   test_rejected_sql();
   drop_tables();
   clpd_db_close(db);

@@ -35,6 +35,10 @@ struct clpd_loop {
   FILE *log;
   clpd_hup_fn *on_hup;
   void *hup_ctx;
+  /* clpd_loop_defer: while deferred, the next cycle is due at defer_until
+   * instead of the scheduler's time. */
+  int deferred;
+  long long defer_until;
 };
 
 static long long now_ms(void) {
@@ -98,6 +102,11 @@ void clpd_loop_notify(clpd_loop *l) {
   /* EAGAIN means the counter is saturated: a wake-up is already pending. */
   if (write(l->event_fd, &one, sizeof one) < 0) {
   }
+}
+
+void clpd_loop_defer(clpd_loop *l, int delay_ms) {
+  l->deferred = 1;
+  l->defer_until = now_ms() + (delay_ms > 0 ? delay_ms : 0);
 }
 
 void clpd_loop_on_hup(clpd_loop *l, clpd_hup_fn *fn, void *ctx) {
@@ -178,6 +187,11 @@ static int arm(clpd_loop *l, long long due_ms) {
   return timerfd_settime(l->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
 }
 
+/* When the next cycle is due: the deferred time, else the schedule's. */
+static long long next_due(const clpd_loop *l, const clpd_sched *s) {
+  return l->deferred ? l->defer_until : clpd_sched_next_due(s);
+}
+
 /* Drains a counter descriptor (eventfd or timerfd). */
 static void drain(int fd) {
   uint64_t count;
@@ -207,7 +221,7 @@ int clpd_loop_run(clpd_loop *l, clpd_cycle_fn *cycle, void *ctx) {
       fds[3 + i].revents = 0;
       polled[i] = l->w[i].id;
     }
-    if (arm(l, clpd_sched_next_due(&s)) != 0) return -1;
+    if (arm(l, next_due(l, &s)) != 0) return -1;
     if (poll(fds, 3 + nw, -1) < 0) {
       if (errno == EINTR) continue;
       return -1;
@@ -236,7 +250,8 @@ int clpd_loop_run(clpd_loop *l, clpd_cycle_fn *cycle, void *ctx) {
     if (fds[2].revents & POLLIN) drain(l->timer_fd);
     dispatch(l, fds + 3, polled, nw);
     now = now_ms();
-    if (now >= clpd_sched_next_due(&s)) {
+    if (now >= next_due(l, &s)) {
+      l->deferred = 0; /* the cycle may defer the next one again */
       clpd_sched_cycle_started(&s, now);
       cycle(ctx);
     }

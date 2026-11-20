@@ -5,6 +5,9 @@
  * declared TIMESTAMPTZ or JSONB is always read back as TEXT, the type the
  * PostgreSQL backend returns for them.
  *
+ * SQLITE_BUSY and SQLITE_LOCKED ("database is locked", any extended code;
+ * after the busy timeout) are CLPD_DB_TRANSIENT (T10f).
+ *
  * Placeholders are SQLite named parameters "$1".."$n", bound by name.
  * Error messages come from sqlite3_errmsg/sqlite3_errstr, which never
  * contain bound parameter values or the database path. */
@@ -25,6 +28,8 @@ static clpd_db_status sq_fail(clpd_db *db, int rc) {
   clpd_db_set_error(db, "%s", h != NULL ? sqlite3_errmsg(h) : sqlite3_errstr(rc));
   if (rc == SQLITE_CONSTRAINT_UNIQUE || rc == SQLITE_CONSTRAINT_PRIMARYKEY)
     return CLPD_DB_UNIQUE;
+  if ((rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_LOCKED)
+    return CLPD_DB_TRANSIENT;
   return CLPD_DB_ERROR;
 }
 

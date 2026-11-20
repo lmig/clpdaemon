@@ -7,8 +7,8 @@
  *   standard_conforming_strings on (the quoting db.c's SQL check assumes)
  *   and extra_float_digits 3 (exact doubles on any server). lock_timeout
  *   5 s and statement_timeout 30 s when the session value is 0, so a value
- *   from options=-c ..., role or database settings wins; a timeout is an
- *   ordinary error (55P03, 57014). Notices are discarded, never printed.
+ *   from options=-c ..., role or database settings wins; a timeout is
+ *   CLPD_DB_TRANSIENT (55P03, 57014). Notices are discarded, never printed.
  * - Statements: PQexecParams with text-format parameters (INTEGER as int8,
  *   FLOAT as float8 with %.17g, TEXT untyped so the server types it from
  *   its context, e.g. timestamptz or jsonb), BLOB as a binary bytea
@@ -19,8 +19,10 @@
  *   and other fields (which may carry row values) are never shown, and in
  *   data exceptions (class 22) everything from the first to the last double
  *   quote of the whole primary message (the input value) becomes "?".
- *   SQLSTATE 23505 is CLPD_DB_UNIQUE; a failure that leaves the connection
- *   CONNECTION_BAD is CLPD_DB_LOST.
+ *   SQLSTATE 23505 is CLPD_DB_UNIQUE; 40001 (serialization failure), 40P01
+ *   (deadlock detected), 55P03 (lock not available) and 57014 (query
+ *   canceled) are CLPD_DB_TRANSIENT (T10f); a failure that leaves the
+ *   connection CONNECTION_BAD is CLPD_DB_LOST.
  * - A COMMIT the server answers with ROLLBACK (aborted transaction) fails.
  * - Out of memory exits through clpd_db_die_oom.
  * Engine thread only, like every clpd_db call. */
@@ -72,6 +74,18 @@ static void set_conn_error(clpd_db *db, const char *prefix) {
     clpd_db_set_error(db, "%s: %.*s", prefix, (int)len, m);
 }
 
+/* The status of a server error by its SQLSTATE (NULL: none). */
+static clpd_db_status status_of(const char *state) {
+  static const char *const transient[] = {"40001", "40P01", "55P03",
+                                          "57014"};
+  size_t i;
+  if (state == NULL) return CLPD_DB_ERROR;
+  if (strcmp(state, "23505") == 0) return CLPD_DB_UNIQUE;
+  for (i = 0; i < sizeof transient / sizeof transient[0]; i++)
+    if (strcmp(state, transient[i]) == 0) return CLPD_DB_TRANSIENT;
+  return CLPD_DB_ERROR;
+}
+
 /* Maps a failed result (res may be NULL) to a status and a message. */
 static clpd_db_status fail_result(clpd_db *db, const PGresult *res,
                                   const char *what) {
@@ -108,8 +122,7 @@ static clpd_db_status fail_result(clpd_db *db, const PGresult *res,
   } else {
     clpd_db_set_error(db, "%s", primary);
   }
-  return state != NULL && strcmp(state, "23505") == 0 ? CLPD_DB_UNIQUE
-                                                      : CLPD_DB_ERROR;
+  return status_of(state);
 }
 
 /* Ends a COPY the statement started (unsupported: nothing is copied) and

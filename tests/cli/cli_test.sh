@@ -1591,8 +1591,11 @@ clpdaemon: db-drop-table: dropping tables is disabled (orm_allow_drop = no)
 if command -v sqlite3 >/dev/null 2>&1; then
   cases=$((cases + 1))
   got=$(sqlite3 ddl.db "SELECT type || ' ' || name || ': ' || coalesce(sql, '') FROM sqlite_master ORDER BY name" 2>&1)
+  # workflow_instance: created at startup, a package has a mapping (T10a).
   want='table ddl_order: CREATE TABLE "ddl_order" ("wf_id" TEXT NOT NULL, "line_no" INTEGER NOT NULL, "note" TEXT, PRIMARY KEY ("wf_id", "line_no"))
-index sqlite_autoindex_ddl_order_1: '
+index sqlite_autoindex_ddl_order_1: 
+index sqlite_autoindex_workflow_instance_1: 
+table workflow_instance: CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
   [ "$got" = "$want" ] || fail "orm ddl: the generated table" "got [$got], want [$want]"
   # A second run keeps the existing table and its row (IF NOT EXISTS), and
   # the refused drop leaves both.
@@ -1703,6 +1706,684 @@ CREATE TABLE "clpd_sequence" ("name" TEXT PRIMARY KEY, "value" INTEGER NOT NULL)
   [ "$got" = "$want" ] || fail "orm seq: the counter row" "got [$got], want [$want]"
 else
   echo "cli_test.sh: sqlite3 not found; the orm ddl catalog cases are skipped" >&2
+fi
+
+# --- cycle transaction (T10a, docs/database.md#cycle-transaction) -------------
+# The retry keys: positive integers, initial not above max (default 30000).
+retryerr() {
+  conf "$1.conf" "node_id = n1
+$2"
+  check "cycle retry: $1" 1 "" "$3" -- --config "$1.conf" --check
+}
+retryerr retry0 'cycle_retry_initial_ms = 0' \
+  "clpdaemon: retry0.conf:2: cycle_retry_initial_ms: expected a positive integer, got '0'"
+retryerr retrymax 'cycle_retry_max_ms = 1s' \
+  "clpdaemon: retrymax.conf:2: cycle_retry_max_ms: expected a positive integer, got '1s'"
+retryerr retryorder 'cycle_retry_initial_ms = 500
+cycle_retry_max_ms = 100' \
+  "clpdaemon: retryorder.conf: cycle_retry_initial_ms (500) must not exceed cycle_retry_max_ms (100)"
+retryerr retrydefault 'cycle_retry_initial_ms = 40000' \
+  "clpdaemon: retrydefault.conf: cycle_retry_initial_ms (40000) must not exceed cycle_retry_max_ms (30000)"
+conf retryok.conf 'node_id = n1
+cycle_retry_initial_ms = 250
+cycle_retry_max_ms = 250'
+check "cycle retry: valid keys" 0 "clpdaemon: retryok.conf: configuration OK" "" -- --config retryok.conf --check
+
+# The mapping key <tpl>.sync (auto or manual) and the reserved instance
+# table name.
+mkdir ormsync
+conf ormsync/package.conf 'definition = sync
+version = 1
+files = s.clp
+orm = orm.conf'
+conf ormsync/s.clp '(deftemplate order (slot wf-id))'
+conf ormsync/orm.conf 'order.table = sync_order
+order.owned = yes
+order.sync = sometimes
+order.slot.wf-id = wf_id text string error'
+conf ormsync.conf "node_id = n1
+database = sqlite:$WORK/sync.db
+packages = ormsync"
+check "orm: bad sync" 1 "" \
+  "clpdaemon: ormsync/orm.conf:3: order.sync: expected auto or manual, got 'sometimes'" -- --config ormsync.conf --check
+conf ormsync/orm.conf 'order.table = sync_order
+order.owned = yes
+order.sync = manual
+order.slot.wf-id = wf_id text string error'
+check "orm: sync manual" 0 "clpdaemon: ormsync.conf: configuration OK" "" -- --config ormsync.conf --check
+conf ormsync/orm.conf 'order.table = workflow_instance
+order.owned = no
+order.slot.wf-id = wf_id text string error'
+check "orm: reserved instance table name" 1 "" \
+  "clpdaemon: ormsync/orm.conf:1: order.table: table name 'workflow_instance' is reserved (the daemon's workflow instance table)" -- --config ormsync.conf --check
+
+# A package whose rule creates its table, then fails on a database error
+# (db-nextval of a sequence that does not exist): the cycle is rolled back
+# (the table is gone), cycle_end gets ok=0, one failure line with the wait.
+mkdir txpkg
+conf txpkg/package.conf 'definition = tx
+version = 1
+files = tx.clp
+orm = orm.conf
+ingest = go'
+conf txpkg/tx.clp '(deftemplate go (slot wf-id))
+(deftemplate order (slot wf-id) (slot note))
+(defrule r (go (wf-id ?w)) => (db-create-table order) (db-nextval missing_no))
+(deffacts seed (go (wf-id w1)))'
+conf txpkg/orm.conf 'order.table = tx_order
+order.owned = yes
+order.slot.wf-id = wf_id text string error
+order.slot.note = note text string nil
+seq.missing_no = tx_missing_seq
+seq.missing_no.owned = yes'
+TXERR="clpdaemon: db-nextval: sequence alias 'missing_no': sequence 'tx_missing_seq': no such table: clpd_sequence
+[PRCCODE4] Execution halted during the actions of defrule 'r'."
+rconf txhooks.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+plugins = $PLUGINS/test_hooks_a.so
+database = sqlite:$WORK/tx.db
+packages = txpkg"
+plugdaemon "cycle tx: a failed statement rolls the cycle back" txhooks.conf \
+  "clpdaemon: hooks-a: cycle_end ok=0" "clpdaemon: hooks-a: init node_id=n1 post_fact=-1 EINVAL
+clpdaemon: hooks-a: after_load
+clpdaemon: n1: running
+clpdaemon: hooks-a: cycle_begin
+$TXERR
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+clpdaemon: hooks-a: cycle_end ok=0
+clpdaemon: received SIGTERM, stopping
+clpdaemon: hooks-a: shutdown"
+
+# wait_status <socket> <pattern>: waits up to 5 s for a status reply
+# matching the grep pattern.
+wait_status() {
+  n=0
+  while ! "$ADMIN" "$1" 'status\n' 2>/dev/null | grep -q "$2"; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && return 1
+    sleep 0.05
+  done
+}
+# After the failure the retry (100 ms later) commits, which resets the
+# backoff: a later failure waits 100 ms again, not 200. That cycle touched
+# instance w2 (its injected go fact), so the rollback evicts it and the
+# retry reloads it (T10c): the SELECT fails, because the rolled-back cycle
+# also undid the creation of tx_order, which isolates w2.
+rconf txreset.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/txreset.db
+packages = txpkg"
+cases=$((cases + 1))
+start txreset.conf admin.sock
+wait_status admin.sock ' cycles=2 ' || ok=0
+acase "cycle tx: inject after the retry" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w2"}}}\n'
+wait_status admin.sock ' cycles=4 ' || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+$TXERR
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+$TXERR
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+clpdaemon: rehydrate: instance 'w2': tx@1::order: table 'tx_order': no such table: tx_order
+clpdaemon: sync: instance 'w2' is no longer synchronized: no such table: tx_order
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "cycle tx: a committed cycle resets the backoff" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# During a long backoff the loop serves the admin socket (an inject is
+# queued, not run) and SIGTERM stops the daemon at once.
+rconf txwait.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 60000
+cycle_retry_max_ms = 60000
+database = sqlite:$WORK/txwait.db
+packages = txpkg"
+cases=$((cases + 1))
+start txwait.conf admin.sock
+wait_line err.txt "clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 60000 ms" || ok=0
+acase "cycle tx: status during the backoff" "OK node_id=n1 cycles=1 queue=0 facts=1" admin.sock 'status\n'
+acase "cycle tx: inject during the backoff" "OK queued
+OK node_id=n1 cycles=1 queue=1 facts=1" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w2"}}}\n' 'status\n'
+sleep 0.3
+acase "cycle tx: no cycle during the backoff" "OK node_id=n1 cycles=1 queue=1 facts=1" admin.sock 'status\n'
+t0=$(date +%s)
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+t1=$(date +%s)
+want="clpdaemon: n1: running
+$TXERR
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 60000 ms
+clpdaemon: received SIGTERM, stopping
+clpdaemon: 1 queued fact dropped at shutdown"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ $((t1 - t0)) -gt 3 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "cycle tx: SIGTERM during the backoff" "exit $rc, lines seen $ok, $((t1 - t0)) s, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+if command -v sqlite3 >/dev/null 2>&1; then
+  # The rolled-back cycle left only the daemon's instance table, created at
+  # startup because a package has a mapping.
+  cases=$((cases + 1))
+  got=$(sqlite3 tx.db "SELECT type || ' ' || name || ': ' || coalesce(sql, '') FROM sqlite_master ORDER BY name" 2>&1)
+  want='index sqlite_autoindex_workflow_instance_1: 
+table workflow_instance: CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
+  [ "$got" = "$want" ] || fail "cycle tx: rolled back, workflow_instance created" "got [$got], want [$want]"
+  # --check writes nothing: no workflow_instance; nor does a daemon whose
+  # packages have no mapping (dbrun.db above).
+  conf txcheck.conf "node_id = n1
+database = sqlite:$WORK/txcheck.db
+packages = txpkg"
+  check "cycle tx: --check" 0 "clpdaemon: txcheck.conf: configuration OK" "" -- --config txcheck.conf --check
+  cases=$((cases + 1))
+  got=$(sqlite3 txcheck.db "SELECT name FROM sqlite_master" 2>&1)$(sqlite3 dbrun.db "SELECT name FROM sqlite_master" 2>&1)
+  [ -z "$got" ] || fail "cycle tx: no workflow_instance under --check or without a mapping" "got [$got]"
+  # The table cannot be created (a read-only database file): exit 1.
+  sqlite3 txro.db 'CREATE TABLE other (x INTEGER)'
+  chmod 0444 txro.db
+  rconf txro.conf "node_id = n1
+database = sqlite:$WORK/txro.db
+packages = txpkg"
+  RUN='timeout 10'
+  check "cycle tx: workflow_instance cannot be created" 1 "" \
+    "clpdaemon: cannot create the workflow_instance table: attempt to write a readonly database" -- --config txro.conf
+  RUN=
+  cases=$((cases + 1))
+  [ ! -e admin.sock ] || fail "cycle tx: no admin socket after the failure" "$(ls -l admin.sock)"
+  chmod 0644 txro.db
+fi
+
+# --- automatic synchronization (T10b, docs/orm.md#automatic-synchronization) --
+# The deffacts fact is written by the first cycle (the rule that creates
+# the tables runs first in it), a rule's assert of a mapped auto template
+# is an INSERT, a fact of a manual template is not written, two modifies
+# in one cycle (pay, then ship) are one UPDATE; an injected fact with the
+# primary key of a stored row is a unique violation that rolls the cycle
+# back, isolates the instance and evicts it without a reload (T10c).
+mkdir syncpkg
+conf syncpkg/package.conf 'definition = sync
+version = 1
+files = s.clp
+orm = orm.conf
+ingest = go, order'
+conf syncpkg/s.clp '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot line-no (type INTEGER)) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id) (slot text))
+(deffacts seed (boot (wf-id w0)) (order (wf-id w1) (line-no 1) (status new)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order) (db-create-table memo))
+(defrule add (go (wf-id ?w) (act add)) => (assert (order (wf-id ?w) (line-no 2) (status new))) (assert (memo (wf-id ?w) (text "m"))))
+(defrule pay (go (wf-id ?w) (act pay)) ?o <- (order (wf-id ?w) (line-no 1) (status new)) => (modify ?o (status paid)))
+(defrule ship ?o <- (order (wf-id ?w) (status paid)) => (modify ?o (status shipped)))'
+conf syncpkg/orm.conf 'order.table = sync_order
+order.owned = yes
+order.key = line-no
+order.slot.wf-id = wf_id text symbol error
+order.slot.line-no = line_no bigint integer error
+order.slot.status = status text symbol default
+memo.table = sync_memo
+memo.owned = yes
+memo.sync = manual
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.text = body text string nil'
+rconf syncrun.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 60000
+cycle_retry_max_ms = 60000
+database = sqlite:$WORK/syncrun.db
+packages = syncpkg"
+SYNCDUP='UNIQUE constraint failed: sync_order.wf_id, sync_order.line_no'
+cases=$((cases + 1))
+start syncrun.conf admin.sock
+wait_status admin.sock ' cycles=1 ' || ok=0
+acase "sync: inject add" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"add"}}}\n'
+wait_status admin.sock ' cycles=2 ' || ok=0
+acase "sync: inject pay" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"pay"}}}\n'
+wait_status admin.sock ' cycles=3 ' || ok=0
+acase "sync: inject a duplicate key" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"line-no":1,"status":{"sym":"dup"}}}\n'
+wait_line err.txt "clpdaemon: cycle transaction failed: $SYNCDUP; retrying in 60000 ms" || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: sync: sync@1::order: table 'sync_order': $SYNCDUP
+clpdaemon: cycle transaction failed: $SYNCDUP; retrying in 60000 ms
+clpdaemon: sync: instance 'w1' is no longer synchronized: $SYNCDUP
+clpdaemon: rehydrate: instance 'w1' is not reloaded: it is no longer synchronized
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "sync: a running daemon writes its facts" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 syncrun.db "SELECT wf_id || '|' || line_no || '|' || status FROM sync_order ORDER BY line_no; SELECT count(*) FROM sync_memo; SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || coalesce(parent_wf_id, owner_node, lease_until, '-') || '|' || (created_at < updated_at) || '|' || (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z') FROM workflow_instance" 2>&1)
+  want='w1|1|shipped
+w1|2|new
+0
+w1|sync|1|active|-|1|1'
+  [ "$got" = "$want" ] || fail "sync: the rows after the cycles" "got [$got], want [$want]"
+fi
+
+# --- rehydration (T10c, docs/orm.md#rehydration) -----------------------------
+# A rolled-back cycle evicts the instance it touched and the retry reloads
+# it from the database: the stored row comes back as it was committed (the
+# rule's modify is undone), the fact the rule asserted (an unmapped memo)
+# and the injected fact that started the cycle are lost, and the untouched
+# boot fact stays. A later injected fact sees exactly that working memory
+# (the show rule prints it).
+mkdir rhpkg
+conf rhpkg/package.conf 'definition = rh
+version = 1
+files = r.clp
+orm = orm.conf
+ingest = go'
+conf rhpkg/r.clp '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id))
+(deffacts seed (boot (wf-id w0)) (order (wf-id w1) (status new)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))
+(defrule fail (go (wf-id ?w) (act fail)) ?o <- (order (wf-id ?w)) => (modify ?o (status bad)) (assert (memo (wf-id ?w))) (db-nextval missing_no))
+(defrule show (go (wf-id ?w) (act show)) (order (wf-id ?w) (status ?s)) => (printout t "show " ?w " " ?s " memos=" (length$ (find-all-facts ((?m memo)) TRUE)) " gos=" (length$ (find-all-facts ((?g go)) TRUE)) crlf))'
+conf rhpkg/orm.conf 'order.table = rh_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+seq.missing_no = rh_missing_seq
+seq.missing_no.owned = yes'
+rconf rhrun.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 100
+cycle_retry_max_ms = 100
+database = sqlite:$WORK/rhrun.db
+packages = rhpkg"
+cases=$((cases + 1))
+start rhrun.conf admin.sock
+wait_status admin.sock ' cycles=1 ' || ok=0
+acase "rehydrate: inject a failing go" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"fail"}}}\n'
+wait_status admin.sock ' cycles=3 ' || ok=0
+acase "rehydrate: working memory after the retry" "OK node_id=n1 cycles=3 queue=0 facts=2" admin.sock 'status\n'
+acase "rehydrate: inject show" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"show"}}}\n'
+wait_line out.txt 'show w1 new memos=0 gos=1' || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: db-nextval: sequence alias 'missing_no': sequence 'rh_missing_seq': no such table: clpd_sequence
+[PRCCODE4] Execution halted during the actions of defrule 'fail'.
+clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 100 ms
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != 'show w1 new memos=0 gos=1' ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "rehydrate: a rolled-back cycle reloads its instance" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 rhrun.db "SELECT wf_id || '|' || status FROM rh_order" 2>&1)
+  [ "$got" = 'w1|new' ] || fail "rehydrate: the stored row is unchanged" "got [$got]"
+fi
+
+# --- DML functions (T10d, docs/orm.md#dml-functions) -------------------------
+# A rule of a running daemon writes, counts and loads the rows of its
+# sync = manual template inside the cycle, which commits; a write to a
+# sync = auto template is one log line and halts the rule.
+mkdir dmlpkg
+conf dmlpkg/package.conf 'definition = dml
+version = 1
+files = d.clp
+orm = orm.conf'
+conf dmlpkg/d.clp '(deftemplate go (slot wf-id))
+(deftemplate memo (slot wf-id) (slot n (type INTEGER)) (slot text))
+(deftemplate order (slot wf-id))
+(defrule r (go (wf-id ?w)) =>
+  (db-create-table memo)
+  (printout t "insert " (db-insert memo wf-id ?w n 1 text "hi") crlf)
+  (printout t "update " (db-update memo (create$ wf-id ?w n 1) text "ho") crlf)
+  (printout t "count " (db-count memo (create$ wf-id ?w)) crlf)
+  (printout t "load " (db-load memo (create$ wf-id ?w)) " facts " (length$ (find-all-facts ((?m memo)) TRUE)) crlf)
+  (printout t "delete " (db-delete memo (create$ wf-id ?w n 2)) crlf)
+  (db-insert order wf-id ?w)
+  (printout t "not reached" crlf))
+(deffacts seed (go (wf-id w1)))'
+conf dmlpkg/orm.conf 'memo.table = dml_memo
+memo.owned = yes
+memo.sync = manual
+memo.key = n
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.n = n bigint integer error
+memo.slot.text = body text string nil
+order.table = dml_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error'
+rconf dml.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/dml.db
+packages = dmlpkg"
+ddlrun "orm dml: a rule writes, counts and loads its rows" dml.conf 'insert TRUE
+update 1
+count 1
+load 1 facts 1
+delete 0' "clpdaemon: n1: running
+clpdaemon: db-insert: template 'order': table 'dml_order' has sync = auto: only the automatic synchronization writes it
+[PRCCODE4] Execution halted during the actions of defrule 'r'."
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 dml.db "SELECT wf_id || '|' || n || '|' || body FROM dml_memo; SELECT count(*) FROM workflow_instance" 2>&1)
+  want='w1|1|ho
+0'
+  [ "$got" = "$want" ] || fail "orm dml: the committed row" "got [$got], want [$want]"
+fi
+
+# --- T10 verify follow-ups (T10e) --------------------------------------------
+# B1: a wf-id taken from a fact is shown in a log line with its control
+# characters as '?', so an injected wf-id cannot forge a line.
+mkdir b1pkg
+conf b1pkg/package.conf 'definition = b1
+version = 1
+files = b.clp
+orm = orm.conf
+ingest = bad'
+conf b1pkg/b.clp '(deftemplate bad (slot wf-id) (slot n))'
+conf b1pkg/orm.conf 'bad.table = b1_bad
+bad.owned = no
+bad.slot.wf-id = wf_id text string error
+bad.slot.n = n bigint integer nil'
+rconf b1.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/b1.db
+packages = b1pkg"
+B1WHY="slot 'n' (column 'n'): expected integer, got STRING"
+cases=$((cases + 1))
+start b1.conf admin.sock
+wait_status admin.sock ' cycles=1 ' || ok=0
+acase "b1: inject a forged wf-id" "OK queued" admin.sock 'inject {"template":"bad","slots":{"wf-id":"a\\u0007b\\nclpdaemon: forged","n":"x"}}\n'
+wait_has err.txt "is not reloaded" || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: sync: b1@1::bad: table 'b1_bad': $B1WHY
+clpdaemon: cycle transaction failed: $B1WHY; retrying in 100 ms
+clpdaemon: sync: instance 'a?b?clpdaemon: forged' is no longer synchronized: $B1WHY
+clpdaemon: rehydrate: instance 'a?b?clpdaemon: forged' is not reloaded: it is no longer synchronized
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  ! grep -qF "instance 'a?b?clpdaemon: forged' is no longer synchronized" err.txt ||
+  grep -q '^clpdaemon: forged' err.txt; then
+  fail "b1: the isolation line shows the wf-id sanitized" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# A1: instance_isolate_after, a positive integer (default 3).
+retryerr isolate0 'instance_isolate_after = 0' \
+  "clpdaemon: isolate0.conf:2: instance_isolate_after: expected a positive integer, got '0'"
+retryerr isolatex 'instance_isolate_after = three' \
+  "clpdaemon: isolatex.conf:2: instance_isolate_after: expected a positive integer, got 'three'"
+conf isolateok.conf 'node_id = n1
+instance_isolate_after = 1'
+check "cycle retry: instance_isolate_after" 0 "clpdaemon: isolateok.conf: configuration OK" "" -- --config isolateok.conf --check
+
+# A1 poison retry: another process sets the stored row of w1 to poison;
+# a rule touches w1 and fails, so the rollback reloads w1, whose poison
+# row activates a rule that fails the same way on every retry. The third
+# rolled-back cycle attributed to w1 (the wf-id of the failing rule)
+# isolates it, and the next cycle commits: w2's row is written.
+# a1case <tag> <name> <action> <failure lines> <failure message>: the
+# package in <tag>pkg, the database <tag>.db.
+a1case() {
+  a1=$1 a1name=$2 a1act=$3 a1lines=$4 a1msg=$5
+  mkdir "${a1}pkg"
+  conf "${a1}pkg"/package.conf 'definition = a1
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order'
+  conf "${a1}pkg"/a.clp "(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id) (slot text))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order) (db-create-table memo))
+(defrule fail (go (wf-id ?w) (act fail)) ?o <- (order (wf-id ?w)) => (modify ?o (status touched)) $a1act)
+(defrule poison ?o <- (order (wf-id ?w) (status poison)) => (modify ?o (status cured)) $a1act)"
+  conf "${a1}pkg"/orm.conf 'order.table = a1_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+memo.table = a1_memo
+memo.owned = yes
+memo.sync = manual
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.text = body text string nil
+seq.missing_no = a1_missing_seq
+seq.missing_no.owned = yes'
+  rconf "$a1.conf" "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 100
+cycle_retry_max_ms = 100
+database = sqlite:$WORK/$a1.db
+packages = ${a1}pkg"
+  cases=$((cases + 1))
+  start "$a1.conf" admin.sock
+  wait_status admin.sock ' cycles=1 ' || ok=0
+  acase "$a1name: inject w1" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"status":{"sym":"new"}}}\n'
+  wait_status admin.sock ' cycles=2 ' || ok=0
+  sqlite3 "$a1.db" "UPDATE a1_order SET status = 'poison' WHERE wf_id = 'w1'; INSERT INTO a1_memo VALUES ('w1', 'old')"
+  acase "$a1name: inject a failing go" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"fail"}}}\n'
+  wait_line err.txt "clpdaemon: sync: instance 'w1' is no longer synchronized: $a1msg (3 rolled-back cycles in a row)" || ok=0
+  acase "$a1name: inject w2" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w2"},"status":{"sym":"new"}}}\n'
+  n=0
+  while [ "$(sqlite3 "$a1.db" "SELECT status FROM a1_order WHERE wf_id = 'w2'" 2>/dev/null)" != new ]; do
+    n=$((n + 1))
+    [ "$n" -gt 40 ] && { ok=0; break; }
+    sleep 0.05
+  done
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  want="clpdaemon: n1: running
+$(printf "$a1lines" fail)
+clpdaemon: cycle transaction failed: $a1msg; retrying in 100 ms
+$(printf "$a1lines" poison)
+clpdaemon: cycle transaction failed: $a1msg; retrying in 100 ms
+$(printf "$a1lines" poison)
+clpdaemon: cycle transaction failed: $a1msg; retrying in 100 ms
+clpdaemon: sync: instance 'w1' is no longer synchronized: $a1msg (3 rolled-back cycles in a row)
+clpdaemon: rehydrate: instance 'w1' is not reloaded: it is no longer synchronized
+clpdaemon: received SIGTERM, stopping"
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+    fail "$a1name: w1 isolated, w2 written" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+  cases=$((cases + 1))
+  got=$(sqlite3 "$a1.db" "SELECT wf_id || '|' || status FROM a1_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM a1_memo" 2>&1)
+  want='w1|poison
+w2|new
+w1|old'
+  [ "$got" = "$want" ] || fail "$a1name: the stored rows" "got [$got], want [$want]"
+}
+if command -v sqlite3 >/dev/null 2>&1; then
+  a1case a1n "a1 nextval" '(db-nextval missing_no)' \
+    "clpdaemon: db-nextval: sequence alias 'missing_no': sequence 'a1_missing_seq': no such table: clpd_sequence\n[PRCCODE4] Execution halted during the actions of defrule '%s'." \
+    'no such table: clpd_sequence'
+  a1case a1i "a1 insert" '(db-insert memo wf-id ?w text "x")' \
+    "clpdaemon: db-insert: template 'memo': table 'a1_memo': UNIQUE constraint failed: a1_memo.wf_id\n[PRCCODE4] Execution halted during the actions of defrule '%s'." \
+    'UNIQUE constraint failed: a1_memo.wf_id'
+
+  # T10b against an audit trigger on a table that is not owned, created
+  # beforehand: two modifies in one cycle are one UPDATE, a modify back to
+  # the stored values writes nothing, a key change is a DELETE then an
+  # INSERT; nil in a null nil column is NULL, in a column of another null
+  # policy the text nil.
+  sqlite3 audit.db "CREATE TABLE au_order (wf_id TEXT NOT NULL, line_no INTEGER NOT NULL, status TEXT, a TEXT, b TEXT, PRIMARY KEY (wf_id, line_no));
+CREATE TABLE audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, wf_id TEXT, line_no INTEGER, status TEXT, a TEXT, b TEXT);
+CREATE TRIGGER au_i AFTER INSERT ON au_order BEGIN INSERT INTO audit (op, wf_id, line_no, status, a, b) VALUES ('I', NEW.wf_id, NEW.line_no, NEW.status, NEW.a, NEW.b); END;
+CREATE TRIGGER au_u AFTER UPDATE ON au_order BEGIN INSERT INTO audit (op, wf_id, line_no, status, a, b) VALUES ('U', NEW.wf_id, NEW.line_no, NEW.status, NEW.a, NEW.b); END;
+CREATE TRIGGER au_d AFTER DELETE ON au_order BEGIN INSERT INTO audit (op, wf_id, line_no, status, a, b) VALUES ('D', OLD.wf_id, OLD.line_no, OLD.status, OLD.a, OLD.b); END;"
+  mkdir aupkg
+  conf aupkg/package.conf 'definition = au
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order'
+  conf aupkg/a.clp '(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot line-no (type INTEGER)) (slot status (type SYMBOL)) (slot a (type SYMBOL)) (slot b (type SYMBOL)))
+(defrule pay (go (wf-id ?w) (act pay)) ?o <- (order (wf-id ?w) (status new)) => (modify ?o (status paid)))
+(defrule ship ?o <- (order (wf-id ?w) (status paid)) => (modify ?o (status shipped)))
+(defrule flip ?g <- (go (wf-id ?w) (act flip)) ?o <- (order (wf-id ?w) (status shipped)) => (retract ?g) (modify ?o (status tmp)))
+(defrule flop ?o <- (order (wf-id ?w) (status tmp)) => (modify ?o (status shipped)))
+(defrule rekey (go (wf-id ?w) (act rekey)) ?o <- (order (wf-id ?w) (line-no 1)) => (modify ?o (line-no 2)))'
+  conf aupkg/orm.conf 'order.table = au_order
+order.owned = no
+order.key = line-no
+order.slot.wf-id = wf_id text symbol error
+order.slot.line-no = line_no bigint integer error
+order.slot.status = status text symbol default
+order.slot.a = a text symbol nil
+order.slot.b = b text symbol default'
+  rconf au.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/audit.db
+packages = aupkg"
+  AUDIT="SELECT op || '|' || wf_id || '|' || line_no || '|' || status || '|' || coalesce(a, 'NULL') || '|' || coalesce(b, 'NULL') FROM audit ORDER BY seq"
+  cases=$((cases + 1))
+  start au.conf admin.sock
+  wait_status admin.sock ' cycles=1 ' || ok=0
+  acase "audit: inject the order" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"line-no":1,"status":{"sym":"new"},"a":{"sym":"nil"},"b":{"sym":"nil"}}}\n'
+  wait_status admin.sock ' cycles=2 ' || ok=0
+  au1=$(sqlite3 audit.db "$AUDIT" 2>&1)
+  acase "audit: two modifies" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"pay"}}}\n'
+  wait_status admin.sock ' cycles=3 ' || ok=0
+  au2=$(sqlite3 audit.db "$AUDIT" 2>&1)
+  acase "audit: a modify back" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"flip"}}}\n'
+  wait_status admin.sock ' cycles=4 ' || ok=0
+  au3=$(sqlite3 audit.db "$AUDIT" 2>&1)
+  acase "audit: a key change" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"rekey"}}}\n'
+  wait_status admin.sock ' cycles=5 ' || ok=0
+  au4=$(sqlite3 audit.db "$AUDIT" 2>&1)
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+    fail "audit: the daemon" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+  AU1='I|w1|1|new|NULL|nil'
+  AU2="$AU1
+U|w1|1|shipped|NULL|nil"
+  AU4="$AU2
+D|w1|1|shipped|NULL|nil
+I|w1|2|shipped|NULL|nil"
+  cases=$((cases + 1))
+  [ "$au1" = "$AU1" ] && [ "$au2" = "$AU2" ] && [ "$au3" = "$AU2" ] && [ "$au4" = "$AU4" ] ||
+    fail "audit: the trigger rows" "after the insert [$au1], two modifies [$au2], a modify back [$au3], a key change [$au4]"
+  cases=$((cases + 1))
+  got=$(sqlite3 audit.db "SELECT wf_id || '|' || line_no || '|' || status || '|' || coalesce(a, 'NULL') || '|' || coalesce(b, 'NULL') FROM au_order; SELECT wf_id || '|' || definition FROM workflow_instance" 2>&1)
+  want='w1|2|shipped|NULL|nil
+w1|au'
+  [ "$got" = "$want" ] || fail "audit: the stored row" "got [$got], want [$want]"
+else
+  echo "cli_test.sh: sqlite3 not found; the T10e A1 and audit cases are skipped" >&2
+fi
+
+# --- transient contention (T10f) --------------------------------------------
+# Another connection holds an EXCLUSIVE lock on the database file while the
+# daemon must reload an instance a rolled-back cycle evicted: the reload
+# SELECT fails with "database is locked" (SQLITE_BUSY after the 5 s busy
+# timeout), which is transient: w1 is not isolated, the start of the
+# cycle is retried, and once the lock is released w1 is reloaded and its
+# rule's modify is written. The first failure (w1's rule, a missing
+# sequence) counts for w1; the two reload failures that follow neither
+# count nor reset, so with instance_isolate_after = 2 three failures in a
+# row isolate nothing.
+if command -v sqlite3 >/dev/null 2>&1; then
+  mkdir tfpkg
+  conf tfpkg/package.conf 'definition = tf
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order'
+  conf tfpkg/a.clp '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))
+(defrule fail (go (wf-id ?w)) ?o <- (order (wf-id ?w)) => (modify ?o (status touched)) (db-nextval missing_no))
+(defrule stored ?o <- (order (wf-id ?w) (status stored)) => (modify ?o (status cured)))'
+  conf tfpkg/orm.conf 'order.table = tf_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+seq.missing_no = tf_missing_seq
+seq.missing_no.owned = yes'
+  rconf tf.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 1000
+cycle_retry_max_ms = 1000
+instance_isolate_after = 2
+database = sqlite:$WORK/tf.db
+packages = tfpkg"
+  cases=$((cases + 1))
+  start tf.conf admin.sock
+  wait_status admin.sock ' cycles=1 ' || ok=0
+  acase "tf: inject w1" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"status":{"sym":"new"}}}\n'
+  wait_status admin.sock ' cycles=2 ' || ok=0
+  sqlite3 tf.db "UPDATE tf_order SET status = 'stored' WHERE wf_id = 'w1'"
+  acase "tf: inject a go" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"}}}\n'
+  TFFAIL='clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 1000 ms'
+  wait_line err.txt "$TFFAIL" || ok=0
+  # The lock, taken during the 1 s wait before the reload and held for 15 s:
+  # the reloads at about 1 s and 7 s wait 5 s each and fail, the one at
+  # about 13 s gets the database when the lock is released.
+  printf '%s\n' '.timeout 5000' 'BEGIN EXCLUSIVE;' '.shell touch tflocked' \
+    '.shell sleep 15' 'COMMIT;' | sqlite3 tf.db >tfholder.txt 2>&1 &
+  hpid=$!
+  n=0
+  while [ ! -e tflocked ]; do
+    n=$((n + 1))
+    [ "$n" -gt 40 ] && { ok=0; break; }
+    sleep 0.05
+  done
+  wait "$hpid"
+  hrc=$?
+  n=0
+  while [ "$(sqlite3 tf.db "SELECT status FROM tf_order WHERE wf_id = 'w1'" 2>/dev/null)" != cured ]; do
+    n=$((n + 1))
+    [ "$n" -gt 400 ] && { ok=0; break; }
+    sleep 0.05
+  done
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  TFRH="clpdaemon: rehydrate: instance 'w1': tf@1::order: table 'tf_order': database is locked"
+  TFRETRY='clpdaemon: cycle transaction failed: database is locked; retrying in 1000 ms'
+  k=$(grep -cxF "$TFRH" err.txt)
+  want="clpdaemon: n1: running
+clpdaemon: db-nextval: sequence alias 'missing_no': sequence 'tf_missing_seq': no such table: clpd_sequence
+[PRCCODE4] Execution halted during the actions of defrule 'fail'.
+$TFFAIL"
+  i=0
+  while [ "$i" -lt "$k" ]; do
+    want="$want
+$TFRH
+$TFRETRY"
+    i=$((i + 1))
+  done
+  want="$want
+clpdaemon: received SIGTERM, stopping"
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$hrc" != 0 ] || [ "$k" -lt 2 ] || [ -s out.txt ] ||
+    [ "$(cat err.txt)" != "$want" ] || grep -q 'is no longer synchronized' err.txt; then
+    fail "tf: a locked reload is retried, not isolated" "exit $rc, lines seen $ok, holder exit $hrc [$(cat tfholder.txt)], reload failures $k, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+  cases=$((cases + 1))
+  got=$(sqlite3 tf.db "SELECT wf_id || '|' || status FROM tf_order ORDER BY wf_id; SELECT count(*) FROM workflow_instance WHERE wf_id = 'w1'" 2>&1)
+  want='w1|cured
+1'
+  [ "$got" = "$want" ] || fail "tf: the stored rows" "got [$got], want [$want]"
+else
+  echo "cli_test.sh: sqlite3 not found; the T10f case is skipped" >&2
 fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"

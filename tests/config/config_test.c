@@ -276,6 +276,123 @@ static void test_database(void) {
   clpd_config_free(&cfg);
 }
 
+/* cycle_retry_initial_ms and cycle_retry_max_ms (T10a): positive
+ * integers, default 100 and 30000, initial not above max. */
+static void test_cycle_retry(void) {
+  static const char *const bad[] = {"0", "-1", "", "1.5", "100ms",
+                                    "2147483648"};
+  static const char *const keys[] = {"cycle_retry_initial_ms",
+                                     "cycle_retry_max_ms"};
+  clpd_config cfg;
+  char text[160], eb[512], expect[2 * sizeof path + 320];
+  size_t i, k;
+  EXPECT(LOAD("retry0.conf", "node_id = n1\n", &cfg, eb) == 0);
+  EXPECT(cfg.cycle_retry_initial_ms == 100);
+  EXPECT(cfg.cycle_retry_max_ms == 30000);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("retry1.conf", "node_id = n1\ncycle_retry_initial_ms = 7\n"
+                             "cycle_retry_max_ms = 2147483647\n", &cfg, eb) == 0);
+  EXPECT(strcmp(eb, "") == 0);
+  EXPECT(cfg.cycle_retry_initial_ms == 7);
+  EXPECT(cfg.cycle_retry_max_ms == 2147483647);
+  clpd_config_free(&cfg);
+  /* Equal values are valid; one key alone keeps the other's default. */
+  EXPECT(LOAD("retry2.conf", "node_id = n1\ncycle_retry_initial_ms = 250\n"
+                             "cycle_retry_max_ms = 250\n", &cfg, eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && cfg.cycle_retry_initial_ms == 250 &&
+         cfg.cycle_retry_max_ms == 250);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("retry3.conf", "node_id = n1\ncycle_retry_max_ms = 100\n", &cfg,
+              eb) == 0);
+  EXPECT(cfg.cycle_retry_initial_ms == 100 && cfg.cycle_retry_max_ms == 100);
+  clpd_config_free(&cfg);
+  for (k = 0; k < 2; k++) {
+    for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+      snprintf(text, sizeof text, "node_id = n1\n%s = %s\n", keys[k], bad[i]);
+      EXPECT(load("retry.conf", text, strlen(text), &cfg, eb, sizeof eb) == 1);
+      snprintf(expect, sizeof expect,
+               "clpdaemon: %s:2: %s: expected a positive integer, got '%s'\n",
+               path, keys[k], bad[i]);
+      EXPECT(strcmp(eb, expect) == 0);
+      EXPECT(cfg.cycle_retry_initial_ms == 100 &&
+             cfg.cycle_retry_max_ms == 30000);
+      clpd_config_free(&cfg);
+    }
+  }
+  /* initial above max: a file-level error after the line errors. */
+  EXPECT(LOAD("retry4.conf", "node_id = n1\ncycle_retry_initial_ms = 500\n"
+                             "cycle_retry_max_ms = 499\n", &cfg, eb) == 1);
+  snprintf(expect, sizeof expect,
+           "clpdaemon: %s: cycle_retry_initial_ms (500) must not exceed "
+           "cycle_retry_max_ms (499)\n", path);
+  EXPECT(strcmp(eb, expect) == 0);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("retry5.conf", "node_id = n1\ncycle_retry_initial_ms = 40000\n",
+              &cfg, eb) == 1);
+  snprintf(expect, sizeof expect,
+           "clpdaemon: %s: cycle_retry_initial_ms (40000) must not exceed "
+           "cycle_retry_max_ms (30000)\n", path);
+  EXPECT(strcmp(eb, expect) == 0);
+  clpd_config_free(&cfg);
+  /* Not checked when a value is invalid. */
+  EXPECT(LOAD("retry6.conf", "node_id = n1\ncycle_retry_initial_ms = 40000\n"
+                             "cycle_retry_max_ms = 0\n", &cfg, eb) == 1);
+  snprintf(expect, sizeof expect,
+           "clpdaemon: %s:3: cycle_retry_max_ms: expected a positive integer, "
+           "got '0'\n", path);
+  EXPECT(strcmp(eb, expect) == 0);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("retry7.conf", "node_id = n1\ncycle_retry_max_ms = 5\n"
+                             "cycle_retry_max_ms = 6\n", &cfg, eb) == 1);
+  snprintf(expect, sizeof expect,
+           "clpdaemon: %s:3: duplicate key 'cycle_retry_max_ms' (first set on "
+           "line 2)\nclpdaemon: %s: cycle_retry_initial_ms (100) must not "
+           "exceed cycle_retry_max_ms (5)\n", path, path);
+  EXPECT(strcmp(eb, expect) == 0);
+  clpd_config_free(&cfg);
+}
+
+/* instance_isolate_after (T10e): a positive integer, default 3. */
+static void test_instance_isolate_after(void) {
+  static const char *const bad[] = {"0", "-1", "", "1.5", "3x",
+                                    "2147483648"};
+  clpd_config cfg;
+  char text[160], eb[512], expect[sizeof path + 160];
+  size_t i;
+  EXPECT(LOAD("iso0.conf", "node_id = n1\n", &cfg, eb) == 0);
+  EXPECT(cfg.instance_isolate_after == 3);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("iso1.conf", "node_id = n1\ninstance_isolate_after = 1\n", &cfg,
+              eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && cfg.instance_isolate_after == 1);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("iso2.conf", "node_id = n1\ninstance_isolate_after = 2147483647\n",
+              &cfg, eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && cfg.instance_isolate_after == 2147483647);
+  clpd_config_free(&cfg);
+  for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    snprintf(text, sizeof text, "node_id = n1\ninstance_isolate_after = %s\n",
+             bad[i]);
+    EXPECT(load("iso.conf", text, strlen(text), &cfg, eb, sizeof eb) == 1);
+    snprintf(expect, sizeof expect,
+             "clpdaemon: %s:2: instance_isolate_after: expected a positive "
+             "integer, got '%s'\n",
+             path, bad[i]);
+    EXPECT(strcmp(eb, expect) == 0);
+    EXPECT(cfg.instance_isolate_after == 3);
+    clpd_config_free(&cfg);
+  }
+  /* The retry keys keep their own checks and defaults. */
+  EXPECT(LOAD("iso3.conf", "node_id = n1\ninstance_isolate_after = 5\n"
+                           "cycle_retry_max_ms = 0\n", &cfg, eb) == 1);
+  snprintf(expect, sizeof expect,
+           "clpdaemon: %s:3: cycle_retry_max_ms: expected a positive integer, "
+           "got '0'\n", path);
+  EXPECT(strcmp(eb, expect) == 0);
+  EXPECT(cfg.instance_isolate_after == 5 && cfg.cycle_retry_initial_ms == 100);
+  clpd_config_free(&cfg);
+}
+
 static void test_nul_byte_rejected(void) {
   clpd_config cfg;
   char eb[512], want[sizeof path + 64];
@@ -300,6 +417,8 @@ int main(void) {
   test_orm_allow_drop();
   test_admin_socket_none();
   test_database();
+  test_cycle_retry();
+  test_instance_isolate_after();
   rmdir(dir);
   if (failures != 0) {
     fprintf(stderr, "%d config checks failed\n", failures);

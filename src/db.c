@@ -355,16 +355,9 @@ static int check_params(clpd_db *db, const clpd_db_value *params, size_t n) {
 
 /* Connections. */
 
-clpd_db_status clpd_db_open(const char *spec, clpd_db **out, char *msg,
-                            size_t n) {
-  clpd_db *db;
-  clpd_db_status st;
+/* Picks the backend of a checked spec and opens its connection into db. */
+static clpd_db_status connect_spec(clpd_db *db, const char *spec) {
   const char *target;
-
-  *out = NULL;
-  if (!clpd_db_check_spec(spec, msg, n)) return CLPD_DB_ERROR;
-  db = xrealloc(NULL, sizeof *db);
-  memset(db, 0, sizeof *db);
   if (strncmp(spec, "sqlite:", 7) == 0) {
     db->ops = &clpd_db_sqlite_ops;
     target = spec + 7;
@@ -372,24 +365,88 @@ clpd_db_status clpd_db_open(const char *spec, clpd_db **out, char *msg,
     db->ops = &clpd_db_pg_ops;
     target = spec;
   }
-  st = db->ops->open(db, target);
+  return db->ops->open(db, target);
+}
+
+clpd_db_status clpd_db_open(const char *spec, clpd_db **out, char *msg,
+                            size_t n) {
+  clpd_db *db;
+  clpd_db_status st;
+
+  *out = NULL;
+  if (!clpd_db_check_spec(spec, msg, n)) return CLPD_DB_ERROR;
+  db = xrealloc(NULL, sizeof *db);
+  memset(db, 0, sizeof *db);
+  st = connect_spec(db, spec);
   if (st != CLPD_DB_OK) {
     copy_msg(msg, n, db->error[0] != '\0' ? db->error
                                           : "cannot open the database");
     free(db);
     return st == CLPD_DB_LOST ? CLPD_DB_LOST : CLPD_DB_ERROR;
   }
+  db->connected = 1;
   db->error[0] = '\0';
   copy_msg(msg, n, "");
   *out = db;
   return CLPD_DB_OK;
 }
 
+/* 1 when an atomic transaction is open and one of its statements failed:
+ * it is rolled back already (or its connection is gone). */
+static int doomed(const clpd_db *db) {
+  return db->in_tx && db->atomic && db->failed != CLPD_DB_OK;
+}
+
+static void end_tx(clpd_db *db) {
+  db->in_tx = 0;
+  db->atomic = 0;
+  db->failed = CLPD_DB_OK;
+  db->failed_error[0] = '\0';
+}
+
+/* Closes the backend connection, rolling back a transaction that is still
+ * open on it. */
+static void disconnect(clpd_db *db) {
+  if (!db->connected) return;
+  if (db->in_tx && !doomed(db)) db->ops->rollback(db);
+  db->ops->close(db);
+  db->connected = 0;
+  end_tx(db);
+}
+
 void clpd_db_close(clpd_db *db) {
   if (db == NULL) return;
-  if (db->in_tx) db->ops->rollback(db);
-  db->ops->close(db);
+  disconnect(db);
   free(db);
+}
+
+clpd_db_status clpd_db_reconnect(clpd_db *db, const char *spec, char *msg,
+                                 size_t n) {
+  clpd_db_status st;
+  disconnect(db);
+  db->error[0] = '\0';
+  if (!clpd_db_check_spec(spec, msg, n)) {
+    clpd_db_set_error(db, "not connected to the database");
+    return CLPD_DB_ERROR;
+  }
+  st = connect_spec(db, spec);
+  if (st != CLPD_DB_OK) {
+    copy_msg(msg, n, db->error[0] != '\0' ? db->error
+                                          : "cannot open the database");
+    clpd_db_set_error(db, "not connected to the database");
+    return st == CLPD_DB_LOST ? CLPD_DB_LOST : CLPD_DB_ERROR;
+  }
+  db->connected = 1;
+  db->error[0] = '\0';
+  copy_msg(msg, n, "");
+  return CLPD_DB_OK;
+}
+
+/* 1 (with the error set) when db has no connection (a failed reconnect). */
+static int not_connected(clpd_db *db) {
+  if (db->connected) return 0;
+  clpd_db_set_error(db, "not connected to the database");
+  return 1;
 }
 
 const char *clpd_db_backend(const clpd_db *db) { return db->ops->name; }
@@ -400,10 +457,28 @@ const char *clpd_db_error(const clpd_db *db) {
 
 int clpd_db_in_transaction(const clpd_db *db) { return db->in_tx; }
 
+int clpd_db_atomic_failed(const clpd_db *db) { return doomed(db); }
+
 static clpd_db_result *result_new(void) {
   clpd_db_result *r = xrealloc(NULL, sizeof *r);
   memset(r, 0, sizeof *r);
   return r;
+}
+
+/* The first failing statement of an atomic transaction: kept with its
+ * message, and the transaction is rolled back at once (SQLite keeps a
+ * transaction open after an error; on a lost connection there is nothing
+ * to roll back). */
+static void atomic_failure(clpd_db *db, clpd_db_status st) {
+  char saved[CLPD_DB_ERROR_MAX];
+  if (db->failed != CLPD_DB_OK) return;
+  db->failed = st;
+  memcpy(db->failed_error, db->error, sizeof db->failed_error);
+  if (st != CLPD_DB_LOST) {
+    memcpy(saved, db->error, sizeof saved);
+    db->ops->rollback(db);
+    memcpy(db->error, saved, sizeof saved);
+  }
 }
 
 clpd_db_status clpd_db_exec(clpd_db *db, const char *sql,
@@ -414,43 +489,69 @@ clpd_db_status clpd_db_exec(clpd_db *db, const char *sql,
 
   if (result != NULL) *result = NULL;
   db->error[0] = '\0';
+  if (not_connected(db)) return CLPD_DB_LOST;
+  if (doomed(db)) {
+    clpd_db_set_error(db, "the transaction was rolled back after an earlier "
+                          "error");
+    return CLPD_DB_ERROR;
+  }
   if (n > 0 && params == NULL) {
     clpd_db_set_error(db, "%lu parameters expected, none given",
                       (unsigned long)n);
-    return CLPD_DB_ERROR;
-  }
-  if (!check_sql(db, sql, n) || !check_params(db, params, n))
-    return CLPD_DB_ERROR;
-  r = result_new();
-  st = db->ops->exec(db, sql, params, n, r);
-  if (st == CLPD_DB_LOST) db->in_tx = 0;
-  if (st != CLPD_DB_OK || result == NULL) {
+    st = CLPD_DB_ERROR;
+  } else if (!check_sql(db, sql, n) || !check_params(db, params, n)) {
+    st = CLPD_DB_ERROR;
+  } else {
+    r = result_new();
+    st = db->ops->exec(db, sql, params, n, r);
+    if (st == CLPD_DB_OK && result != NULL) {
+      *result = r;
+      r = NULL;
+    }
     clpd_db_result_free(r);
-    return st;
   }
-  *result = r;
-  return CLPD_DB_OK;
+  if (st != CLPD_DB_OK && db->in_tx && db->atomic)
+    atomic_failure(db, st); /* stays open (doomed) until commit/rollback */
+  else if (st == CLPD_DB_LOST)
+    db->in_tx = 0;
+  return st;
 }
 
-clpd_db_status clpd_db_begin(clpd_db *db) {
+static clpd_db_status begin(clpd_db *db, int atomic) {
   clpd_db_status st;
   db->error[0] = '\0';
+  if (not_connected(db)) return CLPD_DB_LOST;
   if (db->in_tx) {
     clpd_db_set_error(db, "a transaction is already open");
     return CLPD_DB_ERROR;
   }
   st = db->ops->begin(db);
-  db->in_tx = st == CLPD_DB_OK;
+  end_tx(db);
+  if (st == CLPD_DB_OK) {
+    db->in_tx = 1;
+    db->atomic = atomic;
+  }
   return st;
 }
+
+clpd_db_status clpd_db_begin(clpd_db *db) { return begin(db, 0); }
+
+clpd_db_status clpd_db_begin_atomic(clpd_db *db) { return begin(db, 1); }
 
 clpd_db_status clpd_db_commit(clpd_db *db) {
   clpd_db_status st;
   char saved[CLPD_DB_ERROR_MAX];
   db->error[0] = '\0';
+  if (not_connected(db)) return CLPD_DB_LOST;
   if (!db->in_tx) {
     clpd_db_set_error(db, "no transaction is open");
     return CLPD_DB_ERROR;
+  }
+  if (doomed(db)) {
+    st = db->failed;
+    memcpy(db->error, db->failed_error, sizeof db->error);
+    end_tx(db);
+    return st;
   }
   st = db->ops->commit(db);
   if (st != CLPD_DB_OK && st != CLPD_DB_LOST) {
@@ -458,19 +559,20 @@ clpd_db_status clpd_db_commit(clpd_db *db) {
     db->ops->rollback(db); /* a failed commit ends the transaction */
     memcpy(db->error, saved, sizeof saved);
   }
-  db->in_tx = 0;
+  end_tx(db);
   return st;
 }
 
 clpd_db_status clpd_db_rollback(clpd_db *db) {
   clpd_db_status st;
   db->error[0] = '\0';
+  if (not_connected(db)) return CLPD_DB_LOST;
   if (!db->in_tx) {
     clpd_db_set_error(db, "no transaction is open");
     return CLPD_DB_ERROR;
   }
-  st = db->ops->rollback(db);
-  db->in_tx = 0;
+  st = doomed(db) ? CLPD_DB_OK : db->ops->rollback(db);
+  end_tx(db);
   return st;
 }
 

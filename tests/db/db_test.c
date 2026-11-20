@@ -334,6 +334,33 @@ static void test_sqlite_close_rolls_back(clpd_db **db, const char *spec) {
   if (*db != NULL) EXPECT(sq_count(*db, "SELECT count(*) FROM pgt") == 3);
 }
 
+/* A reconnect that fails leaves the handle without a connection (LOST on
+ * every call, the spec never shown) until a reconnect succeeds (T10a). */
+static void test_sqlite_reconnect(clpd_db *db, const char *dir,
+                                  const char *spec) {
+  char bad[128], msg[256];
+  snprintf(bad, sizeof bad, "sqlite:%s/nodir-secret/x.db", dir);
+  EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+  EXPECT(clpd_db_exec(db, "DELETE FROM pgt", NULL, 0, NULL) == CLPD_DB_OK);
+  EXPECT(clpd_db_reconnect(db, bad, msg, sizeof msg) == CLPD_DB_ERROR);
+  EXPECT(strcmp(msg, "cannot open the SQLite database: unable to open "
+                     "database file") == 0);
+  EXPECT(clpd_db_in_transaction(db) == 0);
+  EXPECT(clpd_db_exec(db, "SELECT 1", NULL, 0, NULL) == CLPD_DB_LOST);
+  EXPECT(strcmp(clpd_db_error(db), "not connected to the database") == 0);
+  EXPECT(clpd_db_begin(db) == CLPD_DB_LOST);
+  EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_LOST);
+  EXPECT(strcmp(clpd_db_error(db), "not connected to the database") == 0);
+  EXPECT(clpd_db_in_transaction(db) == 0);
+  EXPECT(clpd_db_commit(db) == CLPD_DB_LOST);
+  EXPECT(clpd_db_rollback(db) == CLPD_DB_LOST);
+  EXPECT(strcmp(clpd_db_backend(db), "sqlite") == 0);
+  EXPECT(clpd_db_reconnect(db, spec, msg, sizeof msg) == CLPD_DB_OK);
+  EXPECT(strcmp(msg, "") == 0);
+  /* The DELETE of the abandoned transaction was rolled back. */
+  EXPECT(sq_count(db, "SELECT count(*) FROM pgt") == 3);
+}
+
 /* Link seam (--wrap of malloc, calloc and realloc, this test binary only):
  * while set, every allocation from the linked objects fails (the compiler
  * may turn realloc(NULL, n) into malloc, or calloc with the memset). */
@@ -397,6 +424,69 @@ static void test_out_of_memory(const char *dir) {
   unlink(buf);
 }
 
+/* T10f: a lock another connection holds is CLPD_DB_TRANSIENT with SQLite's
+ * message "database is locked" (SQLITE_BUSY, after this connection's busy
+ * timeout, lowered here), for a write, a begin and a read; a missing table
+ * stays CLPD_DB_ERROR and a duplicate key CLPD_DB_UNIQUE on the same
+ * connection, which stays usable once the lock is gone. */
+static void test_sqlite_busy(const char *dir) {
+  char spec[96], msg[256], path[96];
+  clpd_db *holder = NULL, *db = NULL;
+  static const char *const suffixes[] = {"", "-journal", "-wal", "-shm"};
+  size_t i;
+  snprintf(spec, sizeof spec, "sqlite:%s/busy.db", dir);
+  EXPECT(clpd_db_open(spec, &holder, msg, sizeof msg) == CLPD_DB_OK);
+  EXPECT(clpd_db_open(spec, &db, msg, sizeof msg) == CLPD_DB_OK);
+  if (holder == NULL || db == NULL) {
+    clpd_db_close(holder);
+    clpd_db_close(db);
+    return;
+  }
+  EXPECT(clpd_db_exec(db, "PRAGMA busy_timeout = 50", NULL, 0, NULL) ==
+         CLPD_DB_OK);
+  EXPECT(clpd_db_exec(holder, "CREATE TABLE busy (id INTEGER PRIMARY KEY)",
+                      NULL, 0, NULL) == CLPD_DB_OK);
+  EXPECT(clpd_db_exec(holder, "INSERT INTO busy (id) VALUES (1)", NULL, 0,
+                      NULL) == CLPD_DB_OK);
+  /* The holder's write transaction (BEGIN IMMEDIATE) blocks writers. */
+  EXPECT(clpd_db_begin(holder) == CLPD_DB_OK);
+  EXPECT(clpd_db_exec(holder, "INSERT INTO busy (id) VALUES (2)", NULL, 0,
+                      NULL) == CLPD_DB_OK);
+  EXPECT(clpd_db_exec(db, "INSERT INTO busy (id) VALUES (3)", NULL, 0,
+                      NULL) == CLPD_DB_TRANSIENT);
+  EXPECT(strcmp(clpd_db_error(db), "database is locked") == 0);
+  EXPECT(clpd_db_begin(db) == CLPD_DB_TRANSIENT);
+  EXPECT(strcmp(clpd_db_error(db), "database is locked") == 0);
+  EXPECT(clpd_db_in_transaction(db) == 0);
+  EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_TRANSIENT);
+  EXPECT(clpd_db_in_transaction(db) == 0);
+  /* Other failures keep their status meanwhile. */
+  EXPECT(clpd_db_exec(db, "SELECT x FROM busy_missing", NULL, 0, NULL) ==
+         CLPD_DB_ERROR);
+  EXPECT(strcmp(clpd_db_error(db), "no such table: busy_missing") == 0);
+  EXPECT(sq_count(db, "SELECT count(*) FROM busy") == 1);
+  EXPECT(clpd_db_commit(holder) == CLPD_DB_OK);
+  EXPECT(clpd_db_exec(db, "INSERT INTO busy (id) VALUES (1)", NULL, 0,
+                      NULL) == CLPD_DB_UNIQUE);
+  /* An exclusive lock kept after a write blocks readers too. */
+  EXPECT(clpd_db_exec(holder, "PRAGMA locking_mode = EXCLUSIVE", NULL, 0,
+                      NULL) == CLPD_DB_OK);
+  EXPECT(clpd_db_exec(holder, "INSERT INTO busy (id) VALUES (4)", NULL, 0,
+                      NULL) == CLPD_DB_OK);
+  EXPECT(clpd_db_exec(db, "SELECT count(*) FROM busy", NULL, 0, NULL) ==
+         CLPD_DB_TRANSIENT);
+  EXPECT(strcmp(clpd_db_error(db), "database is locked") == 0);
+  clpd_db_close(holder);
+  EXPECT(sq_count(db, "SELECT count(*) FROM busy") == 3);
+  EXPECT(clpd_db_exec(db, "INSERT INTO busy (id) VALUES (3)", NULL, 0,
+                      NULL) == CLPD_DB_OK);
+  clpd_db_close(db);
+  for (i = 0; i < sizeof suffixes / sizeof suffixes[0]; i++) {
+    snprintf(path, sizeof path, "%s/busy.db%s", dir, suffixes[i]);
+    unlink(path);
+  }
+}
+
 static void test_sqlite(void) {
   char dir[] = "/tmp/clpd_db_test.XXXXXX", file[64], spec[80], extra[80];
   static const char *const suffixes[] = {"", "-journal", "-wal", "-shm"};
@@ -411,6 +501,7 @@ static void test_sqlite(void) {
   }
   test_out_of_memory(dir);
   test_sqlite_open_failures(dir);
+  test_sqlite_busy(dir);
   snprintf(file, sizeof file, "%s/extra.db", dir);
   snprintf(spec, sizeof spec, "sqlite:%s", file);
   EXPECT(clpd_db_open(spec, &db, msg, sizeof msg) == CLPD_DB_OK);
@@ -420,6 +511,7 @@ static void test_sqlite(void) {
     test_sqlite_pg_types(db);
     test_sqlite_placeholders(db);
     test_sqlite_affected(db);
+    test_sqlite_reconnect(db, dir, spec);
     test_sqlite_close_rolls_back(&db, spec);
   }
   clpd_db_close(db);
