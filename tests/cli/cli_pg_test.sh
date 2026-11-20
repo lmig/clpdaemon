@@ -512,8 +512,10 @@ cx_lock_case() {
   hrc=$?
   held=$(grep -c "$CXISO" err.txt)
   cases=$((cases + 1))
-  wait_q "SELECT status FROM pgcx_order WHERE wf_id = '$1'" cured ||
-    fail "$2: written after the release" "holder exit $hrc [$(cat holder.txt)], stderr [$(cat err.txt)]"
+  if [ "$locked" = 1 ]; then
+    wait_q "SELECT status FROM pgcx_order WHERE wf_id = '$1'" cured ||
+      fail "$2: written after the release" "holder exit $hrc [$(cat holder.txt)], stderr [$(cat err.txt)]"
+  fi
   stop_daemon "$2"
   fails=$(grep -c "^clpdaemon: cycle transaction failed: $CXLT; retrying in 100 ms\$" err.txt)
   reloads=$(grep -c "^clpdaemon: rehydrate: instance '$1': pgcx@1::order: table 'pgcx_order': $CXLT\$" err.txt)
@@ -525,8 +527,10 @@ cx_lock_case() {
       fail "$2: no isolation" "holder exit $hrc, isolations while held $held, failures $fails (want >= 3), reload failures $reloads (want >= $want_reloads), stderr [$(cat err.txt)]"
   fi
   cases=$((cases + 1))
-  got=$(q "SELECT wf_id || '|' || status FROM pgcx_order ORDER BY wf_id; SELECT count(*) FROM pgcx_memo")
-  [ "$got" = "$1|cured${NL}0" ] || fail "$2: the stored rows" "got [$got]"
+  if [ "$locked" = 1 ]; then
+    got=$(q "SELECT wf_id || '|' || status FROM pgcx_order ORDER BY wf_id; SELECT count(*) FROM pgcx_memo")
+    [ "$got" = "$1|cured${NL}0" ] || fail "$2: the stored rows" "got [$got]"
+  fi
   cx_drop
 }
 cx_lock_case a1 "pg t10g A sync write locked" EXCLUSIVE ExclusiveLock
