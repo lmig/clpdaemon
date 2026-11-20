@@ -2386,5 +2386,121 @@ else
   echo "cli_test.sh: sqlite3 not found; the T10f case is skipped" >&2
 fi
 
+# SD (T10g, the T10f verifier's probe): UNIQUE, a busy reload, UNIQUE. The
+# stored row of d1 is dup and its memo row exists; the go fact's rule fails
+# with UNIQUE (strike 1). Another connection then holds an EXCLUSIVE lock,
+# taken before the reload 1 s later and held for 7 s: the reload waits the
+# 5 s busy timeout and fails with "database is locked" (transient, neither
+# counts nor resets); the next one gets the database, the reloaded dup row's
+# rule fails with UNIQUE again (strike 2) and, with instance_isolate_after =
+# 2, d1 is isolated only then; d2 is written. Only lines starting with
+# "clpdaemon: sync: instance '" are isolations.
+if command -v sqlite3 >/dev/null 2>&1; then
+  mkdir sdpkg
+  conf sdpkg/package.conf 'definition = sd
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order'
+  conf sdpkg/a.clp '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id) (slot text))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order) (db-create-table memo))
+(defrule kickdup (go (wf-id ?w)) ?o <- (order (wf-id ?w)) => (modify ?o (status kicked)) (db-insert memo wf-id ?w text "x"))
+(defrule dup ?o <- (order (wf-id ?w) (status dup)) => (modify ?o (status dupdone)) (db-insert memo wf-id ?w text "x"))'
+  conf sdpkg/orm.conf 'order.table = sd_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+memo.table = sd_memo
+memo.owned = yes
+memo.sync = manual
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.text = body text string nil'
+  rconf sd.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 1000
+cycle_retry_max_ms = 1000
+instance_isolate_after = 2
+database = sqlite:$WORK/sd.db
+packages = sdpkg"
+  cases=$((cases + 1))
+  start sd.conf admin.sock
+  wait_status admin.sock ' cycles=1 ' || ok=0
+  acase "sd: inject d1" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"d1"},"status":{"sym":"new"}}}\n'
+  wait_status admin.sock ' cycles=2 ' || ok=0
+  sqlite3 sd.db "UPDATE sd_order SET status = 'dup' WHERE wf_id = 'd1'; INSERT INTO sd_memo VALUES ('d1', 'x')"
+  acase "sd: inject a go" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"d1"}}}\n'
+  SDMSG='UNIQUE constraint failed: sd_memo.wf_id'
+  SDFAIL="clpdaemon: cycle transaction failed: $SDMSG; retrying in 1000 ms"
+  wait_line err.txt "$SDFAIL" || ok=0
+  printf '%s\n' '.timeout 5000' 'BEGIN EXCLUSIVE;' '.shell touch sdlocked' \
+    '.shell sleep 7' 'COMMIT;' | sqlite3 sd.db >sdholder.txt 2>&1 &
+  hpid=$!
+  n=0
+  while [ ! -e sdlocked ]; do
+    n=$((n + 1))
+    [ "$n" -gt 40 ] && break
+    sleep 0.05
+  done
+  # Taken in time: the first failure is still the only one.
+  if [ ! -e sdlocked ] || [ "$(grep -c '^clpdaemon: cycle transaction failed: ' err.txt)" != 1 ]; then
+    sdlock=late
+  else
+    sdlock=ok
+  fi
+  wait "$hpid"
+  hrc=$?
+  held=$(grep -c "^clpdaemon: sync: instance '" err.txt)
+  SDISO="clpdaemon: sync: instance 'd1' is no longer synchronized: $SDMSG (2 rolled-back cycles in a row)"
+  wait_line err.txt "$SDISO" || ok=0
+  acase "sd: inject d2" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"d2"},"status":{"sym":"new"}}}\n'
+  n=0
+  while [ "$(sqlite3 sd.db "SELECT status FROM sd_order WHERE wf_id = 'd2'" 2>/dev/null)" != new ]; do
+    n=$((n + 1))
+    [ "$n" -gt 100 ] && { ok=0; break; }
+    sleep 0.05
+  done
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  SDRH="clpdaemon: rehydrate: instance 'd1': sd@1::order: table 'sd_order': database is locked"
+  k=$(grep -cxF "$SDRH" err.txt)
+  want="clpdaemon: n1: running
+clpdaemon: db-insert: template 'memo': table 'sd_memo': $SDMSG
+[PRCCODE4] Execution halted during the actions of defrule 'kickdup'.
+$SDFAIL"
+  i=0
+  while [ "$i" -lt "$k" ]; do
+    want="$want
+$SDRH
+clpdaemon: cycle transaction failed: database is locked; retrying in 1000 ms"
+    i=$((i + 1))
+  done
+  want="$want
+clpdaemon: db-insert: template 'memo': table 'sd_memo': $SDMSG
+[PRCCODE4] Execution halted during the actions of defrule 'dup'.
+$SDFAIL
+$SDISO
+clpdaemon: rehydrate: instance 'd1' is not reloaded: it is no longer synchronized
+clpdaemon: received SIGTERM, stopping"
+  if [ "$sdlock" != ok ] || [ "$k" -lt 1 ]; then
+    fail "sd: the lock" "not taken before the reload (lock file $sdlock, busy reloads $k), stderr [$(cat err.txt)]"
+  elif [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$hrc" != 0 ] || [ "$held" != 0 ] || [ -s out.txt ] ||
+    [ "$(cat err.txt)" != "$want" ] || [ "$(grep -c "^clpdaemon: sync: instance '" err.txt)" != 1 ]; then
+    fail "sd: isolated after the second UNIQUE only" "exit $rc, lines seen $ok, holder exit $hrc [$(cat sdholder.txt)], isolations while held $held, busy reloads $k, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+  cases=$((cases + 1))
+  got=$(sqlite3 sd.db "SELECT wf_id || '|' || status FROM sd_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM sd_memo" 2>&1)
+  want='d1|dup
+d2|new
+d1|x'
+  [ "$got" = "$want" ] || fail "sd: the stored rows" "got [$got], want [$want]"
+else
+  echo "cli_test.sh: sqlite3 not found; the T10g SD case is skipped" >&2
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

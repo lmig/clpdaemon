@@ -21,6 +21,10 @@
 # written once the lock is released; a rule statement whose connection is
 # lost (its backend terminated while it waits) with instance_isolate_after
 # = 1 isolates nothing either.
+# T10g: a lock on an auto-sync table (A) and on the table a reload reads
+# (B) isolates nothing and the row is written after the release; UNIQUE,
+# lock timeout, lock timeout, UNIQUE isolates only after the second
+# UNIQUE (D).
 set -u
 
 U='usage: cli_pg_test.sh <clpdaemon> <admin-client> <conninfo> <password>'
@@ -411,6 +415,157 @@ packages = ${tf}pkg" >"$tf.conf"
 }
 pg_tf tft "pg t10f lock timeout" timeout
 pg_tf tfl "pg t10f lost rule statement" lost
+
+# T10g (the T10f verifier's probes): transient contention on the other
+# paths, with lock_timeout = 100 ms through options and
+# instance_isolate_after = 2. Only lines starting with
+# "clpdaemon: sync: instance '" are isolations (the rehydrate line of an
+# isolated instance also says "no longer synchronized").
+# A: an EXCLUSIVE lock on the auto-sync table: every sync write fails with
+# 55P03, no isolation while it is held, the row is written after release.
+# B: an ACCESS EXCLUSIVE lock: the reload SELECT fails too and is retried,
+# no isolation, the row is written after release.
+# D: UNIQUE, 55P03, 55P03, UNIQUE: the transient failures neither count
+# nor reset, so the second UNIQUE isolates (2 rolled-back cycles in a
+# row) and the other instance is written.
+mkdir cxpkg
+printf '%s\n' 'definition = pgcx
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order' >cxpkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id) (slot text))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order) (db-create-table memo))
+(defrule touch (go (wf-id ?w) (act touch)) ?o <- (order (wf-id ?w)) => (modify ?o (status touched)))
+(defrule kickdup (go (wf-id ?w) (act dup)) ?o <- (order (wf-id ?w)) => (modify ?o (status kicked)) (db-insert memo wf-id ?w text "x"))
+(defrule poison ?o <- (order (wf-id ?w) (status poison)) => (modify ?o (status cured)))
+(defrule dup ?o <- (order (wf-id ?w) (status dup)) => (modify ?o (status dupdone)) (db-insert memo wf-id ?w text "x"))' >cxpkg/a.clp
+printf '%s\n' 'order.table = pgcx_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+memo.table = pgcx_memo
+memo.owned = yes
+memo.sync = manual
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.text = body text string nil' >cxpkg/orm.conf
+CXLT='canceling statement due to lock timeout (SQLSTATE 55P03)'
+CXISO="^clpdaemon: sync: instance '"
+cx_drop() {
+  q 'DROP TABLE IF EXISTS pgcx_order' >/dev/null
+  q 'DROP TABLE IF EXISTS pgcx_memo' >/dev/null
+  q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+}
+# cx_start <name> <retry ms>: a daemon on cxpkg, its tables created.
+cx_start() {
+  printf '%s\n' "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = $2
+cycle_retry_max_ms = $2
+instance_isolate_after = 2
+admin_socket = $WORK/admin.sock
+database = $CONNINFO options='-c lock_timeout=100'
+packages = cxpkg" >cx.conf
+  cx_drop
+  : >inject.txt
+  "$BIN" --config cx.conf >out.txt 2>err.txt &
+  pid=$!
+  cases=$((cases + 1))
+  wait_q "SELECT count(*) FROM information_schema.tables WHERE table_name = 'pgcx_memo'" 1 ||
+    fail "$1: the tables" "stderr [$(cat err.txt)]"
+}
+# cx_inject <json>
+cx_inject() { "$ADMIN" admin.sock "inject $1\\n" >>inject.txt 2>&1; }
+# cx_seed <name> <wf-id>: an order row with status new.
+cx_seed() {
+  cx_inject "{\"template\":\"order\",\"slots\":{\"wf-id\":{\"sym\":\"$2\"},\"status\":{\"sym\":\"new\"}}}"
+  wait_q "SELECT status FROM pgcx_order WHERE wf_id = '$2'" new ||
+    fail "$1: $2 written" "stderr [$(cat err.txt)]"
+}
+# cx_hold <name> <table> <mode> <seconds> <pg_locks mode>: another session
+# holds the lock (hpid); returns 1 when it is not granted within 10 s.
+cx_hold() {
+  "$PSQL" -X -q -A -t -v ON_ERROR_STOP=1 -d "$CONNINFO application_name=clpd_holder" \
+    -c 'BEGIN' -c "LOCK TABLE $2 IN $3 MODE" -c "SELECT pg_sleep($4)" -c 'COMMIT' >holder.txt 2>&1 &
+  hpid=$!
+  cases=$((cases + 1))
+  wait_q "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation WHERE c.relname = '$2' AND l.mode = '$5' AND l.granted" 1 && return 0
+  fail "$1: the lock" "$3 on $2 not granted within 10 s, holder [$(cat holder.txt)]"
+  return 1
+}
+# cx_lock_case <tag> <name> <mode> <pg_locks mode>: cases A and B.
+cx_lock_case() {
+  cx_start "$2" 100
+  cx_seed "$2" "$1"
+  q "UPDATE pgcx_order SET status = 'poison' WHERE wf_id = '$1'" >/dev/null
+  cx_hold "$2" pgcx_order "$3" 1.5 "$4"
+  cx_inject "{\"template\":\"go\",\"slots\":{\"wf-id\":{\"sym\":\"$1\"},\"act\":{\"sym\":\"touch\"}}}"
+  wait "$hpid"
+  hrc=$?
+  held=$(grep -c "$CXISO" err.txt)
+  cases=$((cases + 1))
+  wait_q "SELECT status FROM pgcx_order WHERE wf_id = '$1'" cured ||
+    fail "$2: written after the release" "holder exit $hrc [$(cat holder.txt)], stderr [$(cat err.txt)]"
+  stop_daemon "$2"
+  fails=$(grep -c "^clpdaemon: cycle transaction failed: $CXLT; retrying in 100 ms\$" err.txt)
+  reloads=$(grep -c "^clpdaemon: rehydrate: instance '$1': pgcx@1::order: table 'pgcx_order': $CXLT\$" err.txt)
+  if [ "$1" = b1 ]; then want_reloads=2; else want_reloads=0; fi
+  cases=$((cases + 1))
+  [ "$hrc" = 0 ] && [ "$held" = 0 ] && [ "$fails" -ge 3 ] && [ "$reloads" -ge "$want_reloads" ] &&
+    [ "$(grep -c "$CXISO" err.txt)" = 0 ] && ! grep -q 'is not reloaded' err.txt ||
+    fail "$2: no isolation" "holder exit $hrc, isolations while held $held, failures $fails (want >= 3), reload failures $reloads (want >= $want_reloads), stderr [$(cat err.txt)]"
+  cases=$((cases + 1))
+  got=$(q "SELECT wf_id || '|' || status FROM pgcx_order ORDER BY wf_id; SELECT count(*) FROM pgcx_memo")
+  [ "$got" = "$1|cured${NL}0" ] || fail "$2: the stored rows" "got [$got]"
+  cx_drop
+}
+cx_lock_case a1 "pg t10g A sync write locked" EXCLUSIVE ExclusiveLock
+cx_lock_case b1 "pg t10g B reload locked" 'ACCESS EXCLUSIVE' AccessExclusiveLock
+
+# D: the stored row of d1 is dup and its memo row exists; the go fact's
+# rule fails with UNIQUE (strike 1), then the lock on pgcx_memo, taken
+# before the retry 1 s later and held for 3 s, makes the reloaded rule's
+# db-insert fail twice with 55P03; after the release it fails with UNIQUE
+# again (strike 2) and d1 is isolated.
+D='pg t10g D unique, lock, unique'
+CXDUP='duplicate key value violates unique constraint "pgcx_memo_pkey" (SQLSTATE 23505)'
+CXDISO="clpdaemon: sync: instance 'd1' is no longer synchronized: $CXDUP (2 rolled-back cycles in a row)"
+cx_start "$D" 1000
+cx_seed "$D" d1
+q "INSERT INTO pgcx_memo VALUES ('d1', 'x'); UPDATE pgcx_order SET status = 'dup' WHERE wf_id = 'd1'" >/dev/null
+cx_inject '{"template":"go","slots":{"wf-id":{"sym":"d1"},"act":{"sym":"dup"}}}'
+cases=$((cases + 1))
+wait_has err.txt "clpdaemon: cycle transaction failed: $CXDUP; retrying in 1000 ms" ||
+  fail "$D: the first UNIQUE" "stderr [$(cat err.txt)]"
+if cx_hold "$D" pgcx_memo EXCLUSIVE 3 ExclusiveLock &&
+  [ "$(grep -c '^clpdaemon: cycle transaction failed: ' err.txt)" != 1 ]; then
+  fail "$D: the lock" "not taken before the first retry, stderr [$(cat err.txt)]"
+fi
+wait "$hpid"
+hrc=$?
+held=$(grep -c "$CXISO" err.txt)
+cases=$((cases + 1))
+wait_has err.txt "$CXDISO" || fail "$D: d1 isolated" "stderr [$(cat err.txt)]"
+cx_seed "$D" d2
+stop_daemon "$D"
+u=$(grep -c "^clpdaemon: cycle transaction failed: $CXDUP; retrying in 1000 ms\$" err.txt)
+t=$(grep -c "^clpdaemon: cycle transaction failed: $CXLT; retrying in 1000 ms\$" err.txt)
+# The order of the failure and isolation lines.
+seq=$(grep -e '^clpdaemon: cycle transaction failed: ' -e "$CXISO" err.txt |
+  sed -e "s/.*$CXLT.*/T/" -e 's/.*(SQLSTATE 23505); retrying.*/U/' -e "s/^clpdaemon: sync: instance .*/I/" | uniq | tr -d '\n')
+cases=$((cases + 1))
+[ "$hrc" = 0 ] && [ "$held" = 0 ] && [ "$u" = 2 ] && [ "$t" -ge 2 ] && [ "$seq" = UTUI ] &&
+  [ "$(grep -c "$CXISO" err.txt)" = 1 ] && grep -qxF "$CXDISO" err.txt ||
+  fail "$D: isolated after the second UNIQUE only" "holder exit $hrc, isolations while held $held, unique $u (want 2), lock timeouts $t (want >= 2), order [$seq] (want UTUI), stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+got=$(q "SELECT wf_id || '|' || status FROM pgcx_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM pgcx_memo")
+[ "$got" = "d1|dup${NL}d2|new${NL}d1|x" ] || fail "$D: the stored rows" "got [$got]"
+cx_drop
 
 # T10b against an audit trigger on a table that is not owned, created
 # beforehand: one U for two modifies, nothing for a modify back to the

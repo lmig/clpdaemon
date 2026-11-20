@@ -55,12 +55,13 @@ static clpd_db_status run(clpd_db *db, const char *sql) {
 }
 
 /* Runs a one-row, one-column query and returns its value (copied into *out);
- * 0 on failure. */
+ * 0 on failure, with *out a NULL value (never left uninitialized). */
 static int scalar(clpd_db *db, const char *sql, const clpd_db_value *params,
                   size_t n, clpd_db_value *out, char *text, size_t text_size) {
   clpd_db_result *r = NULL;
   const clpd_db_value *v;
   int ok = 0;
+  memset(out, 0, sizeof *out);
   if (clpd_db_exec(db, sql, params, n, &r) == CLPD_DB_OK &&
       clpd_db_result_rows(r) == 1 && clpd_db_result_columns(r) == 1) {
     v = clpd_db_result_value(r, 0, 0);
@@ -402,6 +403,47 @@ static void case_lock_timeout(void) {
   clpd_db_close(holder);
 }
 
+/* T10g: in an atomic transaction an INSERT that waits on a table another
+ * connection has locked fails with CLPD_DB_TRANSIENT after lock_timeout,
+ * and commit returns CLPD_DB_TRANSIENT with that message; nothing is
+ * written. */
+static void case_atomic_lock_timeout(void) {
+  char spec[1024], first[512];
+  clpd_db *holder = open_db(conninfo), *db;
+  clpd_db_value v;
+  EXPECT(holder != NULL);
+  if (holder == NULL) return;
+  EXPECT(run(holder, "CREATE TABLE pg_lock_ins (id BIGINT PRIMARY KEY)") ==
+         CLPD_DB_OK);
+  EXPECT(clpd_db_begin(holder) == CLPD_DB_OK);
+  EXPECT(run(holder, "LOCK TABLE pg_lock_ins IN ACCESS EXCLUSIVE MODE") ==
+         CLPD_DB_OK);
+  snprintf(spec, sizeof spec, "%s options='-c lock_timeout=200ms'", conninfo);
+  db = open_db(spec);
+  EXPECT(db != NULL);
+  if (db != NULL) {
+    EXPECT(clpd_db_begin_atomic(db) == CLPD_DB_OK);
+    EXPECT(run(db, "INSERT INTO pg_lock_ins (id) VALUES (5)") ==
+           CLPD_DB_TRANSIENT);
+    snprintf(first, sizeof first, "%s", clpd_db_error(db));
+    EXPECT(strcmp(first, "canceling statement due to lock timeout "
+                         "(SQLSTATE 55P03)") == 0);
+    EXPECT(clpd_db_atomic_failed(db) == 1);
+    EXPECT(clpd_db_commit(db) == CLPD_DB_TRANSIENT);
+    EXPECT(strcmp(clpd_db_error(db), first) == 0);
+    EXPECT(clpd_db_in_transaction(db) == 0);
+  }
+  EXPECT(clpd_db_rollback(holder) == CLPD_DB_OK);
+  if (db != NULL) {
+    EXPECT(scalar(db, "SELECT count(*) FROM pg_lock_ins", NULL, 0, &v, NULL,
+                  0));
+    EXPECT(v.type == CLPD_DB_INTEGER && v.integer == 0);
+  }
+  clpd_db_close(db);
+  EXPECT(run(holder, "DROP TABLE pg_lock_ins") == CLPD_DB_OK);
+  clpd_db_close(holder);
+}
+
 /* A statement over statement_timeout is CLPD_DB_TRANSIENT (57014, T10f);
  * the connection stays usable. */
 static void case_statement_timeout(void) {
@@ -578,8 +620,9 @@ static void test_aborted_commit(void) {
 /* T10f: the status of a server error by its SQLSTATE, raised on demand by
  * a PL/pgSQL function. Contention (40001 serialization failure, 40P01
  * deadlock, 55P03 lock not available, 57014 query canceled) is
- * CLPD_DB_TRANSIENT, 23505 stays CLPD_DB_UNIQUE and anything else (42P01)
- * CLPD_DB_ERROR; the message is the usual "<primary> (SQLSTATE <code>)".
+ * CLPD_DB_TRANSIENT, 23505 stays CLPD_DB_UNIQUE and anything else (42P01,
+ * and the neighbours of the transient codes: 40000, 40002, 55P02, 57P01,
+ * 23503, T10g) CLPD_DB_ERROR; the message is the usual "<primary> (SQLSTATE <code>)".
  * In an atomic transaction a transient failure rolls back like any other
  * and commit returns it with its message. */
 static void test_transient_codes(void) {
@@ -590,6 +633,9 @@ static void test_transient_codes(void) {
       {"40001", CLPD_DB_TRANSIENT}, {"40P01", CLPD_DB_TRANSIENT},
       {"55P03", CLPD_DB_TRANSIENT}, {"57014", CLPD_DB_TRANSIENT},
       {"23505", CLPD_DB_UNIQUE},    {"42P01", CLPD_DB_ERROR},
+      {"40000", CLPD_DB_ERROR},     {"40002", CLPD_DB_ERROR},
+      {"55P02", CLPD_DB_ERROR},     {"57P01", CLPD_DB_ERROR},
+      {"23503", CLPD_DB_ERROR},
   };
   clpd_db *db = open_db(conninfo);
   clpd_db_value p, v;
@@ -775,6 +821,7 @@ int main(int argc, char **argv) {
   test_out_of_memory();
   test_session_timeouts();
   bounded("lock_timeout", case_lock_timeout, 25);
+  bounded("atomic lock_timeout", case_atomic_lock_timeout, 10);
   bounded("statement_timeout", case_statement_timeout, 10);
   test_connect_timeout();
   suite = clpd_db_suite(conninfo);
