@@ -776,6 +776,22 @@ static void test_update_errors(void) {
   EXPECT(fails_in("shop@1", "(db-update item (create$) qty 1)",
                   UPDATE_ITEM_PREFIX ": the filters must name wf-id or a key "
                   "slot"));
+  /* The documented order (T10e, R3-check-order-update): both lists are
+   * read first, the slot values after the filters, then the filter rule,
+   * then no slot to set. */
+  EXPECT(fails_in("shop@1", "(db-update item (create$) qty 1 qty 2)",
+                  UPDATE_ITEM_PREFIX ": slot 'qty' is given twice"));
+  EXPECT(fails_in("shop@1", "(db-update item (create$) colour 1)",
+                  UPDATE_ITEM_PREFIX ": slot 'colour' is not mapped"));
+  EXPECT(fails_in("shop@1", "(db-update item (create$) n 5)",
+                  UPDATE_ITEM_PREFIX ": slot 'n' is a key slot, which "
+                  "db-update never changes"));
+  EXPECT(fails_in("shop@1", "(db-update item (create$))",
+                  UPDATE_ITEM_PREFIX ": the filters must name wf-id or a key "
+                  "slot"));
+  EXPECT(fails_in("shop@1", "(db-update item (create$ colour w1) qty 1 qty "
+                            "2)",
+                  UPDATE_ITEM_PREFIX ": filter slot 'colour' is not mapped"));
   EXPECT(fails_in("shop@1", "(db-update item (create$ qty 6) qty 1)",
                   UPDATE_ITEM_PREFIX ": filter slot 'qty' is not a key slot"));
   EXPECT(fails_in("shop@1", "(db-update item (create$ wf-id w1 n) qty 1)",

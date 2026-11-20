@@ -19,6 +19,7 @@
 #define CLPD_DEFAULT_ADMIN_SOCKET_MODE 0600
 #define CLPD_DEFAULT_CYCLE_RETRY_INITIAL_MS 100
 #define CLPD_DEFAULT_CYCLE_RETRY_MAX_MS 30000
+#define CLPD_DEFAULT_INSTANCE_ISOLATE_AFTER 3
 
 typedef struct {
   char node_id[CLPD_NODE_ID_MAX + 1];
@@ -39,6 +40,10 @@ typedef struct {
    * on each failure up to the maximum; initial <= max. */
   int cycle_retry_initial_ms;
   int cycle_retry_max_ms;
+  /* Poison retry (T10e): rolled-back cycles in a row attributed to one
+   * instance (the wf-id of the rule whose statement failed first) after
+   * which it is isolated; positive. */
+  int instance_isolate_after;
   clpd_list packages;
   clpd_list plugins;
 } clpd_config;

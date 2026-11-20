@@ -104,7 +104,10 @@ static const char *shop_clp =
     "  (slot req) (slot price (type FLOAT) (default 1.5)))\n"
     "(deffacts seed (order (wf-id w0) (line-no 1) (status new)))\n"
     "(defrule fail (go (wf-id ?w) (act fail)) =>\n"
-    "  (assert (order (wf-id ?w) (line-no 99))) (db-nextval missing_no))\n";
+    "  (assert (order (wf-id ?w) (line-no 99))) (db-nextval missing_no))\n"
+    "(defrule poison ?o <- (order (wf-id ?w) (status poison)) =>\n"
+    "  (modify ?o (status cured)) (db-nextval missing_no))\n"
+    "(defrule anon (go (wf-id ?w) (act anon)) => (db-nextval missing_no))\n";
 static const char *shop_orm =
     "order.table = shop_order\n"
     "order.owned = yes\n"
@@ -1383,6 +1386,91 @@ static void test_rehydrate_failures(void) {
   sql("DELETE FROM shop_order WHERE wf_id IN ('r4', 'r6')");
 }
 
+/* The poison retry (T10e, A1): a rolled-back cycle whose first failure is
+ * a statement of a rule counts for the rule's instance (the wf-id of its
+ * first basis fact that has one); after instance_isolate_after such
+ * cycles in a row (no commit between them) the instance is isolated like
+ * a failed write: its facts retracted, not reloaded, never written; the
+ * retry then commits the other instances. Here a stored row that a rule
+ * always fails on (status poison) comes back with every reload. A commit
+ * resets the counts; a failure of a rule without a wf-id counts for no
+ * instance. */
+static void test_poison_retry(void) {
+  char log[4096], want[4096], got[8192], line[1024], reason[1024];
+  const char *missing =
+      pg ? "relation \"public.shop_missing_seq\" does not exist (SQLSTATE "
+           "42P01)"
+         : "no such table: clpd_sequence";
+  int k;
+  /* The failure lines; the wait doubles from 100 ms while no cycle
+   * commits. */
+#define POISON_LINE(ms)                                                     \
+  snprintf(line, sizeof line,                                              \
+           "clpdaemon: db-nextval: sequence alias 'missing_no': sequence "  \
+           "'shop_missing_seq': %s\n"                                       \
+           "clpdaemon: cycle transaction failed: %s; retrying in %d ms\n",  \
+           missing, missing, (ms))
+  POISON_LINE(100);
+  snprintf(reason, sizeof reason, "%s (3 rolled-back cycles in a row)",
+           missing);
+  sql("INSERT INTO shop_order (wf_id, line_no, status) VALUES ('p1', 1, "
+      "'poison')");
+  /* A change of p2 made before the cycles: they never touch it. */
+  act(SHOP, "(assert (order (wf-id p2) (line-no 1)))");
+  EXPECT(cycle("(assert (go (wf-id p1) (act fail)))", log, sizeof log) == 1);
+  EXPECT(same("poison: first failure", log, line));
+  for (k = 2; k <= 3; k++) {
+    begin_cycle();
+    EXPECT(end_cycle(log, sizeof log) == 1);
+    POISON_LINE(k == 2 ? 200 : 400);
+    snprintf(want, sizeof want, "%s", line);
+    if (k == 3) {
+      isolated(want, sizeof want, "p1", reason);
+      not_reloaded(want, sizeof want, "p1");
+    }
+    EXPECT(same(k == 2 ? "poison: second failure" : "poison: isolated", log,
+                want));
+  }
+  facts_of("p1", got, sizeof got);
+  EXPECT(same("poison: evicted", got, ""));
+  EXPECT(cycle(NULL, log, sizeof log) == 0);
+  EXPECT(same("poison: the retry log", log, ""));
+  EXPECT(same("poison: the retry writes p2", stmts,
+              expect_sql(INS_ORDER INSTANCE)));
+  query("SELECT wf_id, status FROM shop_order WHERE wf_id IN ('p1', 'p2') "
+        "ORDER BY 1",
+        got, sizeof got);
+  EXPECT(same("poison: rows", got, "'p1' 'poison'; 'p2' 'nil'"));
+  /* Isolated: its later facts are not written. */
+  EXPECT(cycle("(assert (order (wf-id p1) (line-no 2)))", log, sizeof log) ==
+         0);
+  EXPECT(same("poison: p1 not written", stmts, ""));
+  forget("p1");
+  forget("p2");
+
+  /* A commit between two failures resets the count. */
+  POISON_LINE(100);
+#undef POISON_LINE
+  clpd_orm_sync_set_isolate_after(syncer, 2);
+  for (k = 0; k < 2; k++) {
+    EXPECT(cycle("(assert (go (wf-id p3) (act fail)))", log, sizeof log) ==
+           1);
+    EXPECT(same("poison: reset by a commit", log, line));
+    EXPECT(cycle(NULL, log, sizeof log) == 0);
+    EXPECT(same("poison: committed", log, ""));
+  }
+  /* A rule whose basis has no wf-id (the slot left nil): the failure
+   * counts for nobody. */
+  clpd_orm_sync_set_isolate_after(syncer, 1);
+  EXPECT(cycle("(assert (go (act anon)))", log, sizeof log) == 1);
+  EXPECT(same("poison: unattributed", log, line));
+  EXPECT(cycle(NULL, log, sizeof log) == 0);
+  EXPECT(same("poison: unattributed retry", log, ""));
+  clpd_orm_sync_set_isolate_after(syncer, 3);
+  EXPECT(cycle(NULL, log, sizeof log) == 0);
+  sql("DELETE FROM shop_order WHERE wf_id IN ('p1', 'p2')");
+}
+
 /* An existing workflow_instance row keeps its definition, version, status
  * and created_at; only updated_at changes. */
 static void test_existing_instance(void) {
@@ -1457,6 +1545,7 @@ int main(int argc, char **argv) {
   test_int4_overflow();
   test_failed_flush();
   test_rule_failure();
+  test_poison_retry();
   test_load();
   test_rehydrate();
   test_rehydrate_ingest();

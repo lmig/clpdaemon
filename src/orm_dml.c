@@ -380,8 +380,10 @@ static void update(Environment *env, UDFContext *ctx, UDFValue *ret) {
     call_free(&c);
     return;
   }
-  if (!read_filters(&c, LIST_KEY_FILTERS) || !need_key_filter(&c) ||
-      !read_values(&c, LIST_SET))
+  /* The documented order: both lists, then the filter rule, then the
+   * slot count. */
+  if (!read_filters(&c, LIST_KEY_FILTERS) || !read_values(&c, LIST_SET) ||
+      !need_key_filter(&c))
     goto done;
   if (c.nvalues == 0) {
     FAIL(&c, ": no slot to set");

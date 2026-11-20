@@ -2077,5 +2077,216 @@ if command -v sqlite3 >/dev/null 2>&1; then
   [ "$got" = "$want" ] || fail "orm dml: the committed row" "got [$got], want [$want]"
 fi
 
+# --- T10 verify follow-ups (T10e) --------------------------------------------
+# B1: a wf-id taken from a fact is shown in a log line with its control
+# characters as '?', so an injected wf-id cannot forge a line.
+mkdir b1pkg
+conf b1pkg/package.conf 'definition = b1
+version = 1
+files = b.clp
+orm = orm.conf
+ingest = bad'
+conf b1pkg/b.clp '(deftemplate bad (slot wf-id) (slot n))'
+conf b1pkg/orm.conf 'bad.table = b1_bad
+bad.owned = no
+bad.slot.wf-id = wf_id text string error
+bad.slot.n = n bigint integer nil'
+rconf b1.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/b1.db
+packages = b1pkg"
+B1WHY="slot 'n' (column 'n'): expected integer, got STRING"
+cases=$((cases + 1))
+start b1.conf admin.sock
+wait_status admin.sock ' cycles=1 ' || ok=0
+acase "b1: inject a forged wf-id" "OK queued" admin.sock 'inject {"template":"bad","slots":{"wf-id":"a\\u0007b\\nclpdaemon: forged","n":"x"}}\n'
+wait_has err.txt "is not reloaded" || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: sync: b1@1::bad: table 'b1_bad': $B1WHY
+clpdaemon: cycle transaction failed: $B1WHY; retrying in 100 ms
+clpdaemon: sync: instance 'a?b?clpdaemon: forged' is no longer synchronized: $B1WHY
+clpdaemon: rehydrate: instance 'a?b?clpdaemon: forged' is not reloaded: it is no longer synchronized
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
+  ! grep -qF "instance 'a?b?clpdaemon: forged' is no longer synchronized" err.txt ||
+  grep -q '^clpdaemon: forged' err.txt; then
+  fail "b1: the isolation line shows the wf-id sanitized" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+
+# A1: instance_isolate_after, a positive integer (default 3).
+retryerr isolate0 'instance_isolate_after = 0' \
+  "clpdaemon: isolate0.conf:2: instance_isolate_after: expected a positive integer, got '0'"
+retryerr isolatex 'instance_isolate_after = three' \
+  "clpdaemon: isolatex.conf:2: instance_isolate_after: expected a positive integer, got 'three'"
+conf isolateok.conf 'node_id = n1
+instance_isolate_after = 1'
+check "cycle retry: instance_isolate_after" 0 "clpdaemon: isolateok.conf: configuration OK" "" -- --config isolateok.conf --check
+
+# A1 poison retry: another process sets the stored row of w1 to poison;
+# a rule touches w1 and fails, so the rollback reloads w1, whose poison
+# row activates a rule that fails the same way on every retry. The third
+# rolled-back cycle attributed to w1 (the wf-id of the failing rule)
+# isolates it, and the next cycle commits: w2's row is written.
+# a1case <tag> <name> <action> <failure lines> <failure message>: the
+# package in <tag>pkg, the database <tag>.db.
+a1case() {
+  a1=$1 a1name=$2 a1act=$3 a1lines=$4 a1msg=$5
+  mkdir "${a1}pkg"
+  conf "${a1}pkg"/package.conf 'definition = a1
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order'
+  conf "${a1}pkg"/a.clp "(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id) (slot text))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order) (db-create-table memo))
+(defrule fail (go (wf-id ?w) (act fail)) ?o <- (order (wf-id ?w)) => (modify ?o (status touched)) $a1act)
+(defrule poison ?o <- (order (wf-id ?w) (status poison)) => (modify ?o (status cured)) $a1act)"
+  conf "${a1}pkg"/orm.conf 'order.table = a1_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default
+memo.table = a1_memo
+memo.owned = yes
+memo.sync = manual
+memo.slot.wf-id = wf_id text symbol error
+memo.slot.text = body text string nil
+seq.missing_no = a1_missing_seq
+seq.missing_no.owned = yes'
+  rconf "$a1.conf" "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+cycle_retry_initial_ms = 100
+cycle_retry_max_ms = 100
+database = sqlite:$WORK/$a1.db
+packages = ${a1}pkg"
+  cases=$((cases + 1))
+  start "$a1.conf" admin.sock
+  wait_status admin.sock ' cycles=1 ' || ok=0
+  acase "$a1name: inject w1" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"status":{"sym":"new"}}}\n'
+  wait_status admin.sock ' cycles=2 ' || ok=0
+  sqlite3 "$a1.db" "UPDATE a1_order SET status = 'poison' WHERE wf_id = 'w1'; INSERT INTO a1_memo VALUES ('w1', 'old')"
+  acase "$a1name: inject a failing go" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"fail"}}}\n'
+  wait_line err.txt "clpdaemon: sync: instance 'w1' is no longer synchronized: $a1msg (3 rolled-back cycles in a row)" || ok=0
+  acase "$a1name: inject w2" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w2"},"status":{"sym":"new"}}}\n'
+  n=0
+  while [ "$(sqlite3 "$a1.db" "SELECT status FROM a1_order WHERE wf_id = 'w2'" 2>/dev/null)" != new ]; do
+    n=$((n + 1))
+    [ "$n" -gt 40 ] && { ok=0; break; }
+    sleep 0.05
+  done
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  want="clpdaemon: n1: running
+$(printf "$a1lines" fail)
+clpdaemon: cycle transaction failed: $a1msg; retrying in 100 ms
+$(printf "$a1lines" poison)
+clpdaemon: cycle transaction failed: $a1msg; retrying in 100 ms
+$(printf "$a1lines" poison)
+clpdaemon: cycle transaction failed: $a1msg; retrying in 100 ms
+clpdaemon: sync: instance 'w1' is no longer synchronized: $a1msg (3 rolled-back cycles in a row)
+clpdaemon: rehydrate: instance 'w1' is not reloaded: it is no longer synchronized
+clpdaemon: received SIGTERM, stopping"
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+    fail "$a1name: w1 isolated, w2 written" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+  cases=$((cases + 1))
+  got=$(sqlite3 "$a1.db" "SELECT wf_id || '|' || status FROM a1_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM a1_memo" 2>&1)
+  want='w1|poison
+w2|new
+w1|old'
+  [ "$got" = "$want" ] || fail "$a1name: the stored rows" "got [$got], want [$want]"
+}
+if command -v sqlite3 >/dev/null 2>&1; then
+  a1case a1n "a1 nextval" '(db-nextval missing_no)' \
+    "clpdaemon: db-nextval: sequence alias 'missing_no': sequence 'a1_missing_seq': no such table: clpd_sequence\n[PRCCODE4] Execution halted during the actions of defrule '%s'." \
+    'no such table: clpd_sequence'
+  a1case a1i "a1 insert" '(db-insert memo wf-id ?w text "x")' \
+    "clpdaemon: db-insert: template 'memo': table 'a1_memo': UNIQUE constraint failed: a1_memo.wf_id\n[PRCCODE4] Execution halted during the actions of defrule '%s'." \
+    'UNIQUE constraint failed: a1_memo.wf_id'
+
+  # T10b against an audit trigger on a table that is not owned, created
+  # beforehand: two modifies in one cycle are one UPDATE, a modify back to
+  # the stored values writes nothing, a key change is a DELETE then an
+  # INSERT; nil in a null nil column is NULL, in a column of another null
+  # policy the text nil.
+  sqlite3 audit.db "CREATE TABLE au_order (wf_id TEXT NOT NULL, line_no INTEGER NOT NULL, status TEXT, a TEXT, b TEXT, PRIMARY KEY (wf_id, line_no));
+CREATE TABLE audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, wf_id TEXT, line_no INTEGER, status TEXT, a TEXT, b TEXT);
+CREATE TRIGGER au_i AFTER INSERT ON au_order BEGIN INSERT INTO audit (op, wf_id, line_no, status, a, b) VALUES ('I', NEW.wf_id, NEW.line_no, NEW.status, NEW.a, NEW.b); END;
+CREATE TRIGGER au_u AFTER UPDATE ON au_order BEGIN INSERT INTO audit (op, wf_id, line_no, status, a, b) VALUES ('U', NEW.wf_id, NEW.line_no, NEW.status, NEW.a, NEW.b); END;
+CREATE TRIGGER au_d AFTER DELETE ON au_order BEGIN INSERT INTO audit (op, wf_id, line_no, status, a, b) VALUES ('D', OLD.wf_id, OLD.line_no, OLD.status, OLD.a, OLD.b); END;"
+  mkdir aupkg
+  conf aupkg/package.conf 'definition = au
+version = 1
+files = a.clp
+orm = orm.conf
+ingest = go, order'
+  conf aupkg/a.clp '(deftemplate go (slot wf-id) (slot act (type SYMBOL)))
+(deftemplate order (slot wf-id) (slot line-no (type INTEGER)) (slot status (type SYMBOL)) (slot a (type SYMBOL)) (slot b (type SYMBOL)))
+(defrule pay (go (wf-id ?w) (act pay)) ?o <- (order (wf-id ?w) (status new)) => (modify ?o (status paid)))
+(defrule ship ?o <- (order (wf-id ?w) (status paid)) => (modify ?o (status shipped)))
+(defrule flip ?g <- (go (wf-id ?w) (act flip)) ?o <- (order (wf-id ?w) (status shipped)) => (retract ?g) (modify ?o (status tmp)))
+(defrule flop ?o <- (order (wf-id ?w) (status tmp)) => (modify ?o (status shipped)))
+(defrule rekey (go (wf-id ?w) (act rekey)) ?o <- (order (wf-id ?w) (line-no 1)) => (modify ?o (line-no 2)))'
+  conf aupkg/orm.conf 'order.table = au_order
+order.owned = no
+order.key = line-no
+order.slot.wf-id = wf_id text symbol error
+order.slot.line-no = line_no bigint integer error
+order.slot.status = status text symbol default
+order.slot.a = a text symbol nil
+order.slot.b = b text symbol default'
+  rconf au.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/audit.db
+packages = aupkg"
+  AUDIT="SELECT op || '|' || wf_id || '|' || line_no || '|' || status || '|' || coalesce(a, 'NULL') || '|' || coalesce(b, 'NULL') FROM audit ORDER BY seq"
+  cases=$((cases + 1))
+  start au.conf admin.sock
+  wait_status admin.sock ' cycles=1 ' || ok=0
+  acase "audit: inject the order" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"w1"},"line-no":1,"status":{"sym":"new"},"a":{"sym":"nil"},"b":{"sym":"nil"}}}\n'
+  wait_status admin.sock ' cycles=2 ' || ok=0
+  au1=$(sqlite3 audit.db "$AUDIT" 2>&1)
+  acase "audit: two modifies" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"pay"}}}\n'
+  wait_status admin.sock ' cycles=3 ' || ok=0
+  au2=$(sqlite3 audit.db "$AUDIT" 2>&1)
+  acase "audit: a modify back" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"flip"}}}\n'
+  wait_status admin.sock ' cycles=4 ' || ok=0
+  au3=$(sqlite3 audit.db "$AUDIT" 2>&1)
+  acase "audit: a key change" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"rekey"}}}\n'
+  wait_status admin.sock ' cycles=5 ' || ok=0
+  au4=$(sqlite3 audit.db "$AUDIT" 2>&1)
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  want="clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+  if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
+    fail "audit: the daemon" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fi
+  AU1='I|w1|1|new|NULL|nil'
+  AU2="$AU1
+U|w1|1|shipped|NULL|nil"
+  AU4="$AU2
+D|w1|1|shipped|NULL|nil
+I|w1|2|shipped|NULL|nil"
+  cases=$((cases + 1))
+  [ "$au1" = "$AU1" ] && [ "$au2" = "$AU2" ] && [ "$au3" = "$AU2" ] && [ "$au4" = "$AU4" ] ||
+    fail "audit: the trigger rows" "after the insert [$au1], two modifies [$au2], a modify back [$au3], a key change [$au4]"
+  cases=$((cases + 1))
+  got=$(sqlite3 audit.db "SELECT wf_id || '|' || line_no || '|' || status || '|' || coalesce(a, 'NULL') || '|' || coalesce(b, 'NULL') FROM au_order; SELECT wf_id || '|' || definition FROM workflow_instance" 2>&1)
+  want='w1|2|shipped|NULL|nil
+w1|au'
+  [ "$got" = "$want" ] || fail "audit: the stored row" "got [$got], want [$want]"
+else
+  echo "cli_test.sh: sqlite3 not found; the T10e A1 and audit cases are skipped" >&2
+fi
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

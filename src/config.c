@@ -39,6 +39,7 @@ enum {
   KEY_ORM_ALLOW_DROP,
   KEY_CYCLE_RETRY_INITIAL,
   KEY_CYCLE_RETRY_MAX,
+  KEY_INSTANCE_ISOLATE_AFTER,
   KEY_COUNT
 };
 
@@ -52,6 +53,7 @@ static const char *const key_names[KEY_COUNT] = {
     "watch",            "packages",                "plugins",
     "database",         "orm_allow_drop",
     "cycle_retry_initial_ms", "cycle_retry_max_ms",
+    "instance_isolate_after",
 };
 
 static const key_kind key_kinds[KEY_COUNT] = {
@@ -59,7 +61,7 @@ static const key_kind key_kinds[KEY_COUNT] = {
     K_POSITIVE,    K_DURATION,      K_PATH,          K_MODE,
     K_OPTIONAL_PATH, K_OPTIONAL_PATH, K_WATCH,       K_PATH_LIST,
     K_PATH_LIST,   K_DATABASE,      K_YES_NO,        K_POSITIVE,
-    K_POSITIVE,
+    K_POSITIVE,    K_POSITIVE,
 };
 
 typedef struct {
@@ -243,6 +245,7 @@ static int apply(clpd_kv *kv, int key, char *value, clpd_config *cfg) {
   case KEY_ORM_ALLOW_DROP: cfg->orm_allow_drop = (int)v; break;
   case KEY_CYCLE_RETRY_INITIAL: cfg->cycle_retry_initial_ms = (int)v; break;
   case KEY_CYCLE_RETRY_MAX: cfg->cycle_retry_max_ms = (int)v; break;
+  case KEY_INSTANCE_ISOLATE_AFTER: cfg->instance_isolate_after = (int)v; break;
   default: break;
   }
   return 1;
@@ -265,6 +268,7 @@ static void set_defaults(clpd_config *cfg) {
   cfg->admin_socket_mode = CLPD_DEFAULT_ADMIN_SOCKET_MODE;
   cfg->cycle_retry_initial_ms = CLPD_DEFAULT_CYCLE_RETRY_INITIAL_MS;
   cfg->cycle_retry_max_ms = CLPD_DEFAULT_CYCLE_RETRY_MAX_MS;
+  cfg->instance_isolate_after = CLPD_DEFAULT_INSTANCE_ISOLATE_AFTER;
   cfg->watch_facts = 1;
   cfg->watch_rules = 1;
 }

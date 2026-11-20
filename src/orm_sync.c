@@ -19,7 +19,16 @@
  * cycle is rolled back those instances, and the one the failed write
  * isolated, are evicted: their facts retracted and their recorded changes
  * dropped; the ones still synchronized wait in `pending` until the next
- * cycle starts, which reloads them (src/orm_load.h) before its begin. */
+ * cycle starts, which reloads them (src/orm_load.h) before its begin.
+ *
+ * Poison retry (T10e): rule-fire hooks note, while a cycle is open, the
+ * instance of each firing rule (the wf-id of its first basis fact that
+ * has one, as the trace's rule wf-id); the rule during whose actions the
+ * cycle transaction got its first failure is the one the rolled-back
+ * cycle is attributed to (not when that failure lost the connection).
+ * Each instance counts its attributed rolled-back cycles until a commit;
+ * at instance_isolate_after it is isolated and evicted like the instance
+ * of a failed write. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "orm_sync.h"
@@ -47,6 +56,12 @@ typedef struct {
   wfpkg *v;
   size_t n, cap;
 } wfset;
+
+/* An instance and its rolled-back cycles in a row (T10e). */
+typedef struct {
+  char *wf;
+  int n;
+} strike;
 
 /* A mapped template whose facts are synchronized (sync = auto). */
 typedef struct {
@@ -87,7 +102,7 @@ struct clpd_orm_syncer {
   long *buckets;
   size_t nb; /* a power of two */
   int suspended;
-  int installed; /* 1: assert hook, 2: retract hook */
+  int installed; /* 1: assert hook, 2: retract hook, 4, 8: rule hooks */
   char **isolated; /* instances no longer synchronized */
   size_t isolated_n;
   char failed[4096]; /* the instance of the write that failed, or "" */
@@ -95,6 +110,13 @@ struct clpd_orm_syncer {
   int cycle_open; /* between a begin and the end of its cycle */
   wfset touched;  /* what the open cycle asserted or retracted */
   wfset pending;  /* evicted instances to reload when the next cycle starts */
+  /* Poison retry (T10e). */
+  int isolate_after;
+  int decided;   /* the open cycle's first failure is attributed (or not) */
+  char *firing;  /* the instance of the rule firing, NULL: none */
+  char *blamed;  /* the instance the first failure is attributed to */
+  strike *strikes; /* attributed rolled-back cycles since the last commit */
+  size_t strikes_n;
 };
 
 static void *xrealloc(void *p, size_t n) {
@@ -242,6 +264,87 @@ static const char *shown(const char *wf, char out[SHOWN_MAX + 1]) {
     out[i] = (unsigned char)wf[i] < 0x20 || wf[i] == 0x7f ? '?' : wf[i];
   out[i] = '\0';
   return out;
+}
+
+/* --- poison retry (T10e) ----------------------------------------------- */
+
+/* The instance of a firing rule: the wf-id of the first fact of its basis
+ * that has one (the symbol nil is none), the rule wf-id of the trace
+ * (src/clips_trace.c), as wf_text writes it; NULL when no fact has one. */
+static char *basis_wf(const Activation *act) {
+  const PartialMatch *b = act->basis;
+  unsigned short i;
+  for (i = 0; b != NULL && i < b->bcount; i++) {
+    PatternEntity *e;
+    CLIPSValue v;
+    Fact *f;
+    char *wf;
+    if (b->binds[i].gm.theMatch == NULL) continue;
+    e = b->binds[i].gm.theMatch->matchingItem;
+    if (e == NULL || e->header.type != FACT_ADDRESS_TYPE) continue;
+    f = (Fact *)e;
+    if (!DeftemplateSlotExistP(FactDeftemplate(f), CLPD_ORM_WF_ID) ||
+        GetFactSlot(f, CLPD_ORM_WF_ID, &v) != GSE_NO_ERROR)
+      continue;
+    if (v.header->type == SYMBOL_TYPE &&
+        strcmp(v.lexemeValue->contents, "nil") == 0)
+      continue;
+    if ((wf = value_text(&v)) != NULL) return wf;
+  }
+  return NULL;
+}
+
+/* Forgets the open cycle's attribution. */
+static void forget_blame(clpd_orm_syncer *s) {
+  free(s->firing);
+  free(s->blamed);
+  s->firing = s->blamed = NULL;
+  s->decided = 0;
+}
+
+/* Before a rule fires in an open cycle whose first failure is still to
+ * come: its instance. A failure before any rule (none sends statements
+ * today) is attributed to nobody. */
+static void before_fire(Environment *env, Activation *act, void *ctx) {
+  clpd_orm_syncer *s = ctx;
+  (void)env;
+  if (act == NULL || !s->cycle_open || s->decided) return;
+  if (clpd_db_atomic_failed(s->db)) {
+    s->decided = 1;
+    return;
+  }
+  free(s->firing);
+  s->firing = basis_wf(act);
+}
+
+/* After it fired: when one of its statements was the cycle's first
+ * failure, the cycle is attributed to its instance (NULL: to nobody). */
+static void after_fire(Environment *env, Activation *act, void *ctx) {
+  clpd_orm_syncer *s = ctx;
+  (void)env;
+  if (act == NULL || !s->cycle_open || s->decided) return;
+  if (clpd_db_atomic_failed(s->db)) {
+    s->decided = 1;
+    s->blamed = s->firing;
+  } else {
+    free(s->firing);
+  }
+  s->firing = NULL;
+}
+
+/* One more attributed rolled-back cycle of wf; returns its count. */
+static int strike_add(clpd_orm_syncer *s, const char *wf) {
+  size_t i;
+  for (i = 0; i < s->strikes_n; i++)
+    if (strcmp(s->strikes[i].wf, wf) == 0) return ++s->strikes[i].n;
+  s->strikes = xrealloc(s->strikes, (s->strikes_n + 1) * sizeof *s->strikes);
+  s->strikes[s->strikes_n].wf = xstrdup(wf);
+  s->strikes[s->strikes_n].n = 1;
+  return s->strikes[s->strikes_n++].n;
+}
+
+static void strikes_clear(clpd_orm_syncer *s) {
+  while (s->strikes_n > 0) free(s->strikes[--s->strikes_n].wf);
 }
 
 /* --- recording ---------------------------------------------------------- */
@@ -867,6 +970,7 @@ int clpd_orm_sync_attach(Environment *env, clpd_db *db,
   s->env = env;
   s->db = db;
   s->p = p;
+  s->isolate_after = CLPD_ORM_SYNC_ISOLATE_AFTER;
   reset_buckets(s, BUCKETS_MIN);
   for (i = 0; i < p->count; i++) {
     const clpd_package *pkg = &p->items[i];
@@ -894,12 +998,20 @@ int clpd_orm_sync_attach(Environment *env, clpd_db *db,
   }
   if (AddAssertFunction(env, NAME, on_assert, 0, s)) s->installed |= 1;
   if (AddRetractFunction(env, NAME, on_retract, 0, s)) s->installed |= 2;
-  if (s->installed != 3) {
+  if (AddBeforeRuleFiresFunction(env, NAME, before_fire, 0, s))
+    s->installed |= 4;
+  if (AddAfterRuleFiresFunction(env, NAME, after_fire, 0, s))
+    s->installed |= 8;
+  if (s->installed != 15) {
     clpd_orm_sync_detach(s);
     return -1;
   }
   *out = s;
   return 0;
+}
+
+void clpd_orm_sync_set_isolate_after(clpd_orm_syncer *s, int n) {
+  if (s != NULL && n >= 1) s->isolate_after = n;
 }
 
 void clpd_orm_sync_clear(clpd_orm_syncer *s) {
@@ -917,7 +1029,12 @@ void clpd_orm_sync_detach(clpd_orm_syncer *s) {
   if (s == NULL) return;
   if (s->installed & 1) RemoveAssertFunction(s->env, NAME);
   if (s->installed & 2) RemoveRetractFunction(s->env, NAME);
+  if (s->installed & 4) RemoveBeforeRuleFiresFunction(s->env, NAME);
+  if (s->installed & 8) RemoveAfterRuleFiresFunction(s->env, NAME);
   clpd_orm_sync_clear(s);
+  forget_blame(s);
+  strikes_clear(s);
+  free(s->strikes);
   while (s->isolated_n > 0) free(s->isolated[--s->isolated_n]);
   free(s->isolated);
   wfset_free(&s->touched);
@@ -996,6 +1113,7 @@ static int is_isolated(const clpd_orm_syncer *s, const char *wf) {
  * and later changes of its facts are not recorded. */
 static void isolate_instance(clpd_orm_syncer *s, const char *wf,
                              const char *why, FILE *log) {
+  char shown_wf[SHOWN_MAX + 1];
   if (!is_isolated(s, wf)) {
     s->isolated = xrealloc(s->isolated,
                            (s->isolated_n + 1) * sizeof(char *));
@@ -1003,18 +1121,22 @@ static void isolate_instance(clpd_orm_syncer *s, const char *wf,
   }
   drop_instance(s, wf);
   fprintf(log, "clpdaemon: sync: instance '%s' is no longer synchronized: "
-               "%s\n", wf, why);
+               "%s\n", shown(wf, shown_wf), why);
   fflush(log);
 }
 
 /* After a rolled-back cycle: the instance whose write failed for good, if
- * any, is isolated; then every instance the cycle touched, and that one,
- * is evicted (T10c): its facts retracted (mapped or not) and its recorded
- * changes dropped; an isolated one is not reloaded (logged), the others
- * wait in pending, with the packages whose templates carried them, for
- * the next cycle's start. */
-static void rolled_back(clpd_orm_syncer *s, const char *why, FILE *log) {
-  char shown_wf[SHOWN_MAX + 1], **wfs;
+ * any, is isolated; so is the instance the cycle is attributed to (a
+ * rule's statement failed first, the connection was not lost: lost 0)
+ * once it reaches isolate_after attributed cycles since the last commit
+ * (T10e). Then every instance the cycle touched, and those, is evicted
+ * (T10c): its facts retracted (mapped or not) and its recorded changes
+ * dropped; an isolated one is not reloaded (logged), the others wait in
+ * pending, with the packages whose templates carried them, for the next
+ * cycle's start. */
+static void rolled_back(clpd_orm_syncer *s, const char *why, int lost,
+                        FILE *log) {
+  char shown_wf[SHOWN_MAX + 1], **wfs, reason[1200];
   wfset ev = {NULL, 0, 0}, pk = {NULL, 0, 0};
   size_t i, n = 0;
   if (s == NULL) return;
@@ -1027,6 +1149,16 @@ static void rolled_back(clpd_orm_syncer *s, const char *why, FILE *log) {
     isolate_instance(s, s->failed, why, log);
     s->failed[0] = '\0';
   }
+  if (s->blamed != NULL && !lost && !is_isolated(s, s->blamed)) {
+    int count = strike_add(s, s->blamed);
+    if (count >= s->isolate_after) {
+      snprintf(reason, sizeof reason, "%s (%d rolled-back cycle%s in a row)",
+               why, count, count == 1 ? "" : "s");
+      wfset_add(&ev, s->blamed, NULL);
+      isolate_instance(s, s->blamed, reason, log);
+    }
+  }
+  forget_blame(s);
   if (ev.n == 0) return;
   /* The distinct instances, sorted for one pass over working memory. */
   wfs = xrealloc(NULL, ev.n * sizeof *wfs);
@@ -1139,6 +1271,7 @@ int clpd_orm_sync_begin_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx,
   if (clpd_orm_tx_begin(tx, log) != 0) return -1;
   if (s != NULL) {
     wfset_clear(&s->touched);
+    forget_blame(s);
     s->cycle_open = 1;
   }
   return 0;
@@ -1150,7 +1283,7 @@ int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
   if (s != NULL && tx->db != NULL && !clpd_db_atomic_failed(tx->db) &&
       flush(s, log, why, sizeof why) == F_ABORT) {
     clpd_orm_tx_abort(tx, log, why);
-    rolled_back(s, why, log);
+    rolled_back(s, why, 0, log);
     return -1;
   }
   /* After a failed statement (the flush's or an earlier one) the commit
@@ -1158,10 +1291,14 @@ int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
   rc = clpd_orm_tx_end(tx, log);
   if (rc != 0) {
     snprintf(why, sizeof why, "%s", clpd_db_error(tx->db));
-    rolled_back(s, why, log);
+    /* The first failure's status is the commit's: a lost connection set
+     * the reconnect (src/orm_tx.h) and is attributed to nobody. */
+    rolled_back(s, why, tx->reconnect, log);
   } else if (s != NULL) {
     clpd_orm_sync_clear(s);
     wfset_clear(&s->touched);
+    forget_blame(s);
+    strikes_clear(s); /* a commit resets the counts */
     s->cycle_open = 0;
   }
   return rc;

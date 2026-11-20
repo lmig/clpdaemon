@@ -48,6 +48,11 @@ typedef struct clpd_orm_syncer clpd_orm_syncer;
  * *out NULL) when CLIPS refuses a hook. */
 int clpd_orm_sync_attach(Environment *env, clpd_db *db,
                          const clpd_packages *p, clpd_orm_syncer **out);
+/* The poison retry (T10e): after n rolled-back cycles in a row attributed
+ * to one instance (see clpd_orm_sync_end_cycle) it is isolated; n >= 1,
+ * CLPD_ORM_SYNC_ISOLATE_AFTER after the attach. NULL is accepted. */
+#define CLPD_ORM_SYNC_ISOLATE_AFTER 3
+void clpd_orm_sync_set_isolate_after(clpd_orm_syncer *s, int n);
 /* Removes the hooks and frees s. NULL is accepted. */
 void clpd_orm_sync_detach(clpd_orm_syncer *s);
 
@@ -122,8 +127,16 @@ int clpd_orm_sync_begin_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
  * evicted (see above); an isolated one logs
  *   clpdaemon: rehydrate: instance '<wf-id>' is not reloaded: it is no
  *   longer synchronized
- * instead of waiting for a reload. Returns 0 when the cycle committed (the
- * changes are forgotten), -1 when it was rolled back (the changes of the
+ * instead of waiting for a reload. Poison retry (T10e,
+ * docs/database.md#poison-retry): a rolled-back cycle whose first failure
+ * came from a statement of a rule (not CLPD_DB_LOST) is attributed to the
+ * rule's instance (the wf-id of its first basis fact that has one; none:
+ * not attributed); an instance with isolate_after attributed cycles since
+ * the last commit is isolated and evicted the same way, its line's
+ * <reason> being "<message> (<n> rolled-back cycles in a row)". A commit
+ * resets the counts. Every <wf-id> is shown with control characters as
+ * '?', at most 200 bytes. Returns 0 when the cycle committed (the changes
+ * are forgotten), -1 when it was rolled back (the changes of the
  * instances it did not touch are kept). s may be NULL. */
 int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
 

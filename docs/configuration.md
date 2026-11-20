@@ -21,7 +21,7 @@ With `--check`, the daemon validates the configuration, opens the trace files ([
 
 A cycle runs `Run` with the `max_rules_per_cycle` limit. The first cycle runs at start; then a cycle is due `tick_interval_ms` after the start of the previous cycle (fixed rate), or `cycle_min_interval_ms` after it when a notification arrived in between. When a cycle takes longer than the interval, the next one starts at once; missed ticks are not replayed.
 
-With a `database`, each cycle runs inside one transaction (the cycle transaction, [`database.md`](database.md#cycle-transaction)). When it fails (a database error in the cycle, or a failed commit) the cycle is rolled back and the next cycle runs after a wait instead of the schedule: `cycle_retry_initial_ms` after the first failure, doubled after each further one up to `cycle_retry_max_ms`, for as long as the failures last; a committed cycle resets it. Signals and the admin socket are served during the wait. Before it starts, a daemon with a database and at least one package with an ORM mapping creates the `workflow_instance` table ([`database.md`](database.md#workflow_instance)).
+With a `database`, each cycle runs inside one transaction (the cycle transaction, [`database.md`](database.md#cycle-transaction)). When it fails (a database error in the cycle, or a failed commit) the cycle is rolled back and the next cycle runs after a wait instead of the schedule: `cycle_retry_initial_ms` after the first failure, doubled after each further one up to `cycle_retry_max_ms`, for as long as the failures last; a committed cycle resets it. Signals and the admin socket are served during the wait. A cycle whose first failure is a database error of a rule's statement counts for that rule's instance; after `instance_isolate_after` such cycles in a row (no commit between them) the instance is isolated and the retry goes on without it ([`database.md`](database.md#poison-retry)). Before it starts, a daemon with a database and at least one package with an ORM mapping creates the `workflow_instance` table ([`database.md`](database.md#workflow_instance)).
 
 | Signal | Effect |
 |---|---|
@@ -53,6 +53,7 @@ One `key = value` per line; lines may end in LF or CRLF, and spaces and tabs cou
 | `orm_allow_drop` | `yes` or `no`: whether `(db-drop-table <template>)` may drop a table the mapping marks as owned ([`orm.md`](orm.md)); a table that is not owned is never dropped | `no` |
 | `cycle_retry_initial_ms` | positive integer, not greater than `cycle_retry_max_ms`: the wait before the first retry of a cycle whose transaction failed ([`database.md`](database.md#cycle-transaction)) | `100` |
 | `cycle_retry_max_ms` | positive integer: the longest wait between two retries (each failure doubles the wait, up to this value) | `30000` |
+| `instance_isolate_after` | positive integer: the rolled-back cycles in a row attributed to one workflow instance (a statement of a rule of that instance failed first) after which the instance is isolated ([`database.md`](database.md#poison-retry)); `1` isolates at the first such failure | `3` |
 
 Integers are decimal and must not exceed 2147483647.
 
@@ -91,4 +92,4 @@ All messages go to stderr, except `--check` success and `--help`, which go to st
 | Interval order | `clpdaemon: <file>: cycle_min_interval_ms (<a>) must not exceed tick_interval_ms (<b>)` |
 | Retry order (also against a default: `cycle_retry_initial_ms = 40000` alone) | `clpdaemon: <file>: cycle_retry_initial_ms (<a>) must not exceed cycle_retry_max_ms (<b>)` |
 
-The interval-order and retry-order checks run only when both values are valid. A `cycle_retry_initial_ms` or `cycle_retry_max_ms` that is not a positive integer gets the "Bad positive integer" message. The `database` messages never show the value, which may name a user or host.
+The interval-order and retry-order checks run only when both values are valid. A `cycle_retry_initial_ms`, `cycle_retry_max_ms` or `instance_isolate_after` that is not a positive integer gets the "Bad positive integer" message (for example `clpdaemon: daemon.conf:7: instance_isolate_after: expected a positive integer, got '0'`). The `database` messages never show the value, which may name a user or host.

@@ -269,6 +269,8 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     /* The DML functions suspend it while loading and note the instances
      * they write (T10d); no rule has run yet. */
     ddl.sync = sync;
+    /* The poison retry (T10e, docs/database.md#cycle-transaction). */
+    clpd_orm_sync_set_isolate_after(sync, cfg->instance_isolate_after);
     if (clpd_trace_active(trace) &&
         (cap = clpd_fdcapture_start(trace, clpd_log())) == NULL) {
       rc = 1;

@@ -352,6 +352,47 @@ static void test_cycle_retry(void) {
   clpd_config_free(&cfg);
 }
 
+/* instance_isolate_after (T10e): a positive integer, default 3. */
+static void test_instance_isolate_after(void) {
+  static const char *const bad[] = {"0", "-1", "", "1.5", "3x",
+                                    "2147483648"};
+  clpd_config cfg;
+  char text[160], eb[512], expect[sizeof path + 160];
+  size_t i;
+  EXPECT(LOAD("iso0.conf", "node_id = n1\n", &cfg, eb) == 0);
+  EXPECT(cfg.instance_isolate_after == 3);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("iso1.conf", "node_id = n1\ninstance_isolate_after = 1\n", &cfg,
+              eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && cfg.instance_isolate_after == 1);
+  clpd_config_free(&cfg);
+  EXPECT(LOAD("iso2.conf", "node_id = n1\ninstance_isolate_after = 2147483647\n",
+              &cfg, eb) == 0);
+  EXPECT(strcmp(eb, "") == 0 && cfg.instance_isolate_after == 2147483647);
+  clpd_config_free(&cfg);
+  for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    snprintf(text, sizeof text, "node_id = n1\ninstance_isolate_after = %s\n",
+             bad[i]);
+    EXPECT(load("iso.conf", text, strlen(text), &cfg, eb, sizeof eb) == 1);
+    snprintf(expect, sizeof expect,
+             "clpdaemon: %s:2: instance_isolate_after: expected a positive "
+             "integer, got '%s'\n",
+             path, bad[i]);
+    EXPECT(strcmp(eb, expect) == 0);
+    EXPECT(cfg.instance_isolate_after == 3);
+    clpd_config_free(&cfg);
+  }
+  /* The retry keys keep their own checks and defaults. */
+  EXPECT(LOAD("iso3.conf", "node_id = n1\ninstance_isolate_after = 5\n"
+                           "cycle_retry_max_ms = 0\n", &cfg, eb) == 1);
+  snprintf(expect, sizeof expect,
+           "clpdaemon: %s:3: cycle_retry_max_ms: expected a positive integer, "
+           "got '0'\n", path);
+  EXPECT(strcmp(eb, expect) == 0);
+  EXPECT(cfg.instance_isolate_after == 5 && cfg.cycle_retry_initial_ms == 100);
+  clpd_config_free(&cfg);
+}
+
 static void test_nul_byte_rejected(void) {
   clpd_config cfg;
   char eb[512], want[sizeof path + 64];
@@ -377,6 +418,7 @@ int main(void) {
   test_admin_socket_none();
   test_database();
   test_cycle_retry();
+  test_instance_isolate_after();
   rmdir(dir);
   if (failures != 0) {
     fprintf(stderr, "%d config checks failed\n", failures);
