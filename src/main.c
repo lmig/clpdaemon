@@ -5,7 +5,8 @@
  * instances are rehydrated when the next one starts (T10c). The rules end
  * instances with the lifecycle functions (T11a, src/orm_life.h). The clock
  * fact is asserted after Reset and modified when each cycle starts (T11b,
- * src/clock.h). */
+ * src/clock.h), and then idle instances are evicted (T11c,
+ * clpd_orm_sync_evict_idle). */
 #include "admin.h"
 #include "clips_trace.h"
 #include "clock.h"
@@ -61,7 +62,9 @@ static void update_clock(clpd_clock *clock) {
 }
 
 /* One cycle: the clock fact gets the wall clock first (T11b, with or
- * without a database), then, with a database, the rest runs inside the
+ * without a database), then, with a database, the instances idle for
+ * idle_eviction_after are evicted (T11c, src/orm_sync.h, outside the
+ * cycle transaction, nothing written) and the rest runs inside the
  * cycle transaction (T10a,
  * docs/database.md#cycle-transaction): reload the instances a rolled-back
  * cycle evicted, then begin (src/orm_sync.h, T10c), assert the facts queued so
@@ -86,6 +89,7 @@ static void run_cycle(void *ctx) {
   Environment *env = clpd_engine_env(c->engine);
   int committed;
   update_clock(c->clock);
+  clpd_orm_sync_evict_idle(c->sync, clpd_log());
   if (clpd_orm_sync_begin_cycle(c->sync, &c->tx, clpd_log()) != 0) {
     clpd_admin_resume(c->admin);
     clpd_loop_defer(c->loop, c->tx.retry_ms);
@@ -300,6 +304,9 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     ddl.sync = sync;
     /* The poison retry (T10e, docs/database.md#cycle-transaction). */
     clpd_orm_sync_set_isolate_after(sync, cfg->instance_isolate_after);
+    /* The idle eviction (T11c, docs/orm.md#idle-eviction), before the
+     * first fact is asserted. */
+    clpd_orm_sync_set_idle_after(sync, cfg->idle_eviction_after_s * 1000LL);
     if ((clock = clpd_clock_create(clpd_engine_env(engine))) == NULL) {
       fputs("clpdaemon: cannot create the clock fact\n", clpd_log());
       rc = 1;

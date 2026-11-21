@@ -2776,5 +2776,98 @@ else
   echo "cli_test.sh: sqlite3 not found; the T11b database case is skipped" >&2
 fi
 
+# --- idle eviction (T11c, FR-9, docs/orm.md#idle-eviction) --------------------
+# A package with a mapped sync = auto template (order), a sync = manual one
+# (note) and unmapped ones (memo, and boot, whose w0 fact stays too).
+mkdir evpkg
+conf evpkg/package.conf 'definition = ev
+version = 1
+files = e.clp
+orm = orm.conf
+ingest = order, memo, note'
+conf evpkg/e.clp '(deftemplate boot (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id))
+(deftemplate note (slot wf-id))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))'
+conf evpkg/orm.conf 'order.table = ev_order
+order.owned = yes
+order.slot.wf-id = wf_id text string error
+order.slot.status = status text symbol default
+note.table = ev_note
+note.owned = yes
+note.sync = manual
+note.slot.wf-id = wf_id text string error'
+if command -v sqlite3 >/dev/null 2>&1; then
+  rconf evrun.conf "node_id = n1
+tick_interval_ms = 50
+cycle_min_interval_ms = 10
+idle_eviction_after = 1s
+database = sqlite:$WORK/ev.db
+packages = evpkg"
+  # evrows: every row of the tables the case writes (timestamps included).
+  evrows() { sqlite3 -cmd '.timeout 5000' ev.db "SELECT * FROM ev_order ORDER BY 1; SELECT * FROM workflow_instance ORDER BY 1" 2>&1; }
+  cases=$((cases + 1))
+  start evrun.conf admin.sock
+  acase "evict: inject" "OK queued
+OK queued
+OK queued
+OK queued
+OK queued
+OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":"e1","status":{"sym":"new"}}}\ninject {"template":"order","slots":{"wf-id":"x\\ny","status":{"sym":"new"}}}\ninject {"template":"order","slots":{"wf-id":"u1","status":{"sym":"new"}}}\ninject {"template":"memo","slots":{"wf-id":"u1"}}\ninject {"template":"order","slots":{"wf-id":"m1","status":{"sym":"new"}}}\ninject {"template":"note","slots":{"wf-id":"m1"}}\n'
+  # clock, w0's boot, e1, x\ny, u1 (2) and m1 (2).
+  wait_status admin.sock ' queue=0 facts=8$' || ok=0
+  ev_before=$(evrows)
+  wait_line err.txt "clpdaemon: evict: instance 'x?y' after 1 s without activity" || ok=0
+  wait_status admin.sock ' queue=0 facts=6$' || ok=0
+  ev_after=$(evrows)
+  # u1 (unmapped memo) and m1 (manual note) stay for good.
+  sleep 2.2
+  st=$("$ADMIN" admin.sock 'status\n' 2>&1)
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  want="clpdaemon: n1: running
+clpdaemon: evict: instance 'e1' after 1 s without activity
+clpdaemon: evict: instance 'x?y' after 1 s without activity
+clpdaemon: received SIGTERM, stopping"
+  [ "$ok" = 1 ] && [ "$rc" = 0 ] && [ ! -s out.txt ] && [ "$(cat err.txt)" = "$want" ] ||
+    fail "evict: idle instances with only auto facts are evicted" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  cases=$((cases + 1))
+  case $st in *' queue=0 facts=6') ;; *) fail "evict: unmapped and manual facts keep their instance" "status [$st]" ;; esac
+  cases=$((cases + 1))
+  want_rows=$(printf 'e1|new\nm1|new\nu1|new\nx\ny|new')
+  [ "$(sqlite3 ev.db 'SELECT * FROM ev_order ORDER BY 1')" = "$want_rows" ] && [ -n "$ev_before" ] &&
+    [ "$ev_after" = "$ev_before" ] && [ "$(evrows)" = "$ev_before" ] ||
+    fail "evict: the evicted instances' rows are unchanged" "before [$ev_before], after [$ev_after], at exit [$(evrows)]"
+else
+  echo "cli_test.sh: sqlite3 not found; the T11c database case is skipped" >&2
+fi
+# Without a database nothing is evicted, whatever idle_eviction_after says.
+mkdir evnodb
+conf evnodb/package.conf 'definition = evnodb
+version = 1
+files = e.clp
+ingest = order'
+conf evnodb/e.clp '(deftemplate order (slot wf-id))'
+rconf evnodb.conf 'node_id = n1
+tick_interval_ms = 50
+cycle_min_interval_ms = 10
+idle_eviction_after = 1s
+packages = evnodb'
+cases=$((cases + 1))
+start evnodb.conf admin.sock
+acase "evict: inject without a database" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":"e1"}}\n'
+wait_status admin.sock ' queue=0 facts=2$' || ok=0
+sleep 2.2
+st=$("$ADMIN" admin.sock 'status\n' 2>&1)
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+[ "$ok" = 1 ] && [ "$rc" = 0 ] && [ ! -s out.txt ] &&
+  [ "$(cat err.txt)" = "clpdaemon: n1: running${NL}clpdaemon: received SIGTERM, stopping" ] ||
+  fail "evict: no eviction without a database" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+case $st in *' queue=0 facts=2') ;; *) fail "evict: the fact stays without a database" "status [$st]" ;; esac
+
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

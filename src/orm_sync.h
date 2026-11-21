@@ -53,6 +53,16 @@ int clpd_orm_sync_attach(Environment *env, clpd_db *db,
  * CLPD_ORM_SYNC_ISOLATE_AFTER after the attach. NULL is accepted. */
 #define CLPD_ORM_SYNC_ISOLATE_AFTER 3
 void clpd_orm_sync_set_isolate_after(clpd_orm_syncer *s, int n);
+/* Idle eviction (T11c, FR-9, docs/orm.md#idle-eviction): the idle period
+ * in milliseconds (ms >= 1; CLPD_ORM_SYNC_IDLE_AFTER_MS after the attach,
+ * the default of idle_eviction_after) and the monotonic clock the
+ * activity times come from (NULL: CLOCK_MONOTONIC; tests replace it).
+ * Set both before the first fact is asserted. NULL s is accepted. */
+#define CLPD_ORM_SYNC_IDLE_AFTER_MS (30LL * 60 * 1000)
+typedef long long clpd_orm_sync_clock(void *ctx);
+void clpd_orm_sync_set_idle_after(clpd_orm_syncer *s, long long ms);
+void clpd_orm_sync_set_clock(clpd_orm_syncer *s, clpd_orm_sync_clock *clock,
+                             void *ctx);
 /* Removes the hooks and frees s. NULL is accepted. */
 void clpd_orm_sync_detach(clpd_orm_syncer *s);
 
@@ -176,5 +186,27 @@ int clpd_orm_sync_begin_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
  * (the changes of the instances it did not touch are kept). s may be
  * NULL. */
 int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
+
+/* The idle eviction (T11c), at the start of a cycle, before
+ * clpd_orm_sync_begin_cycle (outside the cycle transaction; it sends no
+ * statement). The syncer keeps the time of the last activity of each
+ * instance: an assert, modify or retract of a fact carrying its wf-id
+ * (any template; facts loaded with the recording suspended, by db-load or
+ * the rehydration, included) and the firing of a rule whose rule wf-id
+ * (see clpd_orm_sync_end_cycle) is the instance. An instance idle for the
+ * idle period is evicted when every fact carrying its wf-id is of a
+ * template mapped with sync = auto, it has no recorded change waiting to
+ * be written, and it is neither isolated nor waiting for a reload: its
+ * facts are retracted with the recording suspended (nothing is written,
+ * its rows stay), its activity is forgotten, and
+ *   clpdaemon: evict: instance '<wf-id>' after <n> s without activity
+ * is logged (<n> whole seconds since its last activity; <wf-id> shown
+ * like the rehydrate: lines), oldest activity first. An idle instance
+ * that does not qualify is checked again one idle period later; one with
+ * no fact left is forgotten without a line. Instances that a lifecycle
+ * function ended or that were isolated have no activity kept. Returns the
+ * number of instances evicted; 0 for s NULL (no database) or while a
+ * cycle is open. */
+int clpd_orm_sync_evict_idle(clpd_orm_syncer *s, FILE *log);
 
 #endif

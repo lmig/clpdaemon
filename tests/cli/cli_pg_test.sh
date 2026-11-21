@@ -810,5 +810,79 @@ got=$got/$(q "SELECT count(*) FROM information_schema.columns WHERE table_schema
 q 'DROP TABLE IF EXISTS pgclk_job' >/dev/null
 q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
 
+# T11c: idle eviction with PostgreSQL. With idle_eviction_after = 1s the
+# instances whose facts are all of the sync = auto template (e1, and x\ny,
+# shown sanitized) are evicted with the exact line, oldest activity first;
+# u1 (an unmapped memo) and m1 (a sync = manual note) stay; the rows and
+# workflow_instance rows are unchanged by the eviction.
+mkdir evpkg
+printf '%s\n' 'definition = pgev
+version = 1
+files = e.clp
+orm = orm.conf
+ingest = order, memo, note' >evpkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id))
+(deftemplate note (slot wf-id))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))' >evpkg/e.clp
+printf '%s\n' 'order.table = pgev_order
+order.owned = yes
+order.slot.wf-id = wf_id text string error
+order.slot.status = status text symbol default
+note.table = pgev_note
+note.owned = yes
+note.sync = manual
+note.slot.wf-id = wf_id text string error' >evpkg/orm.conf
+printf '%s\n' "node_id = n1
+tick_interval_ms = 50
+cycle_min_interval_ms = 10
+idle_eviction_after = 1s
+admin_socket = $WORK/admin.sock
+database = $CONNINFO
+packages = evpkg" >ev.conf
+q 'DROP TABLE IF EXISTS pgev_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+evrows() { q "SELECT wf_id || '|' || status FROM pgev_order ORDER BY 1"; q "SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || created_at || '|' || updated_at FROM workflow_instance ORDER BY 1"; }
+# evstatus <pattern>: up to 10 s for a status reply matching it.
+evstatus() {
+  n=0
+  while ! "$ADMIN" admin.sock 'status\n' 2>/dev/null | grep -q "$1"; do
+    n=$((n + 1)); [ "$n" -gt 200 ] && return 1; sleep 0.05
+  done
+}
+"$BIN" --config ev.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_has err.txt 'clpdaemon: n1: running' || ok=0
+n=0
+while [ ! -S admin.sock ] && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+inj=$("$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":"e1","status":{"sym":"new"}}}\ninject {"template":"order","slots":{"wf-id":"x\\ny","status":{"sym":"new"}}}\ninject {"template":"order","slots":{"wf-id":"u1","status":{"sym":"new"}}}\ninject {"template":"memo","slots":{"wf-id":"u1"}}\ninject {"template":"order","slots":{"wf-id":"m1","status":{"sym":"new"}}}\ninject {"template":"note","slots":{"wf-id":"m1"}}\n' 2>&1)
+[ "$inj" = "OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued" ] || ok=0
+evstatus ' queue=0 facts=8$' || ok=0
+ev_before=$(evrows)
+wait_has err.txt "clpdaemon: evict: instance 'x?y' after 1 s without activity" || ok=0
+evstatus ' queue=0 facts=6$' || ok=0
+ev_after=$(evrows)
+sleep 2.2
+st=$("$ADMIN" admin.sock 'status\n' 2>&1)
+stop_daemon "pg evict"
+cases=$((cases + 1))
+want="clpdaemon: n1: running
+clpdaemon: evict: instance 'e1' after 1 s without activity
+clpdaemon: evict: instance 'x?y' after 1 s without activity
+clpdaemon: received SIGTERM, stopping"
+[ "$ok" = 1 ] && [ ! -s out.txt ] && [ "$(cat err.txt)" = "$want" ] ||
+  fail "pg evict: idle instances with only auto facts are evicted" "seen $ok, inject [$inj], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+case $st in *' queue=0 facts=6') ;; *) fail "pg evict: unmapped and manual facts keep their instance" "status [$st]" ;; esac
+cases=$((cases + 1))
+[ "$(q "SELECT wf_id || '|' || status FROM pgev_order ORDER BY 1")" = "e1|new${NL}m1|new${NL}u1|new${NL}x${NL}y|new" ] &&
+  [ -n "$ev_before" ] && [ "$ev_after" = "$ev_before" ] && [ "$(evrows)" = "$ev_before" ] ||
+  fail "pg evict: the evicted instances' rows are unchanged" "before [$ev_before], after [$ev_after], at exit [$(evrows)]"
+q 'DROP TABLE IF EXISTS pgev_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
 printf '%d/%d PostgreSQL CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

@@ -43,18 +43,30 @@
  * Facts of an instance in either list are never recorded, and a rolled-
  * back cycle never reloads a finished one. A value the restricted flush
  * cannot write leaves the cycle to be rolled back at its end
- * (abort_pending), as the end-of-cycle flush would. */
+ * (abort_pending), as the end-of-cycle flush would.
+ *
+ * Idle eviction (T11c, src/orm_evict.h): the same assert and retract hooks
+ * (also while the recording is suspended) and the before-fire hook note
+ * the activity of the instance in `idle`, with the syncer's monotonic
+ * clock, except for an isolated or finished instance, whose entry is
+ * removed when it becomes one. The sweep at a cycle start takes the
+ * entries due, checks them all in one pass over working memory and one
+ * over the recorded changes, retracts the qualifying instances in one
+ * more pass (suspended: nothing is recorded or written), and defers the
+ * others by one idle period. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "orm_sync.h"
 
 #include "log.h"
 #include "orm.h"
+#include "orm_evict.h"
 #include "orm_load.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define NAME "clpd-orm-sync"
 #define BUCKETS_MIN 64
@@ -139,6 +151,11 @@ struct clpd_orm_syncer {
   size_t finishing_n;
   int abort_pending; /* a restricted flush met a value it cannot write */
   char abort_why[1024];
+  /* Idle eviction (T11c). */
+  clpd_orm_evict *idle;     /* last activity per instance */
+  long long idle_ms;        /* the idle period */
+  clpd_orm_sync_clock *now; /* monotonic, ms */
+  void *now_ctx;
 };
 
 static void *xrealloc(void *p, size_t n) {
@@ -242,12 +259,16 @@ static const clpd_package *package_of(const clpd_orm_syncer *s,
   return NULL;
 }
 
-/* An open cycle (not loading) asserted or retracted f. */
+static void note_activity(clpd_orm_syncer *s, const char *wf);
+
+/* f was asserted or retracted: activity of its instance (T11c), and the
+ * instance is touched when an open cycle (not loading) did it. */
 static void track(clpd_orm_syncer *s, Fact *f) {
   char *wf;
-  if (!s->cycle_open || s->suspended) return;
   if ((wf = fact_wf(f)) == NULL) return;
-  wfset_add(&s->touched, wf, package_of(s, FactDeftemplate(f)));
+  note_activity(s, wf);
+  if (s->cycle_open && !s->suspended)
+    wfset_add(&s->touched, wf, package_of(s, FactDeftemplate(f)));
   free(wf);
 }
 
@@ -336,14 +357,18 @@ static void forget_blame(clpd_orm_syncer *s) {
  * today) is attributed to nobody. */
 static void before_fire(Environment *env, Activation *act, void *ctx) {
   clpd_orm_syncer *s = ctx;
+  char *wf;
   (void)env;
-  if (act == NULL || !s->cycle_open || s->decided) return;
-  if (clpd_db_atomic_failed(s->db)) {
-    s->decided = 1;
+  if (act == NULL) return;
+  /* A firing is activity of the rule's instance (T11c). */
+  if ((wf = basis_wf(act)) != NULL) note_activity(s, wf);
+  if (!s->cycle_open || s->decided || clpd_db_atomic_failed(s->db)) {
+    if (s->cycle_open && !s->decided) s->decided = 1;
+    free(wf);
     return;
   }
   free(s->firing);
-  s->firing = basis_wf(act);
+  s->firing = wf;
 }
 
 /* After it fired: when one of its statements was the cycle's first
@@ -1017,6 +1042,14 @@ static int first_of_definition(const clpd_packages *p, size_t i) {
   return 1;
 }
 
+/* The production clock of the activity times (T11c). */
+static long long monotonic_ms(void *ctx) {
+  struct timespec ts;
+  (void)ctx;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 int clpd_orm_sync_attach(Environment *env, clpd_db *db,
                          const clpd_packages *p, clpd_orm_syncer **out) {
   clpd_orm_syncer *s;
@@ -1028,6 +1061,9 @@ int clpd_orm_sync_attach(Environment *env, clpd_db *db,
   s->db = db;
   s->p = p;
   s->isolate_after = CLPD_ORM_SYNC_ISOLATE_AFTER;
+  s->idle = clpd_orm_evict_create();
+  s->idle_ms = CLPD_ORM_SYNC_IDLE_AFTER_MS;
+  s->now = monotonic_ms;
   reset_buckets(s, BUCKETS_MIN);
   for (i = 0; i < p->count; i++) {
     const clpd_package *pkg = &p->items[i];
@@ -1100,6 +1136,7 @@ void clpd_orm_sync_detach(clpd_orm_syncer *s) {
   free(s->finishing);
   wfset_free(&s->touched);
   wfset_free(&s->pending);
+  clpd_orm_evict_free(s->idle);
   free(s->e);
   free(s->buckets);
   free(s->maps);
@@ -1222,6 +1259,7 @@ static void isolate_instance(clpd_orm_syncer *s, const char *wf,
     s->isolated[s->isolated_n++] = xstrdup(wf);
   }
   drop_instance(s, wf);
+  clpd_orm_evict_remove(s->idle, wf); /* no activity kept (T11c) */
   fprintf(log, "clpdaemon: sync: instance '%s' is no longer synchronized: "
                "%s\n", shown(wf, shown_wf), why);
   fflush(log);
@@ -1468,8 +1506,132 @@ void clpd_orm_sync_finish(clpd_orm_syncer *s, const char *wf) {
    * the instance counts as touched with the packages of its facts. */
   retract_instances(s, &w, 1, s->cycle_open ? &s->touched : NULL);
   drop_instance(s, wf);
+  clpd_orm_evict_remove(s->idle, wf); /* no activity kept (T11c) */
 }
 
 int clpd_orm_sync_isolated(const clpd_orm_syncer *s, const char *wf) {
   return s != NULL && is_isolated(s, wf);
+}
+
+/* --- idle eviction (T11c) --------------------------------------------- */
+
+void clpd_orm_sync_set_idle_after(clpd_orm_syncer *s, long long ms) {
+  if (s != NULL && ms >= 1) s->idle_ms = ms;
+}
+
+void clpd_orm_sync_set_clock(clpd_orm_syncer *s, clpd_orm_sync_clock *clock,
+                             void *ctx) {
+  if (s == NULL) return;
+  s->now = clock != NULL ? clock : monotonic_ms;
+  s->now_ctx = clock != NULL ? ctx : NULL;
+}
+
+/* Activity of instance wf now, unless it is isolated or finished. */
+static void note_activity(clpd_orm_syncer *s, const char *wf) {
+  long long now;
+  if ((s->isolated_n > 0 && is_isolated(s, wf)) || is_finished(s, wf)) return;
+  now = s->now(s->now_ctx);
+  clpd_orm_evict_touch(s->idle, wf, now, now + s->idle_ms);
+}
+
+/* An instance due for the idle check. */
+typedef struct {
+  char *wf;
+  long long last;
+  size_t facts;  /* in working memory */
+  int blocked;   /* it must stay */
+} candidate;
+
+static int cmp_candidate(const void *a, const void *b) {
+  return strcmp(((const candidate *)a)->wf, ((const candidate *)b)->wf);
+}
+
+/* The candidate of instance wf in c[0..n) (sorted), or NULL. */
+static candidate *candidate_of(candidate *c, size_t n, const char *wf) {
+  candidate key;
+  key.wf = (char *)wf;
+  return bsearch(&key, c, n, sizeof *c, cmp_candidate);
+}
+
+/* Blocks the candidate of the instance of row r, if any. */
+static void block_row(candidate *c, size_t n, const row *r) {
+  char text[4096];
+  candidate *hit;
+  if (r->m == NULL) return;
+  wf_text(r, text, sizeof text);
+  if ((hit = candidate_of(c, n, text)) != NULL) hit->blocked = 1;
+}
+
+int clpd_orm_sync_evict_idle(clpd_orm_syncer *s, FILE *log) {
+  char shown_wf[SHOWN_MAX + 1], **wfs;
+  candidate *c = NULL, *sorted;
+  const char *wf;
+  long long now, last;
+  size_t n = 0, cap = 0, i, k = 0;
+  Fact *f;
+  int evicted = 0;
+  if (s == NULL || s->cycle_open) return 0;
+  now = s->now(s->now_ctx);
+  /* The entries due, oldest activity first; each is deferred by one idle
+   * period now, so the loop ends and a candidate that must stay is checked
+   * again then. */
+  while (clpd_orm_evict_next(s->idle, now, &wf, &last)) {
+    if (n == cap) {
+      cap = cap == 0 ? 16 : 2 * cap;
+      c = xrealloc(c, cap * sizeof *c);
+    }
+    c[n].wf = xstrdup(wf);
+    c[n].last = last;
+    c[n].facts = 0;
+    c[n].blocked = 0;
+    clpd_orm_evict_defer(s->idle, c[n++].wf, now + s->idle_ms);
+  }
+  if (n == 0) return 0;
+  sorted = xrealloc(NULL, n * sizeof *sorted);
+  memcpy(sorted, c, n * sizeof *c);
+  qsort(sorted, n, sizeof *sorted, cmp_candidate);
+  /* Waiting for a reload, or isolated: not in memory as stored. */
+  for (i = 0; i < s->pending.n; i++) {
+    candidate *hit = candidate_of(sorted, n, s->pending.v[i].wf);
+    if (hit != NULL) hit->blocked = 1;
+  }
+  for (i = 0; i < n; i++)
+    if (is_isolated(s, sorted[i].wf)) sorted[i].blocked = 1;
+  /* A recorded change not written yet. */
+  for (i = 0; i < s->n; i++) {
+    if (writes(&s->e[i]) == W_NONE) continue;
+    block_row(sorted, n, &s->e[i].base);
+    block_row(sorted, n, &s->e[i].cur);
+  }
+  /* Its facts: each one of a sync = auto template (map_of), at least one. */
+  for (f = GetNextFact(s->env, NULL); f != NULL; f = GetNextFact(s->env, f)) {
+    char *fw = fact_wf(f);
+    candidate *hit;
+    if (fw == NULL) continue;
+    if ((hit = candidate_of(sorted, n, fw)) != NULL) {
+      hit->facts++;
+      if (map_of(s, FactDeftemplate(f)) == NULL) hit->blocked = 1;
+    }
+    free(fw);
+  }
+  wfs = xrealloc(NULL, n * sizeof *wfs);
+  for (i = 0; i < n; i++)
+    if (!sorted[i].blocked && sorted[i].facts > 0) wfs[k++] = sorted[i].wf;
+  retract_instances(s, wfs, k, NULL); /* wfs is sorted like sorted */
+  free(wfs);
+  for (i = 0; i < n; i++) {
+    const candidate *e = candidate_of(sorted, n, c[i].wf);
+    if (e->blocked) continue;
+    clpd_orm_evict_remove(s->idle, e->wf);
+    if (e->facts == 0) continue; /* nothing left in memory */
+    fprintf(log, "clpdaemon: evict: instance '%s' after %lld s without "
+                 "activity\n",
+            shown(e->wf, shown_wf), (now - e->last) / 1000);
+    evicted++;
+  }
+  if (evicted > 0) fflush(log);
+  free(sorted);
+  for (i = 0; i < n; i++) free(c[i].wf);
+  free(c);
+  return evicted;
 }
