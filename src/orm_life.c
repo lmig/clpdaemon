@@ -51,9 +51,7 @@ static void shown(const char *wf, char out[SHOWN_MAX + 1]) {
 /* The instance's row as the cycle transaction sees it. */
 typedef enum { ROW_NONE, ROW_FOUND, ROW_FAILED } row_state;
 
-typedef struct {
-  char definition[1024], status[64];
-} instance_row;
+typedef clpd_orm_life_row instance_row;
 
 /* Copies a TEXT value ("" otherwise). */
 static void text_of(const clpd_db_value *v, char *out, size_t n) {
@@ -63,25 +61,38 @@ static void text_of(const clpd_db_value *v, char *out, size_t n) {
     snprintf(out, n, "%s", "");
 }
 
-static row_state read_row(clpd_db *db, const char *schema, const char *wf,
-                          instance_row *row) {
+int clpd_orm_life_read_row(clpd_db *db, const char *schema, const char *wf,
+                           clpd_orm_life_row *row, clpd_db_status *st) {
   char sql[256];
   clpd_db_result *r = NULL;
   clpd_db_value p = clpd_db_text(wf);
-  row_state state = ROW_NONE;
+  int found = 0;
   snprintf(sql, sizeof sql,
            "SELECT \"definition\", \"version\", \"status\" FROM "
            "%s\"" CLPD_ORM_INSTANCE_TABLE "\" WHERE \"wf_id\" = $1",
            schema);
-  if (clpd_db_exec(db, sql, &p, 1, &r) != CLPD_DB_OK) return ROW_FAILED;
+  *st = clpd_db_exec(db, sql, &p, 1, &r);
+  if (*st != CLPD_DB_OK) return -1;
   if (clpd_db_result_rows(r) > 0) {
     text_of(clpd_db_result_value(r, 0, 0), row->definition,
             sizeof row->definition);
+    text_of(clpd_db_result_value(r, 0, 1), row->version,
+            sizeof row->version);
     text_of(clpd_db_result_value(r, 0, 2), row->status, sizeof row->status);
-    state = ROW_FOUND;
+    found = 1;
   }
   clpd_db_result_free(r);
-  return state;
+  return found;
+}
+
+static row_state read_row(clpd_db *db, const char *schema, const char *wf,
+                          instance_row *row) {
+  clpd_db_status st;
+  switch (clpd_orm_life_read_row(db, schema, wf, row, &st)) {
+  case 1: return ROW_FOUND;
+  case 0: return ROW_NONE;
+  default: return ROW_FAILED;
+  }
 }
 
 /* The final row: inserted with the caller's definition and version when

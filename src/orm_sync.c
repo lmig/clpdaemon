@@ -58,9 +58,11 @@
 
 #include "orm_sync.h"
 
+#include "ingest.h"
 #include "log.h"
 #include "orm.h"
 #include "orm_evict.h"
+#include "orm_life.h"
 #include "orm_load.h"
 
 #include <stdint.h>
@@ -89,6 +91,13 @@ typedef struct {
   char *wf;
   int n;
 } strike;
+
+/* The facts in working memory of one instance (T11d). */
+typedef struct live_node {
+  char *wf;
+  size_t n;
+  struct live_node *chain; /* the next entry of the bucket */
+} live_node;
 
 /* A mapped template whose facts are synchronized (sync = auto). */
 typedef struct {
@@ -156,6 +165,9 @@ struct clpd_orm_syncer {
   long long idle_ms;        /* the idle period */
   clpd_orm_sync_clock *now; /* monotonic, ms */
   void *now_ctx;
+  /* On-demand rehydration (T11d): facts in working memory per instance. */
+  live_node **live;
+  size_t live_nb, live_n; /* buckets (a power of two), entries */
 };
 
 static void *xrealloc(void *p, size_t n) {
@@ -260,12 +272,15 @@ static const clpd_package *package_of(const clpd_orm_syncer *s,
 }
 
 static void note_activity(clpd_orm_syncer *s, const char *wf);
+static void live_add(clpd_orm_syncer *s, const char *wf, int delta);
 
-/* f was asserted or retracted: activity of its instance (T11c), and the
- * instance is touched when an open cycle (not loading) did it. */
-static void track(clpd_orm_syncer *s, Fact *f) {
+/* f was asserted (delta 1) or retracted (-1): its instance's fact count
+ * (T11d), activity of its instance (T11c), and the instance is touched
+ * when an open cycle (not loading) did it. */
+static void track(clpd_orm_syncer *s, Fact *f, int delta) {
   char *wf;
   if ((wf = fact_wf(f)) == NULL) return;
+  live_add(s, wf, delta);
   note_activity(s, wf);
   if (s->cycle_open && !s->suspended)
     wfset_add(&s->touched, wf, package_of(s, FactDeftemplate(f)));
@@ -549,7 +564,7 @@ static void on_assert(Environment *env, void *fact, void *ctx) {
   long long index;
   long pos;
   (void)env;
-  track(s, fact);
+  track(s, fact, 1);
   if (m == NULL) return;
   index = FactIndex(fact);
   pos = find(s, index);
@@ -569,7 +584,7 @@ static void on_retract(Environment *env, void *fact, void *ctx) {
   const tmap *m = map_of(s, FactDeftemplate(fact));
   long pos;
   (void)env;
-  track(s, fact);
+  track(s, fact, -1);
   if (m == NULL) return;
   pos = find(s, FactIndex(fact));
   if (s->suspended) {
@@ -1137,6 +1152,15 @@ void clpd_orm_sync_detach(clpd_orm_syncer *s) {
   wfset_free(&s->touched);
   wfset_free(&s->pending);
   clpd_orm_evict_free(s->idle);
+  while (s->live_nb > 0) {
+    live_node *e = s->live[--s->live_nb], *chain;
+    for (; e != NULL; e = chain) {
+      chain = e->chain;
+      free(e->wf);
+      free(e);
+    }
+  }
+  free(s->live);
   free(s->e);
   free(s->buckets);
   free(s->maps);
@@ -1634,4 +1658,177 @@ int clpd_orm_sync_evict_idle(clpd_orm_syncer *s, FILE *log) {
   for (i = 0; i < n; i++) free(c[i].wf);
   free(c);
   return evicted;
+}
+
+/* --- on-demand rehydration (T11d) ------------------------------------- */
+
+/* FNV-1a. */
+static size_t live_hash(const char *wf) {
+  uint64_t h = UINT64_C(14695981039346656037);
+  for (; *wf != '\0'; wf++) {
+    h ^= (unsigned char)*wf;
+    h *= UINT64_C(1099511628211);
+  }
+  return (size_t)h;
+}
+
+/* The bucket slot holding wf's entry (or the NULL at its chain's end). */
+static live_node **live_slot(const clpd_orm_syncer *s, const char *wf) {
+  live_node **p = &s->live[live_hash(wf) & (s->live_nb - 1)];
+  while (*p != NULL && strcmp((*p)->wf, wf) != 0) p = &(*p)->chain;
+  return p;
+}
+
+/* One fact of instance wf more (delta 1) or less (-1) in working memory;
+ * the entry goes when its count reaches 0. A retract with no entry (a
+ * fact asserted before the hooks) changes nothing. */
+static void live_add(clpd_orm_syncer *s, const char *wf, int delta) {
+  live_node **p, *e;
+  if (s->live_nb == 0) {
+    s->live_nb = BUCKETS_MIN;
+    s->live = xrealloc(NULL, s->live_nb * sizeof *s->live);
+    memset(s->live, 0, s->live_nb * sizeof *s->live);
+  }
+  p = live_slot(s, wf);
+  if ((e = *p) == NULL) {
+    size_t nb, i;
+    if (delta < 0) return;
+    if (s->live_n + 1 > s->live_nb) { /* doubled: chains stay short */
+      live_node **b;
+      nb = 2 * s->live_nb;
+      b = xrealloc(NULL, nb * sizeof *b);
+      memset(b, 0, nb * sizeof *b);
+      for (i = 0; i < s->live_nb; i++) {
+        live_node *x = s->live[i], *chain;
+        for (; x != NULL; x = chain) {
+          size_t k = live_hash(x->wf) & (nb - 1);
+          chain = x->chain;
+          x->chain = b[k];
+          b[k] = x;
+        }
+      }
+      free(s->live);
+      s->live = b;
+      s->live_nb = nb;
+      p = live_slot(s, wf);
+    }
+    e = xrealloc(NULL, sizeof *e);
+    e->wf = xstrdup(wf);
+    e->n = 1;
+    e->chain = NULL;
+    *p = e;
+    s->live_n++;
+    return;
+  }
+  if (delta > 0) {
+    e->n++;
+  } else if (--e->n == 0) {
+    *p = e->chain;
+    free(e->wf);
+    free(e);
+    s->live_n--;
+  }
+}
+
+/* 1 when a fact carrying instance wf is in working memory. */
+static int live_has(const clpd_orm_syncer *s, const char *wf) {
+  return s->live_nb > 0 && *live_slot(s, wf) != NULL;
+}
+
+/* The loaded package definition@version, or NULL. */
+static const clpd_package *package_named(const clpd_orm_syncer *s,
+                                         const char *definition,
+                                         const char *version) {
+  size_t i;
+  for (i = 0; i < s->p->count; i++)
+    if (strcmp(s->p->items[i].manifest.definition, definition) == 0 &&
+        strcmp(s->p->items[i].manifest.version, version) == 0)
+      return &s->p->items[i];
+  return NULL;
+}
+
+/* The admission failed: a statement of the open cycle failed (the commit
+ * will report it), or (no failed statement) the cycle is aborted at its
+ * end with why. */
+static int admit_failed(clpd_orm_syncer *s, const char *why) {
+  if (!clpd_db_atomic_failed(s->db) && !s->abort_pending) {
+    s->abort_pending = 1;
+    snprintf(s->abort_why, sizeof s->abort_why, "%s", why);
+  }
+  return CLPD_INGEST_STOP;
+}
+
+/* Reads the row of instance wf, which has no fact in memory, and reloads
+ * it when it is active (clpd_orm_sync_admit). */
+static int admit_instance(clpd_orm_syncer *s, const char *wf, FILE *log) {
+  char schema[CLPD_ORM_TX_SCHEMA_SIZE + 2] = "", msg[1024],
+       shown_wf[SHOWN_MAX + 1], shown_def[SHOWN_MAX + 1],
+       shown_ver[SHOWN_MAX + 1];
+  const clpd_orm_template *t = NULL;
+  const clpd_package *pkg;
+  clpd_orm_life_row row;
+  clpd_db_status st;
+  size_t loaded;
+  int found;
+  char *w = (char *)wf; /* retract_instances only reads it */
+  if (clpd_db_atomic_failed(s->db) || s->abort_pending)
+    return CLPD_INGEST_STOP; /* nothing can be read any more */
+  if (strcmp(clpd_db_backend(s->db), "postgresql") == 0) {
+    if (clpd_orm_tx_schema_status(s->db, schema, msg, sizeof msg, &st) != 0) {
+      fprintf(log, "clpdaemon: rehydrate: %s\n", msg);
+      fflush(log);
+      return admit_failed(s, msg);
+    }
+    strcat(schema, ".");
+  }
+  found = clpd_orm_life_read_row(s->db, schema, wf, &row, &st);
+  if (found < 0) {
+    snprintf(msg, sizeof msg, "%s", clpd_db_error(s->db));
+    fprintf(log, "clpdaemon: rehydrate: instance '%s': table '"
+                 CLPD_ORM_INSTANCE_TABLE "': %s\n",
+            shown(wf, shown_wf), msg);
+    fflush(log);
+    if (!retryable(st)) isolate_instance(s, wf, msg, log);
+    return admit_failed(s, msg);
+  }
+  if (found == 0) return CLPD_INGEST_ASSERT; /* a new instance */
+  if (strcmp(row.status, "completed") == 0 ||
+      strcmp(row.status, "failed") == 0) {
+    fprintf(log, "clpdaemon: ingest: instance '%s' is %s; fact dropped\n",
+            shown(wf, shown_wf), row.status);
+    fflush(log);
+    return CLPD_INGEST_DROP;
+  }
+  if ((pkg = package_named(s, row.definition, row.version)) == NULL) {
+    fprintf(log, "clpdaemon: ingest: instance '%s' belongs to package "
+                 "%s@%s, which is not loaded; fact dropped\n",
+            shown(wf, shown_wf), shown(row.definition, shown_def),
+            shown(row.version, shown_ver));
+    fflush(log);
+    return CLPD_INGEST_DROP;
+  }
+  st = clpd_orm_load_instance(s->env, s->db, s, pkg, schema, wf, NULL, 0,
+                              log, &loaded, &t);
+  if (st == CLPD_DB_OK) return CLPD_INGEST_ASSERT;
+  snprintf(msg, sizeof msg, "%s", clpd_db_error(s->db));
+  fprintf(log, "clpdaemon: rehydrate: instance '%s': %s::%s: table '%s': "
+               "%s\n",
+          shown(wf, shown_wf), pkg->manifest.name, t->name, t->table, msg);
+  fflush(log);
+  retract_instances(s, &w, 1, NULL); /* what it loaded */
+  if (!retryable(st)) isolate_instance(s, wf, msg, log);
+  return admit_failed(s, msg);
+}
+
+int clpd_orm_sync_admit(clpd_orm_syncer *s, const CLIPSValue *wf_id,
+                        FILE *log) {
+  char *wf;
+  int rc;
+  if (s == NULL || wf_id == NULL || !s->cycle_open ||
+      (wf = value_text(wf_id)) == NULL)
+    return CLPD_INGEST_ASSERT;
+  rc = live_has(s, wf) || is_isolated(s, wf) ? CLPD_INGEST_ASSERT
+                                             : admit_instance(s, wf, log);
+  free(wf);
+  return rc;
 }

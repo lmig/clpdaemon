@@ -2534,9 +2534,10 @@ clpdaemon: nodb@1: clips:    (wf-complete
 clpdaemon: lifenodb/r.clp: load failed" -- --config lifenodb.conf --check
 # A running daemon: wf-complete writes the rule's pending modify first, then
 # status completed; wf-fail status failed with its reason; every fact of a
-# finished instance leaves working memory (show counts them), its mapped
-# row stays, a second call is refused with the exact line, and a fact
-# asserted for it later (late) is never written.
+# finished instance leaves working memory, its mapped row stays. Since
+# T11d every later fact for a finished instance (again, late, show) is
+# dropped at ingest with the exact line: nothing is asserted (no rule
+# fires, so no second call and no show line) and nothing is written.
 mkdir lifepkg
 conf lifepkg/package.conf 'definition = life
 version = 1
@@ -2585,12 +2586,13 @@ linject 8 '{"template":"go","slots":{"wf-id":{"sym":"w2"},"act":{"sym":"show"}}}
 kill -TERM "$pid" 2>/dev/null
 wait_exit "$pid"
 want="clpdaemon: n1: running
-clpdaemon: wf-complete: instance 'w1' is already completed
-[PRCCODE4] Execution halted during the actions of defrule 'again'.
-clpdaemon: wf-complete: instance 'w2' is already failed
-[PRCCODE4] Execution halted during the actions of defrule 'again'.
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w2' is failed; fact dropped
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w2' is failed; fact dropped
 clpdaemon: received SIGTERM, stopping"
-if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != "show w1 orders=1 memos=0${NL}show w2 orders=0 memos=0" ] || [ "$(cat err.txt)" != "$want" ]; then
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
   fail "life: a running daemon finishes its instances" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
 fi
 if command -v sqlite3 >/dev/null 2>&1; then
@@ -2868,6 +2870,102 @@ wait_exit "$pid"
   fail "evict: no eviction without a database" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
 cases=$((cases + 1))
 case $st in *' queue=0 facts=2') ;; *) fail "evict: the fact stays without a database" "status [$st]" ;; esac
+
+# --- on-demand rehydration (T11d, FR-9, FR-2, docs/orm.md#on-demand-rehydration)
+# order is mapped (sync = auto), event is not. saw prints the stored state a
+# look event of the instance finds; done ends the instance (wf-complete).
+mkdir odpkg
+conf odpkg/package.conf 'definition = od
+version = 1
+files = r.clp
+orm = orm.conf
+ingest = order, event'
+conf odpkg/r.clp '(deftemplate boot (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate event (slot wf-id) (slot kind (type SYMBOL)))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot ?b <- (boot (wf-id ?w)) => (retract ?b) (db-create-table order))
+(defrule saw (event (wf-id ?w) (kind look)) (order (wf-id ?w) (status ?s)) => (printout t "saw " ?w " " ?s crlf))
+(defrule done (event (wf-id ?w) (kind done)) => (wf-complete ?w))'
+conf odpkg/orm.conf 'order.table = od_order
+order.owned = yes
+order.slot.wf-id = wf_id text string error
+order.slot.status = status text symbol default'
+if command -v sqlite3 >/dev/null 2>&1; then
+  rconf odrun.conf "node_id = n1
+tick_interval_ms = 50
+cycle_min_interval_ms = 10
+idle_eviction_after = 1s
+database = sqlite:$WORK/od.db
+packages = odpkg"
+  odsql() { sqlite3 -cmd '.timeout 5000' od.db "$1" 2>&1; }
+  # odrows: every row of the tables the case writes (timestamps included).
+  odrows() { odsql "SELECT * FROM od_order ORDER BY 1; SELECT * FROM workflow_instance ORDER BY 1"; }
+  # Evict then inject: e1 is evicted, another writer changes its row, and a
+  # look event reloads the stored state before it is asserted.
+  cases=$((cases + 1))
+  start odrun.conf admin.sock
+  acase "rehydrate: inject the order" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":"e1","status":{"sym":"new"}}}\n'
+  wait_status admin.sock ' queue=0 facts=2$' || ok=0
+  wait_line err.txt "clpdaemon: evict: instance 'e1' after 1 s without activity" || ok=0
+  wait_status admin.sock ' queue=0 facts=1$' || ok=0
+  [ "$(odsql "UPDATE od_order SET status = 'other' WHERE wf_id = 'e1'; SELECT changes()")" = 1 ] || ok=0
+  od_before=$(odrows)
+  acase "rehydrate: inject after the eviction" "OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\n'
+  wait_line out.txt "saw e1 other" || ok=0
+  wait_status admin.sock ' queue=0 facts=3$' || ok=0
+  od_after=$(odrows)
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  want="clpdaemon: n1: running
+clpdaemon: evict: instance 'e1' after 1 s without activity
+clpdaemon: received SIGTERM, stopping"
+  [ "$ok" = 1 ] && [ "$rc" = 0 ] && [ "$(cat out.txt)" = "saw e1 other" ] && [ "$(cat err.txt)" = "$want" ] &&
+    [ -n "$od_before" ] && [ "$od_after" = "$od_before" ] ||
+    fail "rehydrate: evict then inject reloads the stored state first" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)], before [$od_before], after [$od_after]"
+  # Restart then inject: nothing is reloaded at startup (only the clock
+  # fact); a look event reloads e1; done ends it; then facts for finished
+  # instances (completed here, failed by another writer) and for an active
+  # instance whose package is not loaded are dropped, nothing written.
+  cases=$((cases + 1))
+  start odrun.conf admin.sock
+  wait_status admin.sock ' cycles=[1-9][0-9]* queue=0 facts=1$' || ok=0
+  st0=$("$ADMIN" admin.sock 'status\n' 2>&1)
+  acase "rehydrate: inject after the restart" "OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\n'
+  wait_line out.txt "saw e1 other" || ok=0
+  wait_status admin.sock ' queue=0 facts=3$' || ok=0
+  acase "rehydrate: inject done" "OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"done"}}}\n'
+  wait_status admin.sock ' queue=0 facts=1$' || ok=0
+  [ "$(odsql "SELECT status FROM workflow_instance WHERE wf_id = 'e1'")" = completed ] || ok=0
+  odsql "INSERT INTO workflow_instance (wf_id, definition, version, status, created_at, updated_at) VALUES ('f1', 'od', '1', 'failed', 'x', 'x'), ('p1', 'other', '2', 'active', 'x', 'x')" >/dev/null
+  od_before=$(odrows)
+  acase "rehydrate: inject for finished and foreign instances" "OK queued
+OK queued
+OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\ninject {"template":"order","slots":{"wf-id":"f1","status":{"sym":"late"}}}\ninject {"template":"event","slots":{"wf-id":"p1"}}\n'
+  wait_line err.txt "clpdaemon: ingest: instance 'p1' belongs to package other@2, which is not loaded; fact dropped" || ok=0
+  wait_status admin.sock ' queue=0 facts=1$' || ok=0
+  sleep 0.3
+  st1=$("$ADMIN" admin.sock 'status\n' 2>&1)
+  od_after=$(odrows)
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  want="clpdaemon: n1: running
+clpdaemon: ingest: instance 'e1' is completed; fact dropped
+clpdaemon: ingest: instance 'f1' is failed; fact dropped
+clpdaemon: ingest: instance 'p1' belongs to package other@2, which is not loaded; fact dropped
+clpdaemon: received SIGTERM, stopping"
+  [ "$ok" = 1 ] && [ "$rc" = 0 ] && [ "$(cat out.txt)" = "saw e1 other" ] && [ "$(cat err.txt)" = "$want" ] ||
+    fail "rehydrate: restart then inject, finished instances dropped" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  cases=$((cases + 1))
+  case $st0 in *' queue=0 facts=1') ;; *) fail "rehydrate: no eager reload at startup" "status [$st0]" ;; esac
+  cases=$((cases + 1))
+  case $st1 in *' queue=0 facts=1') ;; *) fail "rehydrate: dropped facts are not asserted" "status [$st1]" ;; esac
+  cases=$((cases + 1))
+  [ -n "$od_before" ] && [ "$od_after" = "$od_before" ] && [ "$(odrows)" = "$od_before" ] ||
+    fail "rehydrate: nothing written for dropped facts" "before [$od_before], after [$od_after], at exit [$(odrows)]"
+else
+  echo "cli_test.sh: sqlite3 not found; the T11d database cases are skipped" >&2
+fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

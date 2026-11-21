@@ -25,6 +25,8 @@
 # (B) isolates nothing and the row is written after the release; UNIQUE,
 # lock timeout, lock timeout, UNIQUE isolates only after the second
 # UNIQUE (D).
+# T11d: on-demand rehydration (evict then inject, restart then inject,
+# finished instances and an unloaded package dropped).
 set -u
 
 U='usage: cli_pg_test.sh <clpdaemon> <admin-client> <conninfo> <password>'
@@ -672,9 +674,9 @@ q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
 # T11a: wf-complete and wf-fail against PostgreSQL. wf-complete writes the
 # rule's pending modify first, then status completed (reason NULL) with a
 # later updated_at; wf-fail status failed with its reason; the instance's
-# facts leave working memory (show counts them), its mapped rows stay, a
-# second call is refused with the exact line, and a later fact (late) is
-# never written. Then a workflow_instance of another shape (the T10 table,
+# facts leave working memory, its mapped rows stay; since T11d every later
+# fact for a finished instance (again, late, show) is dropped at ingest
+# with the exact line (no rule fires, nothing is written). Then a workflow_instance of another shape (the T10 table,
 # without reason) is refused at startup.
 mkdir lifepkg
 printf '%s\n' 'definition = pglife
@@ -727,13 +729,14 @@ for j in '"w1"},"act":{"sym":"done"}' '"w2"},"act":{"sym":"fail"},"why":"no stoc
 done
 stop_daemon "pg life"
 want="clpdaemon: n1: running
-clpdaemon: wf-complete: instance 'w1' is already completed
-[PRCCODE4] Execution halted during the actions of defrule 'again'.
-clpdaemon: wf-complete: instance 'w2' is already failed
-[PRCCODE4] Execution halted during the actions of defrule 'again'.
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w2' is failed; fact dropped
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w2' is failed; fact dropped
 clpdaemon: received SIGTERM, stopping"
 cases=$((cases + 1))
-[ "$ok" = 1 ] && [ "$(cat err.txt)" = "$want" ] && [ "$(cat out.txt)" = "show w1 orders=1 memos=0${NL}show w2 orders=0 memos=0" ] &&
+[ "$ok" = 1 ] && [ "$(cat err.txt)" = "$want" ] && [ ! -s out.txt ] &&
   [ "$(cat inject.txt)" = "OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued" ] ||
   fail "pg life: a running daemon finishes its instances" "cycles seen $ok, inject [$(cat inject.txt)], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
 cases=$((cases + 1))
@@ -882,6 +885,110 @@ cases=$((cases + 1))
   [ -n "$ev_before" ] && [ "$ev_after" = "$ev_before" ] && [ "$(evrows)" = "$ev_before" ] ||
   fail "pg evict: the evicted instances' rows are unchanged" "before [$ev_before], after [$ev_after], at exit [$(evrows)]"
 q 'DROP TABLE IF EXISTS pgev_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
+# T11d: on-demand rehydration with PostgreSQL. e1 is evicted (idle 1s),
+# another session changes its row, and a look event reloads the stored
+# state before it is asserted (saw prints it); after a restart nothing is
+# reloaded at startup and the same event reloads e1 again; done ends it;
+# then facts for finished instances (completed, failed by another writer)
+# and for an active instance whose package is not loaded are dropped with
+# their lines, nothing asserted, nothing written.
+mkdir odpkg
+printf '%s\n' 'definition = pgrh
+version = 1
+files = r.clp
+orm = orm.conf
+ingest = order, event' >odpkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate event (slot wf-id) (slot kind (type SYMBOL)))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot ?b <- (boot (wf-id ?w)) => (retract ?b) (db-create-table order))
+(defrule saw (event (wf-id ?w) (kind look)) (order (wf-id ?w) (status ?s)) => (printout t "saw " ?w " " ?s crlf))
+(defrule done (event (wf-id ?w) (kind done)) => (wf-complete ?w))' >odpkg/r.clp
+printf '%s\n' 'order.table = pgrh_order
+order.owned = yes
+order.slot.wf-id = wf_id text string error
+order.slot.status = status text symbol default' >odpkg/orm.conf
+printf '%s\n' "node_id = n1
+tick_interval_ms = 50
+cycle_min_interval_ms = 10
+idle_eviction_after = 1s
+admin_socket = $WORK/admin.sock
+database = $CONNINFO
+packages = odpkg" >rh.conf
+q 'DROP TABLE IF EXISTS pgrh_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+rhrows() { q "SELECT wf_id || '|' || status FROM pgrh_order ORDER BY 1"; q "SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || coalesce(reason, '-') || '|' || created_at || '|' || updated_at FROM workflow_instance ORDER BY 1"; }
+rh_start() {
+  : >out.txt
+  : >err.txt
+  "$BIN" --config rh.conf >out.txt 2>err.txt &
+  pid=$!
+  ok=1
+  wait_has err.txt 'clpdaemon: n1: running' || ok=0
+  n=0
+  while [ ! -S admin.sock ] && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+}
+rh_start
+inj=$("$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":"e1","status":{"sym":"new"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+evstatus ' queue=0 facts=2$' || ok=0
+wait_has err.txt "clpdaemon: evict: instance 'e1' after 1 s without activity" || ok=0
+evstatus ' queue=0 facts=1$' || ok=0
+[ "$(q "UPDATE pgrh_order SET status = 'other' WHERE wf_id = 'e1' RETURNING wf_id")" = e1 ] || ok=0
+rh_before=$(rhrows)
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+wait_has out.txt "saw e1 other" || ok=0
+evstatus ' queue=0 facts=3$' || ok=0
+rh_after=$(rhrows)
+stop_daemon "pg rehydrate: evict"
+cases=$((cases + 1))
+want="clpdaemon: n1: running
+clpdaemon: evict: instance 'e1' after 1 s without activity
+clpdaemon: received SIGTERM, stopping"
+[ "$ok" = 1 ] && [ "$(cat out.txt)" = "saw e1 other" ] && [ "$(cat err.txt)" = "$want" ] &&
+  [ -n "$rh_before" ] && [ "$rh_after" = "$rh_before" ] ||
+  fail "pg rehydrate: evict then inject reloads the stored state first" "seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)], before [$rh_before], after [$rh_after]"
+rh_start
+evstatus ' cycles=[1-9][0-9]* queue=0 facts=1$' || ok=0
+st0=$("$ADMIN" admin.sock 'status\n' 2>&1)
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+wait_has out.txt "saw e1 other" || ok=0
+evstatus ' queue=0 facts=3$' || ok=0
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"done"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+evstatus ' queue=0 facts=1$' || ok=0
+[ "$(q "SELECT status FROM workflow_instance WHERE wf_id = 'e1'")" = completed ] || ok=0
+q "INSERT INTO workflow_instance (wf_id, definition, version, status, created_at, updated_at) VALUES ('f1', 'pgrh', '1', 'failed', now(), now()), ('p1', 'other', '2', 'active', now(), now())" >/dev/null
+rh_before=$(rhrows)
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\ninject {"template":"order","slots":{"wf-id":"f1","status":{"sym":"late"}}}\ninject {"template":"event","slots":{"wf-id":"p1"}}\n' 2>&1)
+[ "$inj" = "OK queued${NL}OK queued${NL}OK queued" ] || ok=0
+wait_has err.txt "clpdaemon: ingest: instance 'p1' belongs to package other@2, which is not loaded; fact dropped" || ok=0
+evstatus ' queue=0 facts=1$' || ok=0
+sleep 0.3
+st1=$("$ADMIN" admin.sock 'status\n' 2>&1)
+rh_after=$(rhrows)
+stop_daemon "pg rehydrate: restart"
+cases=$((cases + 1))
+want="clpdaemon: n1: running
+clpdaemon: ingest: instance 'e1' is completed; fact dropped
+clpdaemon: ingest: instance 'f1' is failed; fact dropped
+clpdaemon: ingest: instance 'p1' belongs to package other@2, which is not loaded; fact dropped
+clpdaemon: received SIGTERM, stopping"
+[ "$ok" = 1 ] && [ "$(cat out.txt)" = "saw e1 other" ] && [ "$(cat err.txt)" = "$want" ] ||
+  fail "pg rehydrate: restart then inject, finished instances dropped" "seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+case $st0 in *' queue=0 facts=1') ;; *) fail "pg rehydrate: no eager reload at startup" "status [$st0]" ;; esac
+cases=$((cases + 1))
+case $st1 in *' queue=0 facts=1') ;; *) fail "pg rehydrate: dropped facts are not asserted" "status [$st1]" ;; esac
+cases=$((cases + 1))
+[ -n "$rh_before" ] && [ "$rh_after" = "$rh_before" ] && [ "$(rhrows)" = "$rh_before" ] ||
+  fail "pg rehydrate: nothing written for dropped facts" "before [$rh_before], after [$rh_after], at exit [$(rhrows)]"
+q 'DROP TABLE IF EXISTS pgrh_order' >/dev/null
 q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
 
 printf '%d/%d PostgreSQL CLI cases passed\n' $((cases - failures)) "$cases"

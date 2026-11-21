@@ -113,6 +113,16 @@ set_tests_properties(clpdaemon_orm_evict PROPERTIES TIMEOUT 60)
 add_test(NAME clpdaemon_orm_evict_pg
   COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:orm_evict_test>)
 set_tests_properties(clpdaemon_orm_evict_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+# On-demand rehydration (T11d): the same pair, SQLite and PostgreSQL.
+add_executable(orm_rehydrate_test orm/orm_rehydrate_test.c)
+target_link_libraries(orm_rehydrate_test PRIVATE clpd_core)
+target_include_directories(orm_rehydrate_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+target_compile_options(orm_rehydrate_test PRIVATE ${CLPD_WARNINGS})
+add_test(NAME clpdaemon_orm_rehydrate COMMAND orm_rehydrate_test)
+set_tests_properties(clpdaemon_orm_rehydrate PROPERTIES TIMEOUT 60)
+add_test(NAME clpdaemon_orm_rehydrate_pg
+  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/db/pg_cluster.sh $<TARGET_FILE:orm_rehydrate_test>)
+set_tests_properties(clpdaemon_orm_rehydrate_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 # A running daemon against PostgreSQL (T10b): the synchronization, and the
 # admin socket served during the backoff after a lost server.
 add_test(NAME clpdaemon_cli_pg
@@ -122,7 +132,7 @@ add_test(NAME clpdaemon_cli_pg
 set_tests_properties(clpdaemon_cli_pg PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 set_tests_properties(clpdaemon_db_pg clpdaemon_orm_ddl_pg clpdaemon_orm_tx_pg
   clpdaemon_orm_sync_pg clpdaemon_orm_dml_pg clpdaemon_orm_life_pg
-  clpdaemon_orm_evict_pg clpdaemon_cli_pg PROPERTIES
+  clpdaemon_orm_evict_pg clpdaemon_orm_rehydrate_pg clpdaemon_cli_pg PROPERTIES
   RESOURCE_LOCK clpd_pg_cluster)
 
 # Link seam for the reader-failure cases, this test binary only: the test
@@ -151,6 +161,9 @@ target_link_options(orm_dml_test PRIVATE -Wl,--wrap=clpd_db_exec)
 target_link_options(orm_life_test PRIVATE -Wl,--wrap=clpd_db_exec)
 # orm_evict_test wraps it to show the eviction sends no statement (T11c).
 target_link_options(orm_evict_test PRIVATE -Wl,--wrap=clpd_db_exec)
+# orm_rehydrate_test wraps it to record the reloads and to make one fail
+# (T11d).
+target_link_options(orm_rehydrate_test PRIVATE -Wl,--wrap=clpd_db_exec)
 
 # The loader test dlopens the plugins built in <build>/plugins, which take
 # their CLIPS symbols from the test executable.

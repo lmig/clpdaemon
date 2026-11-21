@@ -76,4 +76,24 @@ int clpd_ingest_assert(Environment *env, const clpd_packages *p,
 size_t clpd_ingest_drain(Environment *env, const clpd_packages *p,
                          clpd_ingest_reject_fn *reject, void *ctx);
 
+/* The admission of a fact the drain is about to assert (T11d, the
+ * on-demand rehydration of src/orm_sync.h): called once every check of
+ * the document passed, right before the assert, with the value the fact's
+ * wf-id slot will hold (the one the document gives, else the slot's
+ * default; NULL when the template has no wf-id slot). It may assert other
+ * facts. Returns CLPD_INGEST_ASSERT (the fact is asserted),
+ * CLPD_INGEST_DROP (the fact is freed without being asserted; the
+ * admission logged why) or CLPD_INGEST_STOP (the fact stays at the head
+ * of the queue, with every fact after it, and the drain ends). */
+enum { CLPD_INGEST_ASSERT = 0, CLPD_INGEST_DROP = 1, CLPD_INGEST_STOP = -1 };
+typedef int clpd_ingest_admit_fn(void *ctx, const CLIPSValue *wf_id);
+/* clpd_ingest_drain with an admission (admit NULL: none, the same as
+ * clpd_ingest_drain). *asserted (when not NULL) gets the number
+ * clpd_ingest_drain returns. Returns 0, or -1 when an admission stopped
+ * the drain. Engine thread, outside Run. */
+int clpd_ingest_drain_admit(Environment *env, const clpd_packages *p,
+                            clpd_ingest_reject_fn *reject, void *rctx,
+                            clpd_ingest_admit_fn *admit, void *actx,
+                            size_t *asserted);
+
 #endif

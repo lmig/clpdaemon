@@ -209,4 +209,41 @@ int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
  * cycle is open. */
 int clpd_orm_sync_evict_idle(clpd_orm_syncer *s, FILE *log);
 
+/* The on-demand rehydration (T11d, FR-9;
+ * docs/orm.md#on-demand-rehydration): the admission of the ingest drain
+ * (src/ingest.h clpd_ingest_admit_fn, whose CLPD_INGEST_* values it
+ * returns), inside the open cycle transaction. wf_id is the
+ * value the wf-id slot of the fact about to be asserted will hold (NULL:
+ * no wf-id slot). Returns CLPD_INGEST_ASSERT at once for s NULL, no cycle
+ * open, a value that names no instance (src/orm_sync.c value_text), an
+ * instance with a fact in working memory (a count the hooks keep, O(1))
+ * or an isolated one (never reloaded). Otherwise reads the instance's
+ * workflow_instance row:
+ *   no row: CLPD_INGEST_ASSERT (a new instance);
+ *   status completed or failed: logs
+ *     clpdaemon: ingest: instance '<wf-id>' is <status>; fact dropped
+ *   and returns CLPD_INGEST_DROP;
+ *   any other status, the package definition@version of the row not
+ *   loaded: logs
+ *     clpdaemon: ingest: instance '<wf-id>' belongs to package
+ *     <definition>@<version>, which is not loaded; fact dropped
+ *   and returns CLPD_INGEST_DROP;
+ *   otherwise loads the instance with clpd_orm_load_instance (that
+ *   package, without echo) and returns CLPD_INGEST_ASSERT.
+ * A failed statement logs
+ *   clpdaemon: rehydrate: instance '<wf-id>': table 'workflow_instance':
+ *   <message>
+ * (the row) or the rehydrate: line of clpd_orm_sync_begin_cycle (a
+ * SELECT of the load; what the instance loaded is retracted), or
+ * "clpdaemon: rehydrate: <message>" (PostgreSQL current_schema()), and
+ * returns CLPD_INGEST_STOP: the cycle can no longer commit, and
+ * clpd_orm_sync_end_cycle rolls it back (its cycle transaction line
+ * follows). A failure that is neither CLPD_DB_LOST nor CLPD_DB_TRANSIENT
+ * (T10f) also isolates the instance (the isolation line of
+ * clpd_orm_sync_end_cycle follows at once). <wf-id>, <definition> and
+ * <version> are shown with control characters as '?', at most 200
+ * bytes. */
+int clpd_orm_sync_admit(clpd_orm_syncer *s, const CLIPSValue *wf_id,
+                        FILE *log);
+
 #endif

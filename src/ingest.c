@@ -93,6 +93,30 @@ static int take(item *out) {
   return got;
 }
 
+/* The oldest queued fact without taking it; 0 when the queue is empty.
+ * Only the engine thread takes facts, and posts only add after the last
+ * one, so the head stays the same until pop(). */
+static int peek(item *out) {
+  int got = 0;
+  pthread_mutex_lock(&lock);
+  if (count > 0) {
+    *out = ring[head];
+    got = 1;
+  }
+  pthread_mutex_unlock(&lock);
+  return got;
+}
+
+/* Removes the oldest queued fact (the one peek() returned). */
+static void pop(void) {
+  pthread_mutex_lock(&lock);
+  if (count > 0) {
+    head = (head + 1) % CLPD_INGEST_QUEUE_MAX;
+    count--;
+  }
+  pthread_mutex_unlock(&lock);
+}
+
 size_t clpd_ingest_clear(void) {
   size_t dropped = 0;
   item it;
@@ -225,9 +249,10 @@ static int check_constraints(ctx *c, TemplateSlot *ts, CLIPSValue *cv) {
   }
 }
 
-/* Puts one slot member into fb after the shape checks. */
+/* Puts one slot member into fb after the shape checks; the value put in
+ * *put (when not NULL). */
 static int put_slot(ctx *c, FactBuilder *fb, TemplateSlot *ts,
-                    const clpd_json *v) {
+                    const clpd_json *v, CLIPSValue *put) {
   CLIPSValue cv;
   if (!ts->multislot) {
     if (v->type == CLPD_JSON_ARRAY)
@@ -250,10 +275,11 @@ static int put_slot(ctx *c, FactBuilder *fb, TemplateSlot *ts,
     MBDispose(mb);
   }
   if (check_constraints(c, ts, &cv) != 0) return -1;
-  return FBPutSlot(fb, ts->slotName->contents, &cv) == PSE_NO_ERROR
-             ? 0
-             : fail(c, "slot '%s': value rejected by the slot's constraints",
-                    c->slot);
+  if (FBPutSlot(fb, ts->slotName->contents, &cv) != PSE_NO_ERROR)
+    return fail(c, "slot '%s': value rejected by the slot's constraints",
+                c->slot);
+  if (put != NULL) *put = cv;
+  return 0;
 }
 
 #ifndef NDEBUG
@@ -277,12 +303,36 @@ static int no_inner_nul(const clpd_json *v) {
 }
 #endif
 
+#define WF_ID "wf-id" /* the instance slot (src/orm.h CLPD_ORM_WF_ID) */
+
+/* The value the wf-id slot of the fact will hold: the one put (has_wf),
+ * else the slot's default (into *wf); NULL without a wf-id slot or
+ * default. */
+static const CLIPSValue *admitted_wf(Deftemplate *tpl, int has_wf,
+                                     CLIPSValue *wf) {
+  if (has_wf) return wf;
+  if (!DeftemplateSlotExistP(tpl, WF_ID) ||
+      !DeftemplateSlotDefaultValue(tpl, WF_ID, wf))
+    return NULL;
+  return wf;
+}
+
+/* The admission of the drain (T11d), NULL: none. */
+typedef struct {
+  clpd_ingest_admit_fn *fn;
+  void *ctx;
+  int verdict; /* what fn returned; CLPD_INGEST_ASSERT without fn */
+} admission;
+
 /* Checks the document and fills a fact builder for its template, then
- * asserts it when do_assert is set. Order of the checks (docs/ingest.md):
- * JSON, top-level keys in document order, 'template', 'slots', the
- * whitelist, each slot in document order, then the required slots. */
+ * asserts it when do_assert is set, after the admission a (if not NULL)
+ * agreed. Order of the checks (docs/ingest.md): JSON, top-level keys in
+ * document order, 'template', 'slots', the whitelist, each slot in
+ * document order, then the required slots. A fact the admission dropped
+ * or stopped returns 1, with a->verdict set. */
 static int ingest(Environment *env, const clpd_packages *p, const char *json,
-                  size_t len, char *msg, size_t n, int do_assert) {
+                  size_t len, char *msg, size_t n, int do_assert,
+                  admission *a) {
   char tname[SHOWN_MAX + 4];
   clpd_json_error jerr;
   clpd_json *doc;
@@ -293,6 +343,8 @@ static int ingest(Environment *env, const clpd_packages *p, const char *json,
   FactBuilder *fb;
   GCBlock gcb;
   ctx c;
+  CLIPSValue wf;
+  int has_wf = 0;
   size_t i;
   int rc = -1;
 
@@ -360,7 +412,10 @@ static int ingest(Environment *env, const clpd_packages *p, const char *json,
       fail(&c, "template '%s' has no slot '%s'", tname, c.slot);
       break;
     }
-    if (put_slot(&c, fb, ts, &m->value) != 0) break;
+    if (put_slot(&c, fb, ts, &m->value,
+                 strcmp(m->key, WF_ID) == 0 ? &wf : NULL) != 0)
+      break;
+    if (strcmp(m->key, WF_ID) == 0) has_wf = 1;
   }
   if (i == slots->u.obj.count) {
     for (ts = tpl->slotList; ts != NULL; ts = ts->next)
@@ -371,6 +426,10 @@ static int ingest(Environment *env, const clpd_packages *p, const char *json,
            clpd_ingest_shown(ts->slotName->contents, c.slot));
     else if (!do_assert)
       rc = 0;
+    else if (a != NULL && a->fn != NULL &&
+             (a->verdict = a->fn(a->ctx, admitted_wf(tpl, has_wf, &wf))) !=
+                 CLPD_INGEST_ASSERT)
+      rc = 1;
     else if (FBAssert(fb) == NULL || FBError(env) != FBE_NO_ERROR)
       fail(&c, "cannot assert the fact");
     else
@@ -385,27 +444,48 @@ done:
 
 int clpd_ingest_check(Environment *env, const clpd_packages *p,
                       const char *json, size_t len, char *msg, size_t n) {
-  return ingest(env, p, json, len, msg, n, 0);
+  return ingest(env, p, json, len, msg, n, 0, NULL);
 }
 
 int clpd_ingest_assert(Environment *env, const clpd_packages *p,
                        const char *json, size_t len, char *msg, size_t n) {
-  return ingest(env, p, json, len, msg, n, 1);
+  return ingest(env, p, json, len, msg, n, 1, NULL);
 }
 
 size_t clpd_ingest_drain(Environment *env, const clpd_packages *p,
                          clpd_ingest_reject_fn *reject, void *rctx) {
+  size_t asserted = 0;
+  clpd_ingest_drain_admit(env, p, reject, rctx, NULL, NULL, &asserted);
+  return asserted;
+}
+
+int clpd_ingest_drain_admit(Environment *env, const clpd_packages *p,
+                            clpd_ingest_reject_fn *reject, void *rctx,
+                            clpd_ingest_admit_fn *admit, void *actx,
+                            size_t *asserted) {
   char msg[CLPD_INGEST_MESSAGE_MAX];
-  size_t todo = clpd_ingest_queue_length(), asserted = 0;
+  size_t todo = clpd_ingest_queue_length(), n = 0;
+  admission a;
+  int rc;
   item it;
+  a.fn = admit;
+  a.ctx = actx;
   /* Only the facts queued at the start: a post during the drain waits for
    * the next cycle. */
-  while (todo-- > 0 && take(&it)) {
-    if (ingest(env, p, it.text, it.len, msg, sizeof msg, 1) == 0)
-      asserted++;
-    else if (reject != NULL)
+  while (todo-- > 0 && peek(&it)) {
+    a.verdict = CLPD_INGEST_ASSERT;
+    rc = ingest(env, p, it.text, it.len, msg, sizeof msg, 1, &a);
+    if (rc == 1 && a.verdict == CLPD_INGEST_STOP) {
+      if (asserted != NULL) *asserted = n;
+      return -1; /* it stays queued, first */
+    }
+    if (rc == 0)
+      n++;
+    else if (rc < 0 && reject != NULL)
       reject(rctx, it.origin, msg);
+    pop();
     free(it.text);
   }
-  return asserted;
+  if (asserted != NULL) *asserted = n;
+  return 0;
 }

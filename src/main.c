@@ -6,7 +6,8 @@
  * instances with the lifecycle functions (T11a, src/orm_life.h). The clock
  * fact is asserted after Reset and modified when each cycle starts (T11b,
  * src/clock.h), and then idle instances are evicted (T11c,
- * clpd_orm_sync_evict_idle). */
+ * clpd_orm_sync_evict_idle); an ingested fact for an instance with no fact
+ * in working memory reloads it first (T11d, clpd_orm_sync_admit). */
 #include "admin.h"
 #include "clips_trace.h"
 #include "clock.h"
@@ -61,6 +62,13 @@ static void update_clock(clpd_clock *clock) {
     fputs("clpdaemon: cannot update the clock fact\n", clpd_log());
 }
 
+/* The admission of each fact the ingest drain asserts (T11d): the
+ * on-demand rehydration of src/orm_sync.h. */
+static int admit_fact(void *ctx, const CLIPSValue *wf_id) {
+  cycle_ctx *c = ctx;
+  return clpd_orm_sync_admit(c->sync, wf_id, clpd_log());
+}
+
 /* One cycle: the clock fact gets the wall clock first (T11b, with or
  * without a database), then, with a database, the instances idle for
  * idle_eviction_after are evicted (T11c, src/orm_sync.h, outside the
@@ -69,7 +77,9 @@ static void update_clock(clpd_clock *clock) {
  * docs/database.md#cycle-transaction): reload the instances a rolled-back
  * cycle evicted, then begin (src/orm_sync.h, T10c), assert the facts queued so
  * far (docs/ingest.md; a rejected one is logged under the plugin or admin
- * socket that posted it), the plugins' cycle_begin, focus every package
+ * socket that posted it; with a database, an instance with no fact in
+ * working memory is reloaded before its fact, T11d), the plugins'
+ * cycle_begin, focus every package
  * module, Run with the rule limit, write the changes of the mapped facts
  * and commit (src/orm_sync.h), the plugins' cycle_end, then write the
  * partial output lines the cycle left. Run stops on an
@@ -83,7 +93,10 @@ static void update_clock(clpd_clock *clock) {
  * admin listener is resumed, as after every cycle (a failed reconnect may
  * have freed the descriptor it waited for); when the begin or the commit
  * fails, the loop runs the next cycle after the backoff (clpd_loop_defer),
- * serving signals and the admin socket meanwhile. */
+ * serving signals and the admin socket meanwhile. When an on-demand reload
+ * failed (T11d) the drain stops there (that fact and the ones after it
+ * stay queued) and the cycle is rolled back without Run, the plugins'
+ * hooks or a count, like a failed begin, and retried after the backoff. */
 static void run_cycle(void *ctx) {
   cycle_ctx *c = ctx;
   Environment *env = clpd_engine_env(c->engine);
@@ -95,7 +108,15 @@ static void run_cycle(void *ctx) {
     clpd_loop_defer(c->loop, c->tx.retry_ms);
     return;
   }
-  clpd_ingest_drain(env, c->packages, clpd_admin_post_rejected, c->plugins);
+  if (clpd_ingest_drain_admit(env, c->packages, clpd_admin_post_rejected,
+                              c->plugins, c->sync != NULL ? admit_fact : NULL,
+                              c, NULL) != 0) {
+    clpd_orm_sync_end_cycle(c->sync, &c->tx, clpd_log());
+    clpd_clips_trace_flush(c->ct);
+    clpd_admin_resume(c->admin);
+    clpd_loop_defer(c->loop, c->tx.retry_ms);
+    return;
+  }
   clpd_plugins_cycle_begin(c->plugins);
   clpd_packages_focus(env, c->packages);
   clpd_engine_run_cycle(c->engine, c->max_rules);
