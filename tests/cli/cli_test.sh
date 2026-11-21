@@ -2454,7 +2454,9 @@ packages = sdpkg"
   fi
   wait "$hpid"
   hrc=$?
-  held=$(grep -c "^clpdaemon: sync: instance '" err.txt)
+  # No isolation count here: the lock is already released when the holder
+  # exits, so the daemon may isolate d1 before this point; the exact stderr
+  # below pins the order (the busy reload before the second UNIQUE).
   SDISO="clpdaemon: sync: instance 'd1' is no longer synchronized: $SDMSG (2 rolled-back cycles in a row)"
   wait_line err.txt "$SDISO" || ok=0
   acase "sd: inject d2" "OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":{"sym":"d2"},"status":{"sym":"new"}}}\n'
@@ -2488,9 +2490,9 @@ clpdaemon: rehydrate: instance 'd1' is not reloaded: it is no longer synchronize
 clpdaemon: received SIGTERM, stopping"
   if [ "$sdlock" != ok ] || [ "$k" -lt 1 ]; then
     fail "sd: the lock" "not taken before the reload (lock file $sdlock, busy reloads $k), stderr [$(cat err.txt)]"
-  elif [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$hrc" != 0 ] || [ "$held" != 0 ] || [ -s out.txt ] ||
+  elif [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$hrc" != 0 ] || [ -s out.txt ] ||
     [ "$(cat err.txt)" != "$want" ] || [ "$(grep -c "^clpdaemon: sync: instance '" err.txt)" != 1 ]; then
-    fail "sd: isolated after the second UNIQUE only" "exit $rc, lines seen $ok, holder exit $hrc [$(cat sdholder.txt)], isolations while held $held, busy reloads $k, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+    fail "sd: isolated after the second UNIQUE only" "exit $rc, lines seen $ok, holder exit $hrc [$(cat sdholder.txt)], busy reloads $k, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
   fi
   cases=$((cases + 1))
   got=$(sqlite3 sd.db "SELECT wf_id || '|' || status FROM sd_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM sd_memo" 2>&1)

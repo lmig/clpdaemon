@@ -563,7 +563,9 @@ elif [ "$(grep -c '^clpdaemon: cycle transaction failed: ' err.txt)" != 1 ]; the
 fi
 wait "$hpid"
 hrc=$?
-held=$(grep -c "$CXISO" err.txt)
+# No isolation count here: the lock is already released when the holder
+# exits, so d1 may be isolated before this point; the order check below
+# (UTUI) pins that the isolation came after the second UNIQUE.
 cases=$((cases + 1))
 wait_has err.txt "$CXDISO" || fail "$D: d1 isolated" "stderr [$(cat err.txt)]"
 cx_seed "$D" d2
@@ -575,9 +577,9 @@ seq=$(grep -e '^clpdaemon: cycle transaction failed: ' -e "$CXISO" err.txt |
   sed -e "s/.*$CXLT.*/T/" -e 's/.*(SQLSTATE 23505); retrying.*/U/' -e "s/^clpdaemon: sync: instance .*/I/" | uniq | tr -d '\n')
 cases=$((cases + 1))
 if [ "$locked" = 1 ]; then
-  [ "$hrc" = 0 ] && [ "$held" = 0 ] && [ "$u" = 2 ] && [ "$t" -ge 2 ] && [ "$seq" = UTUI ] &&
+  [ "$hrc" = 0 ] && [ "$u" = 2 ] && [ "$t" -ge 2 ] && [ "$seq" = UTUI ] &&
     [ "$(grep -c "$CXISO" err.txt)" = 1 ] && grep -qxF "$CXDISO" err.txt ||
-    fail "$D: isolated after the second UNIQUE only" "holder exit $hrc, isolations while held $held, unique $u (want 2), lock timeouts $t (want >= 2), order [$seq] (want UTUI), stderr [$(cat err.txt)]"
+    fail "$D: isolated after the second UNIQUE only" "holder exit $hrc, unique $u (want 2), lock timeouts $t (want >= 2), order [$seq] (want UTUI), stderr [$(cat err.txt)]"
 fi
 cases=$((cases + 1))
 got=$(q "SELECT wf_id || '|' || status FROM pgcx_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM pgcx_memo")
