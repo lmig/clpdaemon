@@ -369,8 +369,10 @@ wait_grows() {
   done
 }
 
-# The engine is traced from Reset on (T5b): the deffacts assert, then the
-# firing of rule start and its modify as one event. Timestamps are stripped.
+# The engine is traced from Reset on (T5b): the deffacts assert, the clock
+# fact asserted after Reset (T11b; its values replaced by <ms> and <iso>),
+# then the firing of rule start and its modify as one event. Timestamps are
+# stripped.
 rconf trpkg.conf 'node_id = n1
 tick_interval_ms = 20
 cycle_min_interval_ms = 10
@@ -386,13 +388,17 @@ wait_has run.jsonl '"event":"modify"' || ok=0
 kill -TERM "$pid"
 wait_exit "$pid"
 want_text="n1 w1 FACT+ f-1 (order (wf-id w1) (status new))
+n1 - FACT+ f-2 (clpd-clock (now-ms <ms>) (now \"<iso>\"))
 n1 w1 FIRE fibre-installation@v3::start f-1
 n1 w1 FACT~ f-1 (order (wf-id w1) (status started))"
 want_jsonl='{"node_id":"n1","wf_id":"w1","event":"assert","fact":1,"template":"order","text":"(order (wf-id w1) (status new))"}
+{"node_id":"n1","event":"assert","fact":2,"template":"clpd-clock","text":"(clpd-clock (now-ms <ms>) (now \"<iso>\"))"}
 {"node_id":"n1","wf_id":"w1","event":"fire","module":"fibre-installation@v3","rule":"start","facts":[1]}
 {"node_id":"n1","wf_id":"w1","event":"modify","fact":1,"template":"order","text":"(order (wf-id w1) (status started))"}'
-got_text=$(cut -d' ' -f2- run.log)
-got_jsonl=$(sed 's/"ts":"[^"]*",//' run.jsonl)
+# clock_values: the clock fact's values as <ms> and <iso> (T11b).
+clock_values() { sed -E 's/\(now-ms [0-9]+\) \(now (\\?)"[0-9T:.Z-]+\\?"\)/(now-ms <ms>) (now \1"<iso>\1")/'; }
+got_text=$(cut -d' ' -f2- run.log | clock_values)
+got_jsonl=$(sed 's/"ts":"[^"]*",//' run.jsonl | clock_values)
 want="clpdaemon: n1: running
 clpdaemon: received SIGTERM, stopping"
 if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ] ||
@@ -467,12 +473,14 @@ wait_has sys.log 'stdout out-child' || ok=0
 wait_has sys.log 'stderr err-child' || ok=0
 kill -TERM "$pid"
 wait_exit "$pid"
-got_text=$(cut -d' ' -f2- sys.log | LC_ALL=C sort)
-got_jsonl=$(sed 's/"ts":"[^"]*",//' sys.jsonl | LC_ALL=C sort)
-want_text='n1 - FIRE sys@1::shell
+got_text=$(cut -d' ' -f2- sys.log | clock_values | LC_ALL=C sort)
+got_jsonl=$(sed 's/"ts":"[^"]*",//' sys.jsonl | clock_values | LC_ALL=C sort)
+want_text='n1 - FACT+ f-1 (clpd-clock (now-ms <ms>) (now "<iso>"))
+n1 - FIRE sys@1::shell
 n1 - stderr err-child
 n1 - stdout out-child'
-want_jsonl='{"node_id":"n1","event":"fire","module":"sys@1","rule":"shell","facts":[]}
+want_jsonl='{"node_id":"n1","event":"assert","fact":1,"template":"clpd-clock","text":"(clpd-clock (now-ms <ms>) (now \"<iso>\"))"}
+{"node_id":"n1","event":"fire","module":"sys@1","rule":"shell","facts":[]}
 {"node_id":"n1","event":"output","stream":"stderr","text":"err-child"}
 {"node_id":"n1","event":"output","stream":"stdout","text":"out-child"}'
 want="clpdaemon: n1: running
@@ -564,8 +572,10 @@ ok=1
 wait_line err.txt "clpdaemon: STDERR: engine-error" || ok=0
 kill -TERM "$pid"
 wait_exit "$pid"
-want="clpdaemon: n1: running
-clpdaemon: /dev/full: cannot write: No space left on device
+# The first failed write is the clock fact's assert after Reset (T11b),
+# before the running line.
+want="clpdaemon: /dev/full: cannot write: No space left on device
+clpdaemon: n1: running
 clpdaemon: STDERR: engine-error
 clpdaemon: received SIGTERM, stopping"
 if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$(cat err.txt)" != "$want" ]; then
@@ -1143,8 +1153,8 @@ admin_socket = adm.sock'
 cases=$((cases + 1))
 start admcmd.conf adm.sock
 [ "$(stat -c %a adm.sock 2>/dev/null)" = 600 ] || fail "admin socket default mode 0600" "$(ls -l adm.sock)"
-wait_reply adm.sock status "OK node_id=n1 cycles=1 queue=0 facts=0" || ok=0
-S0="OK node_id=n1 cycles=1 queue=0 facts=0"
+wait_reply adm.sock status "OK node_id=n1 cycles=1 queue=0 facts=1" || ok=0
+S0="OK node_id=n1 cycles=1 queue=0 facts=1"
 acase "admin: errors and several commands in one write" "ERR invalid JSON: offset 1: unexpected end of input
 ERR template 'nope' is not ingestible
 ERR template 'order' has no slot 'tags'
@@ -1164,12 +1174,12 @@ while ! grep -qxF "seen w1" out.txt 2>/dev/null; do
   if [ "$n" -gt 40 ]; then ok=0; break; fi
   sleep 0.05
 done
-S1="OK node_id=n1 cycles=2 queue=0 facts=1"
+S1="OK node_id=n1 cycles=2 queue=0 facts=2"
 acase "admin: status after the inject" "$S1" adm.sock 'status\n'
 acase "admin: command split across writes" "$S1
 OK queued" adm.sock 'sta' 'tus\ninj' 'ect {"template":"order","slots":{"wf-id":"w2"}}\n'
-wait_reply adm.sock status "OK node_id=n1 cycles=3 queue=0 facts=2" || ok=0
-S2="OK node_id=n1 cycles=3 queue=0 facts=2"
+wait_reply adm.sock status "OK node_id=n1 cycles=3 queue=0 facts=3" || ok=0
+S2="OK node_id=n1 cycles=3 queue=0 facts=3"
 # A client that disconnects mid-line: the partial command never runs.
 acase "admin: disconnect mid-line" "" -c adm.sock 'inject {"template":"order","slots":{"wf-id":"w9"}}'
 sleep 0.4
@@ -1203,7 +1213,7 @@ admin_socket_mode = 0660'
 cases=$((cases + 1))
 start admfull.conf full.sock
 [ "$(stat -c %a full.sock 2>/dev/null)" = 660 ] || fail "admin socket mode 0660" "$(ls -l full.sock)"
-wait_reply full.sock status "OK node_id=n1 cycles=1 queue=0 facts=0" || ok=0
+wait_reply full.sock status "OK node_id=n1 cycles=1 queue=0 facts=1" || ok=0
 many='' wantmany='' i=0
 while [ "$i" -lt 1024 ]; do
   many=$many'inject {"template":"order","slots":{"wf-id":"q"}}\n'
@@ -1211,7 +1221,7 @@ while [ "$i" -lt 1024 ]; do
   i=$((i + 1))
 done
 acase "admin: inject into a full queue" "${wantmany}ERR ingest queue full
-OK node_id=n1 cycles=1 queue=1024 facts=0" full.sock "${many}"'inject {"template":"order","slots":{"wf-id":"q"}}\nstatus\n'
+OK node_id=n1 cycles=1 queue=1024 facts=1" full.sock "${many}"'inject {"template":"order","slots":{"wf-id":"q"}}\nstatus\n'
 kill -TERM "$pid"
 wait_exit "$pid"
 want="clpdaemon: n1: running
@@ -1254,7 +1264,7 @@ wait "$pid" 2>/dev/null
 [ -S stale.sock ] || ok=0
 start admstale.conf stale.sock
 first=$pid
-wait_reply stale.sock status "OK node_id=n1 cycles=1 queue=0 facts=0" || ok=0
+wait_reply stale.sock status "OK node_id=n1 cycles=1 queue=0 facts=1" || ok=0
 "$BIN" --config admstale.conf >out2.txt 2>err2.txt &
 second=$!
 wait_line err2.txt "clpdaemon: n1: running" || ok=0
@@ -1262,7 +1272,7 @@ kill -TERM "$first"
 wait_exit "$first"
 [ "$rc" = 0 ] || ok=0
 [ -S stale.sock ] || ok=0
-wait_reply stale.sock status "OK node_id=n1 cycles=1 queue=0 facts=0" || ok=0
+wait_reply stale.sock status "OK node_id=n1 cycles=1 queue=0 facts=1" || ok=0
 kill -TERM "$second"
 wait_exit "$second"
 if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -e stale.sock ]; then
@@ -1846,11 +1856,11 @@ packages = txpkg"
 cases=$((cases + 1))
 start txwait.conf admin.sock
 wait_line err.txt "clpdaemon: cycle transaction failed: no such table: clpd_sequence; retrying in 60000 ms" || ok=0
-acase "cycle tx: status during the backoff" "OK node_id=n1 cycles=1 queue=0 facts=1" admin.sock 'status\n'
+acase "cycle tx: status during the backoff" "OK node_id=n1 cycles=1 queue=0 facts=2" admin.sock 'status\n'
 acase "cycle tx: inject during the backoff" "OK queued
-OK node_id=n1 cycles=1 queue=1 facts=1" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w2"}}}\n' 'status\n'
+OK node_id=n1 cycles=1 queue=1 facts=2" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w2"}}}\n' 'status\n'
 sleep 0.3
-acase "cycle tx: no cycle during the backoff" "OK node_id=n1 cycles=1 queue=1 facts=1" admin.sock 'status\n'
+acase "cycle tx: no cycle during the backoff" "OK node_id=n1 cycles=1 queue=1 facts=2" admin.sock 'status\n'
 t0=$(date +%s)
 kill -TERM "$pid" 2>/dev/null
 wait_exit "$pid"
@@ -2006,7 +2016,7 @@ start rhrun.conf admin.sock
 wait_status admin.sock ' cycles=1 ' || ok=0
 acase "rehydrate: inject a failing go" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"fail"}}}\n'
 wait_status admin.sock ' cycles=3 ' || ok=0
-acase "rehydrate: working memory after the retry" "OK node_id=n1 cycles=3 queue=0 facts=2" admin.sock 'status\n'
+acase "rehydrate: working memory after the retry" "OK node_id=n1 cycles=3 queue=0 facts=3" admin.sock 'status\n'
 acase "rehydrate: inject show" "OK queued" admin.sock 'inject {"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"show"}}}\n'
 wait_line out.txt 'show w1 new memos=0 gos=1' || ok=0
 kill -TERM "$pid" 2>/dev/null
@@ -2616,6 +2626,154 @@ packages = lifepkg"
 clpdaemon: received SIGTERM, stopping"
 else
   echo "cli_test.sh: sqlite3 not found; the T11a row checks are skipped" >&2
+fi
+
+# --- clock fact (T11b, FR-10, docs/packages.md#the-clock-fact) ----------------
+# A package cannot define its own clpd-clock: the exact lines, exit 1, both
+# under --check and at startup (no admin socket left).
+mkdir clkown
+conf clkown/package.conf 'definition = clkown
+version = 1
+files = c.clp'
+conf clkown/c.clp '(deftemplate clpd-clock (slot now-ms))'
+rconf clkown.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = clkown'
+CLKERR="clpdaemon: clkown@1: clips: [CSTRCPSR3] clkown/c.clp, Line 1: Cannot define deftemplate 'clpd-clock' because of an import/export conflict.
+clpdaemon: clkown@1: clips: ERROR:
+clpdaemon: clkown@1: clips: (deftemplate clkown@1::clpd-clock
+clpdaemon: clkown/c.clp: load failed
+clpdaemon: clkown/c.clp: deftemplate 'clpd-clock' is reserved by the core (MAIN::clpd-clock)"
+check "clock: a package defining clpd-clock (--check)" 1 "" "$CLKERR" -- --config clkown.conf --check
+RUN='timeout 10'
+check "clock: a package defining clpd-clock (startup)" 1 "" "$CLKERR" -- --config clkown.conf
+RUN=
+cases=$((cases + 1))
+[ ! -e admin.sock ] || fail "clock: no admin socket after the refusal" "$(ls -l admin.sock)"
+
+# Without packages and without a database the clock fact is the one fact.
+rconf clknone.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10'
+cases=$((cases + 1))
+start clknone.conf admin.sock
+wait_status admin.sock ' queue=0 facts=1$' || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+[ "$ok" = 1 ] && [ "$rc" = 0 ] && [ ! -s out.txt ] &&
+  [ "$(cat err.txt)" = "clpdaemon: n1: running${NL}clpdaemon: received SIGTERM, stopping" ] ||
+  fail "clock: the one fact without packages or database" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+
+# A rule fires on a deadline: due w1 at injection + 1500 ms fires once the
+# clock reaches it (not in the cycles before), due w2 a day away never.
+# The trace has the startup assert of the clock fact (f-1, no deffacts)
+# and none of its per-cycle modifies over the many cycles that ran; the
+# ring line shows now-ms >= at and now as now-ms in ISO-8601 UTC.
+mkdir clkdl
+conf clkdl/package.conf 'definition = clkdl
+version = 1
+files = d.clp
+ingest = due'
+conf clkdl/d.clp '(deftemplate due (slot wf-id) (slot at (type INTEGER)))
+(defrule ring ?d <- (due (wf-id ?w) (at ?at)) (clpd-clock (now-ms ?n&:(>= ?n ?at)) (now ?s))
+  => (retract ?d) (printout t "ring " ?w " " ?n " " ?at " " ?s crlf))'
+rconf clkdl.conf 'node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+packages = clkdl
+trace_text = clk.log
+trace_jsonl = clk.jsonl'
+# iso <ms>: the ISO-8601 UTC form of a Unix time in milliseconds.
+iso() { printf '%s.%03dZ' "$(date -u -d "@$(($1 / 1000))" +%Y-%m-%dT%H:%M:%S)" $(($1 % 1000)); }
+cases=$((cases + 1))
+t_start=$(date +%s%3N)
+start clkdl.conf admin.sock
+t0=$(date +%s%3N)
+at1=$((t0 + 1500)) at2=$((t0 + 86400000))
+acase "clock: inject due w1" "OK queued" admin.sock "inject {\"template\":\"due\",\"slots\":{\"wf-id\":{\"sym\":\"w1\"},\"at\":$at1}}\\n"
+acase "clock: inject due w2" "OK queued" admin.sock "inject {\"template\":\"due\",\"slots\":{\"wf-id\":{\"sym\":\"w2\"},\"at\":$at2}}\\n"
+wait_status admin.sock ' queue=0 facts=3$' || ok=0
+early=$(grep -c 'ring' clk.log)
+wait_has clk.log 'STDOUT ring w1' || ok=0
+c1=$("$ADMIN" admin.sock 'status\n' 2>&1)
+sleep 0.3
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+got_text=$(cut -d' ' -f2- clk.log | sed -E 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z/<iso>/g; s/[0-9]{13}/<ms>/g')
+want_text='n1 - FACT+ f-1 (clpd-clock (now-ms <ms>) (now "<iso>"))
+n1 w1 FACT+ f-2 (due (wf-id w1) (at <ms>))
+n1 w2 FACT+ f-3 (due (wf-id w2) (at <ms>))
+n1 w1 FIRE clkdl@1::ring f-2,f-1
+n1 w1 FACT- f-2 (due (wf-id w1) (at <ms>))
+n1 w1 STDOUT ring w1 <ms> <ms> <iso>'
+ring=$(sed -n 's/.* STDOUT ring w1 //p' clk.log)
+n=${ring%% *} rest=${ring#* }
+r_at=${rest%% *} r_iso=${rest#* }
+c_ms=$(sed -n 's/.*FACT+ f-1 (clpd-clock (now-ms \([0-9]*\)) (now "\([^"]*\)")).*/\1/p' clk.log)
+c_iso=$(sed -n 's/.*FACT+ f-1 (clpd-clock (now-ms \([0-9]*\)) (now "\([^"]*\)")).*/\2/p' clk.log)
+cycles=$(printf '%s' "$c1" | sed -n 's/.* cycles=\([0-9]*\) .*/\1/p')
+detail="exit $rc, seen $ok, early $early, status [$c1], stdout [$(cat out.txt)], stderr [$(cat err.txt)]
+  text [$(cut -d' ' -f2- clk.log)]"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ -s out.txt ] || [ "$early" != 0 ] ||
+  [ "$(cat err.txt)" != "clpdaemon: n1: running${NL}clpdaemon: received SIGTERM, stopping" ] ||
+  [ "$got_text" != "$want_text" ]; then
+  fail "clock: a rule fires on a deadline" "$detail"
+fi
+cases=$((cases + 1))
+case $c1 in *' queue=0 facts=2') ;; *) fail "clock: the due fact is gone after the ring" "$detail" ;; esac
+cases=$((cases + 1))
+[ -n "$n" ] && [ "$r_at" = "$at1" ] && [ "$n" -ge "$at1" ] && [ "$n" -lt $((at1 + 5000)) ] &&
+  [ "$r_iso" = "$(iso "$n")" ] || fail "clock: now-ms and now at the ring" "n [$n] at [$r_at] want at [$at1] iso [$r_iso] want [$(iso "${n:-0}")]"
+cases=$((cases + 1))
+[ -n "$c_ms" ] && [ "$c_ms" -ge "$t_start" ] && [ "$c_ms" -le "$t0" ] && [ "$c_iso" = "$(iso "$c_ms")" ] ||
+  fail "clock: the startup clock fact" "now-ms [$c_ms] in [$t_start, $t0], now [$c_iso]"
+cases=$((cases + 1))
+[ -n "$cycles" ] && [ "$cycles" -gt 20 ] && [ "$(grep -c 'clpd-clock' clk.log)" = 1 ] &&
+  [ "$(grep -c '"template":"clpd-clock"' clk.jsonl)" = 1 ] &&
+  [ "$(grep -c '"event":"assert","fact":1,"template":"clpd-clock"' clk.jsonl)" = 1 ] &&
+  [ "$(grep -c '"event":"modify"' clk.jsonl)" = 0 ] ||
+  fail "clock: no clock event per cycle" "cycles [$cycles], jsonl [$(cat clk.jsonl)]"
+
+# With a database (SQLite): the clock fact is in working memory (facts
+# counts it), a rule matching it modifies a mapped fact, which is written,
+# and nothing is written for the clock fact itself.
+if command -v sqlite3 >/dev/null 2>&1; then
+  mkdir clkdb
+  conf clkdb/package.conf 'definition = clkdb
+version = 1
+files = c.clp
+orm = orm.conf'
+  conf clkdb/c.clp '(deftemplate boot (slot wf-id))
+(deftemplate job (slot wf-id) (slot state (type SYMBOL)))
+(deffacts seed (boot (wf-id w0)) (job (wf-id w1) (state waiting)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table job))
+(defrule seen ?j <- (job (wf-id ?w) (state waiting)) (clpd-clock (now-ms ?n&:(> ?n 0))) => (modify ?j (state seen)))'
+  conf clkdb/orm.conf 'job.table = clk_job
+job.owned = yes
+job.slot.wf-id = wf_id text symbol error
+job.slot.state = state text symbol default'
+  rconf clkdb.conf "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/clk.db
+packages = clkdb"
+  cases=$((cases + 1))
+  start clkdb.conf admin.sock
+  wait_status admin.sock ' queue=0 facts=3$' || ok=0
+  wait_status admin.sock ' cycles=[0-9][0-9]' || ok=0
+  kill -TERM "$pid" 2>/dev/null
+  wait_exit "$pid"
+  got=$(sqlite3 clk.db "SELECT type || ' ' || name FROM sqlite_master WHERE type = 'table' ORDER BY name; SELECT wf_id || '|' || state FROM clk_job; SELECT wf_id || '|' || definition || '|' || status FROM workflow_instance ORDER BY wf_id" 2>&1)
+  want='table clk_job
+table workflow_instance
+w1|seen
+w1|clkdb|active'
+  [ "$ok" = 1 ] && [ "$rc" = 0 ] && [ ! -s out.txt ] && [ "$got" = "$want" ] &&
+    [ "$(cat err.txt)" = "clpdaemon: n1: running${NL}clpdaemon: received SIGTERM, stopping" ] ||
+    fail "clock: with a database, nothing written for it" "exit $rc, seen $ok, got [$got], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+else
+  echo "cli_test.sh: sqlite3 not found; the T11b database case is skipped" >&2
 fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"

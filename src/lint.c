@@ -4,6 +4,8 @@
  * LHS of their pretty-print form, read with a small s-expression reader. */
 #include "lint.h"
 
+#include "clock.h"
+
 #include <string.h>
 
 #define LINT_PREFIX "clpdaemon: %s: lint: "
@@ -171,6 +173,12 @@ static void check_pattern(reader *r, rule_ctx *c, token head) {
 
   if (c->exempt != NULL && name_in(name, name_len, c->exempt->templates,
                                    c->exempt->template_count))
+    return;
+  /* The core's clock fact has no wf-id (T11b): its patterns are exempt. A
+   * package cannot define a template of that name (src/packages.c), so
+   * the name is the imported MAIN::clpd-clock. */
+  if (name_len == strlen(CLPD_CLOCK_TEMPLATE) &&
+      strncmp(name, CLPD_CLOCK_TEMPLATE, name_len) == 0)
     return;
   if (found && !or_seen) var_len = variable_name_len(value);
   if (var_len == 0) {

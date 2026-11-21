@@ -3,9 +3,12 @@
  * the cycle transaction (T10a), which ends with the automatic
  * synchronization of the mapped facts (T10b); a rolled-back cycle's
  * instances are rehydrated when the next one starts (T10c). The rules end
- * instances with the lifecycle functions (T11a, src/orm_life.h). */
+ * instances with the lifecycle functions (T11a, src/orm_life.h). The clock
+ * fact is asserted after Reset and modified when each cycle starts (T11b,
+ * src/clock.h). */
 #include "admin.h"
 #include "clips_trace.h"
+#include "clock.h"
 #include "config.h"
 #include "db.h"
 #include "engine.h"
@@ -42,6 +45,7 @@ typedef struct {
   const clpd_packages *packages;
   clpd_plugins *plugins;
   clpd_clips_trace *ct;
+  clpd_clock *clock;
   clpd_admin *admin;
   clpd_loop *loop;
   clpd_orm_tx tx; /* the cycle transaction; no database: does nothing */
@@ -50,7 +54,15 @@ typedef struct {
   unsigned long cycles; /* run so far (admin `status`) */
 } cycle_ctx;
 
-/* One cycle, with a database inside the cycle transaction (T10a,
+/* Logs a failed clock update; the cycle goes on with the previous value. */
+static void update_clock(clpd_clock *clock) {
+  if (clpd_clock_update(clock) != 0)
+    fputs("clpdaemon: cannot update the clock fact\n", clpd_log());
+}
+
+/* One cycle: the clock fact gets the wall clock first (T11b, with or
+ * without a database), then, with a database, the rest runs inside the
+ * cycle transaction (T10a,
  * docs/database.md#cycle-transaction): reload the instances a rolled-back
  * cycle evicted, then begin (src/orm_sync.h, T10c), assert the facts queued so
  * far (docs/ingest.md; a rejected one is logged under the plugin or admin
@@ -73,6 +85,7 @@ static void run_cycle(void *ctx) {
   cycle_ctx *c = ctx;
   Environment *env = clpd_engine_env(c->engine);
   int committed;
+  update_clock(c->clock);
   if (clpd_orm_sync_begin_cycle(c->sync, &c->tx, clpd_log()) != 0) {
     clpd_admin_resume(c->admin);
     clpd_loop_defer(c->loop, c->tx.retry_ms);
@@ -99,8 +112,8 @@ static void wake_loop(void *loop) { clpd_loop_notify(loop); }
  * exit code. */
 static int serve(const clpd_config *cfg, clpd_engine *engine,
                  const clpd_packages *packages, clpd_plugins *plugins,
-                 clpd_trace *trace, clpd_clips_trace *ct, clpd_admin *admin,
-                 clpd_db *db, clpd_orm_syncer *sync) {
+                 clpd_trace *trace, clpd_clips_trace *ct, clpd_clock *clock,
+                 clpd_admin *admin, clpd_db *db, clpd_orm_syncer *sync) {
   FILE *log = clpd_log();
   cycle_ctx ctx;
   clpd_admin_state as;
@@ -133,6 +146,7 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
   ctx.packages = packages;
   ctx.plugins = plugins;
   ctx.ct = ct;
+  ctx.clock = clock;
   ctx.admin = admin;
   ctx.loop = loop;
   clpd_orm_tx_init(&ctx.tx, db, cfg->database, cfg->cycle_retry_initial_ms,
@@ -184,7 +198,8 @@ static int create_instance_table(clpd_db *db, const clpd_packages *p) {
  * functions (docs/orm.md), plugins (load and init), rule packages, then either the --check report or
  * the workflow_instance table (T10a) and the synchronization hooks (T10b),
  * the admin socket (FR-20, unless admin_socket = none), the trace hooks,
- * the plugins' after_load, Reset once and the event loop; the socket file
+ * the plugins' after_load, Reset once, the clock fact (T11b; its assert is
+ * traced, its per-cycle modifies are not) and the event loop; the socket file
  * is removed on every path after it was created. The synchronization hooks
  * come before after_load and Reset, so the facts asserted there (deffacts
  * included) are changes the first cycle writes.
@@ -200,6 +215,7 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_packages packages = {NULL, 0};
   clpd_plugins *plugins = NULL;
   clpd_clips_trace *ct = NULL;
+  clpd_clock *clock = NULL;
   clpd_admin *admin = NULL;
   clpd_db *db = NULL;
   clpd_orm_syncer *sync = NULL;
@@ -284,13 +300,22 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
     ddl.sync = sync;
     /* The poison retry (T10e, docs/database.md#cycle-transaction). */
     clpd_orm_sync_set_isolate_after(sync, cfg->instance_isolate_after);
-    if (clpd_trace_active(trace) &&
-        (cap = clpd_fdcapture_start(trace, clpd_log())) == NULL) {
+    if ((clock = clpd_clock_create(clpd_engine_env(engine))) == NULL) {
+      fputs("clpdaemon: cannot create the clock fact\n", clpd_log());
+      rc = 1;
+    } else if (clpd_trace_active(trace) &&
+               (cap = clpd_fdcapture_start(trace, clpd_log())) == NULL) {
       rc = 1;
     } else {
       clpd_plugins_after_load(plugins);
       Reset(clpd_engine_env(engine));
-      rc = serve(cfg, engine, &packages, plugins, trace, ct, admin, db, sync);
+      if (clpd_clock_update(clock) != 0) {
+        fputs("clpdaemon: cannot assert the clock fact\n", clpd_log());
+        rc = 1;
+      } else {
+        rc = serve(cfg, engine, &packages, plugins, trace, ct, clock, admin,
+                   db, sync);
+      }
       /* Shut down before the capture stops, so what the plugins print in
        * shutdown still reaches the trace; the call after this block is
        * then a no-op (it covers the paths that never got here). */
@@ -313,6 +338,7 @@ static int start(const char *config_path, const clpd_config *cfg, int check) {
   clpd_orm_sync_detach(sync); /* before the packages it points into */
   ddl.sync = NULL;
   clpd_packages_free(&packages);
+  clpd_clock_destroy(clock); /* before the environment */
   clpd_engine_destroy(engine);
   clpd_db_close(db); /* NULL when no database is configured */
   clpd_plugins_close(plugins);

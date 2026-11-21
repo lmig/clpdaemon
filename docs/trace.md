@@ -26,7 +26,7 @@ An empty or missing key disables that format. With both disabled, the daemon wri
 The daemon connects the trace to the CLIPS environment after the rule packages are loaded and before the single `Reset`, so the facts asserted by `Reset` (deffacts) are traced, while package load diagnostics still go to stderr. Without a trace file nothing is connected and engine output goes to the console.
 
 - **Output**: a router takes the logical names `STDOUT` (also `t`), `STDERR` and `STDWRN`. Text is cut into lines at `\n`; each line is one `output` event with its stream name. A partial line (no `\n` yet) is written at the end of every engine cycle, when a rule starts or ends firing, and at shutdown. A line that reaches 65536 bytes without a newline is written as one event as soon as it reaches that size, and the rest continues in the next (the same rule as for [process output](#process-output-fds-1-and-2)); shorter lines are never split. So a line of 65535 bytes is one event, 65536 bytes followed by `a` and a newline are a 65536-byte event and an `a` event, and a line of exactly 65536 bytes followed by its newline is a 65536-byte event followed by an empty event. With a trace, engine output no longer reaches the console.
-- **Facts** (`watch` includes `facts`): `assert`, `retract` and `modify` events. A `modify` is one event with the fact after the change (same index); the retract and assert CLIPS performs inside it are not traced. A modify whose result already exists as another fact only removes the old one, and is traced as its `retract`.
+- **Facts** (`watch` includes `facts`): `assert`, `retract` and `modify` events. A `modify` is one event with the fact after the change (same index); the retract and assert CLIPS performs inside it are not traced. A modify whose result already exists as another fact only removes the old one, and is traced as its `retract`. Modifies of the clock fact are the exception: they are never traced ([below](#clock-fact)).
 - **Rules** (`watch` includes `rules`): one `fire` event before the actions of the rule run, with the module, the rule and the indices of the facts it matched in pattern order. Patterns that match no fact (`not`, `exists`) and objects (COOL instances) are left out; a rule without patterns has no facts.
 - CLIPS `watch` itself stays off: its `==>`, `<==` and `FIRE` text would repeat the events above.
 - **Process output** (FR-16): see [below](#process-output-fds-1-and-2).
@@ -39,6 +39,16 @@ The daemon connects the trace to the CLIPS environment after the rule packages a
 
 If the hooks cannot be installed (none is left installed) the daemon stops with exit code 1:
 `clpdaemon: cannot attach the trace to the CLIPS environment`
+
+### Clock fact
+
+The core's clock fact `MAIN::clpd-clock` ([`packages.md`](packages.md#the-clock-fact), T11b) is asserted after `Reset` and modified at the start of every cycle. Its assert is traced once at startup, after the deffacts facts, as an `assert` event without `wf_id` (the template has no `wf-id` slot):
+
+```
+2026-11-18T10:37:25.641Z n1 - FACT+ f-3 (clpd-clock (now-ms 1794998245641) (now "2026-11-18T10:37:25.641Z"))
+```
+
+Its modifies are never traced, neither the per-cycle update nor a modify by a rule or a command, so an idle daemon adds no trace line per cycle. A retract of the clock fact (a rule's `retract` or `reset`) is traced, and so is the new clock fact the next cycle asserts. A rule that matches the clock fact lists its index in its `fire` event like any other fact. With a trace file that cannot be written, the clock fact's assert is the first event, so the `cannot write` line comes before `clpdaemon: <node_id>: running`.
 
 ## Process output (fds 1 and 2)
 

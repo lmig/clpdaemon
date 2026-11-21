@@ -31,13 +31,13 @@ The package is identified as `definition@version` (for example `fibre-installati
 
 At startup (FR-2), after the configuration and the CLIPS environment, the daemon loads the packages in the order of `packages`:
 
-1. It reads the manifest and creates the module `(defmodule definition@version)`; package files must not declare a `defmodule` of their own.
+1. It reads the manifest and creates the module `(defmodule definition@version (import MAIN deftemplate clpd-clock))`, which sees the core's clock template ([The clock fact](#the-clock-fact)); package files must not declare a `defmodule` of their own.
 2. It loads `files` in order into that module. Every construct a file defines must belong to the package's module (see [Package module](#package-module)). Loading a package stops at its first failed file.
 3. It runs the `wf-id` lint on the package (FR-7, see below).
 4. It checks the `ingest` list: every name must be a deftemplate of the package (not an implied one), and not listed by an earlier package (also one that failed to load).
 5. When `orm` is set, it reads and checks the mapping file against the package's deftemplates and the mappings of earlier packages ([`orm.md`](orm.md#loading)).
 
-Every package is checked even when an earlier one failed, so one run reports all errors; any error makes the daemon exit 1. With `--check`, the daemon stops after loading, linting and checking the mappings. Otherwise it calls `Reset` once and enters the event loop.
+Every package is checked even when an earlier one failed, so one run reports all errors; any error makes the daemon exit 1. With `--check`, the daemon stops after loading, linting and checking the mappings. Otherwise it calls `Reset` once, asserts the clock fact and enters the event loop.
 
 Before each cycle the daemon replaces the focus stack with MAIN under every package module, the first package on top, so one `Run` fires the rules of all packages (a rule of a non-MAIN module only fires with focus).
 
@@ -58,6 +58,36 @@ A file that ends with another module current although no line above was written 
 
 The `defglobal` check does not use the watch flags of the globals, so loading leaves them, and the `:==` lines on stdout, exactly as plain CLIPS (also with `(watch globals)` on). Still, a `defglobal` initial value that runs `watch` or `unwatch` on `globals` or `all` (also for single globals, or with an item computed at run time), or that leaves global watching changed, rejects the file with one line and the globals the file defined in another module are still reported; watching other items (`(watch facts)`) is allowed. A value that makes CLIPS recompute the scope of the globals (a plugin function calling `GetNextDefglobalInScope`) cannot be checked and rejects the file.
 
+## The clock fact
+
+The core keeps a clock fact so rules can express deadlines and timeouts (FR-10, T11b). It defines the deftemplate `MAIN::clpd-clock` when it creates the CLIPS environment, exported from MAIN and imported by every package module (also under `--check`):
+
+```clips
+(deftemplate MAIN::clpd-clock
+   (slot now-ms (type INTEGER))   ; Unix time in milliseconds, UTC wall clock
+   (slot now (type STRING)))      ; the same instant in ISO-8601 UTC, e.g. "2026-11-18T10:37:25.641Z"
+```
+
+`now` has the format of the trace timestamps ([`trace.md`](trace.md#line-formats)): milliseconds truncated, `Z` for UTC. Exactly one clock fact exists: the daemon asserts it after `Reset` at startup and modifies it at the start of every cycle, before the ingested facts are asserted, with or without a database. Its value is the wall clock (`CLOCK_REALTIME`), so it follows clock adjustments of the host; the event loop's intervals use the monotonic clock. Between two cycles the value does not change: a rule sees the time its cycle started, and a deadline fires at the first cycle that starts at or after it (with no other activity, within `tick_interval_ms`, [`configuration.md`](configuration.md)). A rule's `(reset)` or a retract of the clock fact removes it until the next cycle starts, which asserts a new one (with a new fact index).
+
+```clips
+(deftemplate reminder (slot wf-id) (slot due-ms (type INTEGER)))
+(defrule overdue
+   ?r <- (reminder (wf-id ?w) (due-ms ?due))
+   (clpd-clock (now-ms ?n&:(>= ?n ?due)))
+   =>
+   (retract ?r)
+   (printout t ?w " is overdue" crlf))
+```
+
+Every cycle modifies the clock fact, so a rule matching it is activated again in each cycle while its other patterns still match: retract or change the fact that carries the deadline (as above), as with any rule that must fire once.
+
+The clock fact has no `wf-id`: its patterns are exempt from the [`wf-id` lint](#wf-id-lint), it belongs to no workflow instance (a rule's wf-id comes from its other facts), it is never written to the database ([`orm.md`](orm.md)), and a rolled-back cycle, the lifecycle functions and the rehydration leave it in place. Its assert (and a retract) is traced like any fact; its modifies are never traced ([`trace.md`](trace.md#clock-fact)). The admin `status` command counts it in `facts`.
+
+The name `clpd-clock` is reserved: a package that defines its own `clpd-clock` deftemplate (with or without a module name, also `MAIN::clpd-clock`) fails to load, also under `--check`, with CLIPS's import/export conflict lines, `load failed` and `clpdaemon: <file>: deftemplate 'clpd-clock' is reserved by the core (MAIN::clpd-clock)` (for `MAIN::clpd-clock`, the reserved line followed by the outside-the-package-module line). A rule or `deffacts` may still assert a second `clpd-clock` fact; that is not supported (the core updates only its own).
+
+If the clock fact cannot be created or asserted at startup, the daemon exits 1 with `clpdaemon: cannot create the clock fact` or `clpdaemon: cannot assert the clock fact`; a failed update at the start of a cycle writes `clpdaemon: cannot update the clock fact` and the cycle runs with the previous value.
+
 ## wf-id lint
 
 Every deftemplate of a package must have a `wf-id` slot, and every rule must bind the `wf-id` slot of all its patterns to one shared variable, so a rule only joins facts of the same workflow instance (FR-7):
@@ -71,6 +101,7 @@ Every deftemplate of a package must have a `wf-id` slot, and every rule must bin
 - A rule without its pretty-print form (for example with `conserve-mem` on) cannot be checked and is an error.
 - The first checked pattern of a rule sets the expected variable.
 - `lint_exempt` names templates (for example reference data shared by all instances) and rules to skip; patterns on an exempt template are not checked. Naming a construct the package does not define is an error.
+- Patterns on the core's clock template `clpd-clock` are not checked ([The clock fact](#the-clock-fact)); they still count in the pattern numbers. It is not a template of the package, so `lint_exempt` cannot name it.
 
 Lint errors make the package fail like load errors.
 
@@ -95,6 +126,8 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | CLIPS error or warning while loading | `clpdaemon: <definition@version>: clips: <CLIPS message line>`, one line per non-blank line CLIPS writes (CLIPS names the file and line) |
 | Package file failed to load | `clpdaemon: <file>: load failed`, after the CLIPS lines |
 | `defmodule` in a package file | `clpdaemon: <file>: defmodule is not allowed in package files` |
+| A package file defines a `clpd-clock` deftemplate ([above](#the-clock-fact)) | `clpdaemon: <file>: deftemplate 'clpd-clock' is reserved by the core (MAIN::clpd-clock)` |
+| The clock template cannot be defined (an environment whose MAIN module was already redefined) | `clpdaemon: cannot define the clock template MAIN::clpd-clock` |
 | A construct outside the package module ([above](#package-module)) | `clpdaemon: <file>: <construct> '<module>::<name>' is outside the package module <definition@version>`, `<construct>` one of `deftemplate`, `defrule`, `deffacts`, `defglobal`, `deffunction`, `defgeneric`, `defmethod`, `defclass`, `definstances`, `defmessage-handler`; `<name>` is `?*<global>*` for a defglobal, the defgeneric for a defmethod, and `<class> <handler> <type>` for a message-handler (`'MAIN::USER hello primary'`) |
 | The constructs of a file cannot be checked (a construct type the loader cannot inspect, for example one a plugin added, or a defglobal value that recomputed the scope of the globals) | `clpdaemon: <file>: cannot check the modules of its constructs` |
 | A defglobal value changed the watch state of globals ([above](#package-module)) | `clpdaemon: <file>: cannot check the modules of its constructs (a defglobal value changed the watch state of globals)` |
@@ -108,4 +141,4 @@ Manifest errors go to stderr; every error in the file is reported, one per line,
 | `ingest` names no deftemplate of the package | `clpdaemon: <pkg>: ingest names unknown template '<t>'` |
 | `ingest` names a template an earlier package lists | `clpdaemon: <pkg>: ingest names template '<t>', already listed by <first pkg>` |
 
-A file's messages come in this order: the CLIPS lines, then `load failed`, the `defmodule` message or the end-module message, then the constructs outside the package module (the watch-state and cannot-check lines in definition order with them, before the globals of the same statement). Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come next, in list order, then the mapping messages ([`orm.md`](orm.md#messages)).
+A file's messages come in this order: the CLIPS lines, then `load failed`, the `defmodule` message or the end-module message, then the reserved `clpd-clock` line and the constructs outside the package module (the watch-state and cannot-check lines in definition order with them, before the globals of the same statement). Lint messages come after the load messages, in this order: unknown exemptions, templates, then rules in definition order. The `ingest` messages come next, in list order, then the mapping messages ([`orm.md`](orm.md#messages)).

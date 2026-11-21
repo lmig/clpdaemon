@@ -2,6 +2,8 @@
 
 #include "engine.h"
 
+#include "clock.h"
+
 #include <signal.h>
 #include <stdlib.h>
 
@@ -27,7 +29,9 @@ clpd_engine *clpd_engine_create(void) {
   clpd_engine *e = calloc(1, sizeof *e);
   if (e == NULL) return NULL;
   e->env = CreateEnvironment();
-  if (e->env == NULL ||
+  /* The clock template first: MAIN can be redefined to export it only
+   * once (T11b, src/clock.h), and nothing has redefined it yet. */
+  if (e->env == NULL || clpd_clock_define(e->env) != 0 ||
       !AddPeriodicFunction(e->env, "clpd-halt-check", halt_check, 0, e)) {
     if (e->env != NULL) DestroyEnvironment(e->env);
     free(e);

@@ -760,5 +760,55 @@ got=$(q "SELECT count(*) FROM workflow_instance")$(q "SELECT count(*) FROM infor
 [ ! -e admin.sock ] || fail "pg life: no admin socket after the refusal" "$(ls -l admin.sock)"
 q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
 
+# T11b: the clock fact with PostgreSQL: in working memory (status counts
+# it), a rule matching it modifies a mapped fact, which is written, and
+# nothing is written for the clock fact itself (no table, no row, no
+# instance).
+mkdir clkpkg
+printf '%s\n' 'definition = pgclk
+version = 1
+files = c.clp
+orm = orm.conf' >clkpkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate job (slot wf-id) (slot state (type SYMBOL)))
+(deffacts seed (boot (wf-id w0)) (job (wf-id w1) (state waiting)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table job))
+(defrule seen ?j <- (job (wf-id ?w) (state waiting)) (clpd-clock (now-ms ?n&:(> ?n 0))) => (modify ?j (state seen)))' >clkpkg/c.clp
+printf '%s\n' 'job.table = pgclk_job
+job.owned = yes
+job.slot.wf-id = wf_id text symbol error
+job.slot.state = state text symbol default' >clkpkg/orm.conf
+printf '%s\n' "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+admin_socket = $WORK/admin.sock
+database = $CONNINFO
+packages = clkpkg" >clk.conf
+q 'DROP TABLE IF EXISTS pgclk_job' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+tables_before=$(q "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'")
+"$BIN" --config clk.conf >out.txt 2>err.txt &
+pid=$!
+cases=$((cases + 1))
+wait_q "SELECT wf_id || ' ' || state FROM pgclk_job" 'w1 seen' ||
+  fail "pg clock: the rule on the clock fact" "got [$(q 'SELECT * FROM pgclk_job')], stderr [$(cat err.txt)]"
+n=0
+while ! "$ADMIN" admin.sock 'status\n' 2>/dev/null | grep -q ' cycles=5 \| cycles=[0-9][0-9]'; do
+  n=$((n + 1)); [ "$n" -gt 100 ] && break; sleep 0.05
+done
+cases=$((cases + 1))
+st=$("$ADMIN" admin.sock 'status\n' 2>&1)
+case $st in *' queue=0 facts=3') ;; *) fail "pg clock: the clock fact is counted" "got [$st]" ;; esac
+stop_daemon "pg clock"
+cases=$((cases + 1))
+got=$(q "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('pgclk_job', 'workflow_instance') ORDER BY 1")
+got=$got/$(q "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'")
+got=$got/$(q "SELECT wf_id || '|' || definition || '|' || status FROM workflow_instance ORDER BY wf_id")
+got=$got/$(q "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND column_name IN ('now_ms', 'now', 'now-ms')")
+[ "$got" = "pgclk_job${NL}workflow_instance/$((tables_before + 2))/w1|pgclk|active/0" ] && [ ! -s out.txt ] ||
+  fail "pg clock: nothing written for the clock fact" "got [$got], before [$tables_before], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+q 'DROP TABLE IF EXISTS pgclk_job' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
 printf '%d/%d PostgreSQL CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

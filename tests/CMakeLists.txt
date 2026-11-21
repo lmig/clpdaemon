@@ -22,7 +22,7 @@ target_compile_options(config_test PRIVATE ${CLPD_WARNINGS})
 
 add_test(NAME clpdaemon_config COMMAND config_test)
 
-foreach(t scheduler engine loop lint manifest packages trace clips_trace fdcapture plugins json ingest admin orm)
+foreach(t scheduler engine clock loop lint manifest packages trace clips_trace fdcapture plugins json ingest admin orm)
   add_executable(${t}_test ${t}/${t}_test.c)
   target_link_libraries(${t}_test PRIVATE clpd_core)
   target_compile_options(${t}_test PRIVATE ${CLPD_WARNINGS})

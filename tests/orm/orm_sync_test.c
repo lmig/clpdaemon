@@ -17,6 +17,7 @@
  * connection or transient contention, T10f). */
 #define _POSIX_C_SOURCE 200809L
 
+#include "clock.h"
 #include "db_backend.h"
 #include "ingest.h"
 #include "log.h"
@@ -1079,6 +1080,40 @@ static void test_rule_failure(void) {
   EXPECT(same("still not written", got, "0"));
 }
 
+/* T11b: the clock fact (asserted before a cycle, modified at its start
+ * like the daemon does) is never written, and a rolled-back cycle keeps it
+ * (it carries no wf-id): no statement, no log line, nothing stored. */
+static void test_clock_not_written(void) {
+  char log[4096], before[16384], after[16384];
+  clpd_clock *c = clpd_clock_create(env);
+  EXPECT(c != NULL);
+  if (c == NULL) return;
+  fingerprint(before, sizeof before);
+  EXPECT(clpd_clock_update(c) == 0);
+  begin_cycle();
+  EXPECT(clpd_clock_update(c) == 0);
+  EXPECT(end_cycle(log, sizeof log) == 0);
+  EXPECT(same("clock statements", stmts, ""));
+  EXPECT(same("clock log", log, ""));
+  fingerprint(after, sizeof after);
+  EXPECT(same("clock: nothing written", after, before));
+  begin_cycle();
+  EXPECT(clpd_clock_update(c) == 0);
+  act(SHOP, "(assert (go (wf-id k9) (act fail)))");
+  EXPECT(end_cycle(log, sizeof log) == 1);
+  EXPECT(clpd_clock_fact(c) != NULL && FactExistp(clpd_clock_fact(c)));
+  begin_cycle();
+  EXPECT(clpd_clock_update(c) == 0);
+  EXPECT(end_cycle(log, sizeof log) == 0);
+  EXPECT(same("clock retry log", log, ""));
+  EXPECT(strstr(stmts, "clock") == NULL);
+  EXPECT(clpd_clock_fact(c) != NULL && FactExistp(clpd_clock_fact(c)));
+  fingerprint(after, sizeof after);
+  EXPECT(same("clock: still nothing written", after, before));
+  if (clpd_clock_fact(c) != NULL) Retract(clpd_clock_fact(c));
+  clpd_clock_destroy(c);
+}
+
 /* --- loading and rehydration (T10c) ------------------------------------- */
 
 /* The schema prefix the loader takes ("public". on PostgreSQL). */
@@ -1697,6 +1732,7 @@ int main(int argc, char **argv) {
   test_int4_overflow();
   test_failed_flush();
   test_rule_failure();
+  test_clock_not_written();
   test_poison_retry();
   test_transient();
   test_load();

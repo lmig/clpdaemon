@@ -2,8 +2,10 @@
 
 #include "packages.h"
 
+#include "clock.h"
 #include "lint.h"
 #include "log.h"
+#include "pprint.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -418,6 +420,34 @@ static void compare_handlers(guard_snapshot *s, int parsed) {
   free(s->handler_count);
 }
 
+/* The core's clock template is reserved (T11b, src/clock.h): a deftemplate
+ * parse named clpd-clock, in any module, is reported. Its name is read
+ * from the pretty-print buffer, which holds "(deftemplate <module>::<name>"
+ * after the heading (CLIPS adds the current module to an unqualified
+ * name), also when the parse stopped there: in a package module, where
+ * the template is imported, CLIPS refuses the name as an import/export
+ * conflict right after reading it. Without a pretty-print buffer
+ * (conserve-mem) nothing is reported, and CLIPS's refusal still fails the
+ * load. */
+static void check_reserved(Environment *env) {
+  static const char head[] = "(deftemplate ";
+  const char *pp = GetPPBuffer(env), *name, *sep, *end;
+  char line[1024];
+  if (pp == NULL || strncmp(pp, head, sizeof head - 1) != 0) return;
+  name = pp + sizeof head - 1;
+  end = name + strcspn(name, " \t\r\n()\"");
+  for (sep = name; sep + 1 < end; sep++)
+    if (sep[0] == ':' && sep[1] == ':') name = sep + 2;
+  if ((size_t)(end - name) != strlen(CLPD_CLOCK_TEMPLATE) ||
+      strncmp(name, CLPD_CLOCK_TEMPLATE, (size_t)(end - name)) != 0)
+    return;
+  snprintf(line, sizeof line, "clpdaemon: %s: deftemplate '%s' is reserved "
+           "by the core (MAIN::%s)\n", guard->file, CLPD_CLOCK_TEMPLATE,
+           CLPD_CLOCK_TEMPLATE);
+  append(&guard->lines, line);
+  guard->errors++;
+}
+
 static bool guarded_parse(Environment *env, const char *source, size_t i) {
   const guard_hook *h = &guard->hooks[i];
   guard_snapshot s;
@@ -434,6 +464,8 @@ static bool guarded_parse(Environment *env, const char *source, size_t i) {
   }
   failed = h->parse(env, source);
   if (h->kind == DEFINES_LIST) {
+    if (guard->depth == 1 && strcmp(h->type, "deftemplate") == 0)
+      check_reserved(env);
     if (!failed) compare_lists(h, &s);
     free_lists(&s);
   } else if (h->kind == DEFINES_GLOBALS) {
@@ -917,7 +949,7 @@ static int check_orm(Environment *env, clpd_packages *out, int have_database,
 static int load_package(Environment *env, clpd_packages *out,
                         int have_database, FILE *err) {
   clpd_package *pkg = &out->items[out->count - 1];
-  char build[CLPD_PACKAGE_NAME_MAX * 2 + 16];
+  char build[CLPD_PACKAGE_NAME_MAX * 2 + 64];
   clpd_lint_exempt exempt;
   size_t i;
   int errors;
@@ -929,7 +961,10 @@ static int load_package(Environment *env, clpd_packages *out,
       return 1;
     }
   }
-  snprintf(build, sizeof build, "(defmodule %s)", pkg->manifest.name);
+  /* Every package module sees the core's clock template (T11b). */
+  snprintf(build, sizeof build,
+           "(defmodule %s (import MAIN deftemplate " CLPD_CLOCK_TEMPLATE "))",
+           pkg->manifest.name);
   if (Build(env, build) != BE_NO_ERROR) {
     fprintf(err, "clpdaemon: %s: cannot create module %s\n", pkg->dir,
             pkg->manifest.name);
@@ -957,6 +992,14 @@ int clpd_packages_load_ex(Environment *env, const clpd_list *dirs,
 
   out->items = NULL;
   out->count = 0;
+  /* The core defines it with the environment (src/engine.c); an
+   * environment created otherwise gets it here, before any module
+   * imports it. */
+  if (clpd_clock_define(env) != 0) {
+    fputs("clpdaemon: cannot define the clock template MAIN::"
+          CLPD_CLOCK_TEMPLATE "\n", err);
+    return 1;
+  }
   for (i = 0; dirs != NULL && i < dirs->count; i++) {
     clpd_manifest m;
     clpd_package *grown;

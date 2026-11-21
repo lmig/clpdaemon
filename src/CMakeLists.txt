@@ -1,4 +1,4 @@
-add_library(clpd_core STATIC kvfile.c config.c manifest.c packages.c scheduler.c engine.c loop.c lint.c trace.c clips_trace.c fdcapture.c log.c plugins.c json.c ingest.c admin.c db.c db_sqlite.c db_pg.c orm.c orm_ddl.c orm_dml.c orm_tx.c orm_sync.c orm_load.c orm_life.c)
+add_library(clpd_core STATIC kvfile.c config.c manifest.c packages.c scheduler.c engine.c loop.c lint.c trace.c clips_trace.c fdcapture.c log.c plugins.c json.c ingest.c admin.c db.c db_sqlite.c db_pg.c orm.c orm_ddl.c orm_dml.c orm_tx.c orm_sync.c orm_load.c orm_life.c clock.c)
 target_include_directories(clpd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
 # Database backends (src/db.h, T8): both required. libpq from Homebrew is

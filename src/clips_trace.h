@@ -1,7 +1,8 @@
 /* Connects a CLIPS environment to the trace sink (FR-13 to FR-16, L48):
  * a router for STDOUT, STDERR and STDWRN turned into output lines, and the
- * structured fact and rule-fire events selected by `watch`. Attribution
- * rules are documented in docs/trace.md. */
+ * structured fact and rule-fire events selected by `watch`; modifies of
+ * the core's clock fact (src/clock.h) are not traced. Attribution rules
+ * are documented in docs/trace.md. */
 #ifndef CLPD_CLIPS_TRACE_H
 #define CLPD_CLIPS_TRACE_H
 
