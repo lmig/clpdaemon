@@ -382,17 +382,20 @@ static void test_next_delay(void) {
   EXPECT(clpd_orm_tx_next_delay(2147483647, 1, 2147483647) == 2147483647);
 }
 
-/* workflow_instance: created when missing, kept (rows included) when it
- * exists; on PostgreSQL in current_schema(). */
+/* workflow_instance: created when missing (with the reason column of
+ * T11a), kept (rows included) when it exists; on PostgreSQL in
+ * current_schema(). */
 static void test_instance_table(void) {
   char got[2048], msg[512];
   const char *want =
       pg ? "wf_id text NOT NULL, definition text NOT NULL, version text NOT "
-           "NULL, status text NOT NULL, parent_wf_id text, owner_node text, "
+           "NULL, status text NOT NULL, reason text, parent_wf_id text, "
+           "owner_node text, "
            "lease_until timestamptz, created_at timestamptz NOT NULL, "
            "updated_at timestamptz NOT NULL | pk wf_id"
          : "wf_id TEXT NOT NULL, definition TEXT NOT NULL, version TEXT NOT "
-           "NULL, status TEXT NOT NULL, parent_wf_id TEXT, owner_node TEXT, "
+           "NULL, status TEXT NOT NULL, reason TEXT, parent_wf_id TEXT, "
+           "owner_node TEXT, "
            "lease_until TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT "
            "NULL | pk wf_id";
   EXPECT(rows("workflow_instance") == -1);

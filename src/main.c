@@ -2,7 +2,8 @@
  * the database (T8d) and the event loop running engine cycles (T3) inside
  * the cycle transaction (T10a), which ends with the automatic
  * synchronization of the mapped facts (T10b); a rolled-back cycle's
- * instances are rehydrated when the next one starts (T10c). */
+ * instances are rehydrated when the next one starts (T10c). The rules end
+ * instances with the lifecycle functions (T11a, src/orm_life.h). */
 #include "admin.h"
 #include "clips_trace.h"
 #include "config.h"
@@ -153,16 +154,28 @@ static int serve(const clpd_config *cfg, clpd_engine *engine,
 
 /* The workflow_instance table (T10a), when a database is configured and a
  * package has an ORM mapping; never under --check, which writes nothing.
- * Returns 0, or -1 after logging the failure. */
+ * An existing table must have the daemon's columns (T11a). Returns 0, or
+ * -1 after logging the failure. */
 static int create_instance_table(clpd_db *db, const clpd_packages *p) {
   char msg[512];
   size_t i;
+  int rc;
   for (i = 0; i < p->count && p->items[i].orm == NULL; i++) {
   }
   if (db == NULL || i == p->count) return 0;
-  if (clpd_orm_tx_create_instance_table(db, msg, sizeof msg) == 0) return 0;
+  if (clpd_orm_tx_create_instance_table(db, msg, sizeof msg) != 0) {
+    fprintf(clpd_log(),
+            "clpdaemon: cannot create the workflow_instance table: %s\n",
+            msg);
+    return -1;
+  }
+  rc = clpd_orm_tx_check_instance_table(db, msg, sizeof msg);
+  if (rc == 0) return 0;
   fprintf(clpd_log(),
-          "clpdaemon: cannot create the workflow_instance table: %s\n", msg);
+          rc < 0 ? "clpdaemon: cannot check the workflow_instance table: %s\n"
+                 : "clpdaemon: the workflow_instance table does not match the "
+                   "daemon's: %s\n",
+          msg);
   return -1;
 }
 

@@ -87,15 +87,35 @@ int clpd_orm_tx_schema_status(clpd_db *db, char *out, char *msg, size_t n,
                               clpd_db_status *st);
 
 /* CREATE TABLE IF NOT EXISTS for workflow_instance (one row per workflow
- * instance, written by the synchronization, src/orm_sync.h), in autocommit; on PostgreSQL qualified
- * with current_schema() like the DDL functions (docs/orm.md). Columns, in
- * order (PostgreSQL / SQLite types):
+ * instance, written by the synchronization, src/orm_sync.h, and the
+ * lifecycle functions, src/orm_life.h), in autocommit; on PostgreSQL
+ * qualified with current_schema() like the DDL functions (docs/orm.md).
+ * Columns, in order (PostgreSQL / SQLite types):
  *   wf_id TEXT NOT NULL (the primary key), definition TEXT NOT NULL,
- *   version TEXT NOT NULL, status TEXT NOT NULL, parent_wf_id TEXT,
- *   owner_node TEXT, lease_until TIMESTAMPTZ / TEXT,
+ *   version TEXT NOT NULL, status TEXT NOT NULL, reason TEXT (T11a),
+ *   parent_wf_id TEXT, owner_node TEXT, lease_until TIMESTAMPTZ / TEXT,
  *   created_at TIMESTAMPTZ / TEXT NOT NULL,
  *   updated_at TIMESTAMPTZ / TEXT NOT NULL.
  * Returns 0, or -1 with a one-line message in msg. */
 int clpd_orm_tx_create_instance_table(clpd_db *db, char *msg, size_t n);
+
+/* Compares the existing workflow_instance table (on PostgreSQL the one in
+ * current_schema()) with the columns above (T11a): every column present
+ * with its type (PostgreSQL udt_name text or timestamptz; SQLite declared
+ * type TEXT, any case) and nullability, no other column, and the primary
+ * key exactly (wf_id). Returns 0 when it matches; 1 with the first
+ * difference in msg, in this order (each daemon column in order, then the
+ * other columns in catalog order, then the primary key):
+ *   missing column '<column>'
+ *   column '<column>' has type '<type>', expected <TYPE>
+ *   column '<column>' is nullable, expected NOT NULL
+ *   column '<column>' is NOT NULL, expected nullable
+ *   unexpected column '<column>'
+ *   there is no primary key, expected (wf_id)
+ *   the primary key is (<column>, ...), expected (wf_id)
+ * (catalog names and types shown with control characters as '?', at most
+ * 200 bytes); or -1 with the database's one-line message when a catalog
+ * query fails. */
+int clpd_orm_tx_check_instance_table(clpd_db *db, char *msg, size_t n);
 
 #endif

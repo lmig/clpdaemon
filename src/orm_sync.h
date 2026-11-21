@@ -69,6 +69,37 @@ int clpd_orm_sync_suspended(const clpd_orm_syncer *s);
 void clpd_orm_sync_touch(clpd_orm_syncer *s, const char *wf,
                          const clpd_package *pkg);
 
+/* The lifecycle functions (T11a, src/orm_life.h), from a rule inside the
+ * open cycle transaction.
+ *
+ * clpd_orm_sync_flush_instance writes the recorded changes of instance wf
+ * now (the flush of clpd_orm_sync_end_cycle restricted to the entries
+ * whose last committed or current row belongs to wf: its DELETEs,
+ * UPDATEs, INSERTs and workflow_instance row, same statements, same order,
+ * same failure lines), then forgets them and notes the instances written
+ * as touched by the cycle (a rollback evicts and reloads them). Returns 0
+ * (also with nothing to write, or s NULL), or -1 when nothing more may be
+ * written in the cycle (a statement of it failed already, or a value
+ * could not be written before) or the flush failed: a refused write or a
+ * value it cannot write logs its sync: line, the instance of that write
+ * is isolated when the cycle ends, and the cycle is rolled back there (a
+ * value through clpd_orm_tx_abort, as for the end-of-cycle flush).
+ *
+ * clpd_orm_sync_finish ends instance wf in memory: every fact carrying
+ * its wf-id is retracted with the recording suspended (no DELETE, its
+ * rows stay), the instance counts as touched by the open cycle, and from
+ * now on no fact of it is recorded (never written). A rolled-back cycle
+ * forgets that it ended (the rehydration reloads it); after a commit it
+ * stays ended until the syncer is detached, and a rollback never reloads
+ * it. NULL is accepted (nothing happens).
+ *
+ * clpd_orm_sync_isolated is 1 when wf is no longer synchronized (a write
+ * that failed for good, the poison retry), else 0 (also for s NULL). */
+int clpd_orm_sync_flush_instance(clpd_orm_syncer *s, const char *wf,
+                                 FILE *log);
+void clpd_orm_sync_finish(clpd_orm_syncer *s, const char *wf);
+int clpd_orm_sync_isolated(const clpd_orm_syncer *s, const char *wf);
+
 /* The parameter for the value v in column c, by the write rules of the
  * synchronization (docs/orm.md#write-rules; the DML functions use them
  * too): the symbol nil in a null nil column is NULL; otherwise v must have

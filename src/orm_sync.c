@@ -31,7 +31,19 @@
  * attributed rolled-back cycles until a commit; at instance_isolate_after
  * it is isolated and evicted like the instance of a failed write. A
  * retryable failure neither counts nor resets, and never isolates through
- * a write or a reload either. */
+ * a write or a reload either.
+ *
+ * Finished instances (T11a, src/orm_life.h): a lifecycle function writes
+ * the instance's recorded changes at once (the flush restricted to it,
+ * the entries then dropped and the instance noted as touched), and then
+ * retracts its facts with the recording suspended (no DELETE). The
+ * instance goes to `finishing` until the cycle ends: a commit moves it to
+ * `finished` (sorted, kept until the syncer is detached), a rollback
+ * forgets it, so the rehydration reloads it like any touched instance.
+ * Facts of an instance in either list are never recorded, and a rolled-
+ * back cycle never reloads a finished one. A value the restricted flush
+ * cannot write leaves the cycle to be rolled back at its end
+ * (abort_pending), as the end-of-cycle flush would. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "orm_sync.h"
@@ -120,6 +132,13 @@ struct clpd_orm_syncer {
   char *blamed;  /* the instance the first failure is attributed to */
   strike *strikes; /* attributed rolled-back cycles since the last commit */
   size_t strikes_n;
+  /* Finished instances (T11a). */
+  char **finished; /* committed, sorted with cmp_text */
+  size_t finished_n;
+  char **finishing; /* finished in the open cycle */
+  size_t finishing_n;
+  int abort_pending; /* a restricted flush met a value it cannot write */
+  char abort_why[1024];
 };
 
 static void *xrealloc(void *p, size_t n) {
@@ -477,11 +496,20 @@ static int in_instance(const row *r, const char *wf) {
   return strcmp(text, wf) == 0;
 }
 
-/* 1 when f belongs to an instance no longer synchronized. */
+static int is_finished(const clpd_orm_syncer *s, const char *wf);
+
+/* 1 when f belongs to an instance no longer synchronized, or to a
+ * finished one (T11a): its changes are never recorded. */
 static int isolated(const clpd_orm_syncer *s, const tmap *m, Fact *f) {
   row r = {NULL, NULL};
   size_t i;
   int hit = 0;
+  if (s->finished_n > 0 || s->finishing_n > 0) {
+    char *wf = fact_wf(f);
+    hit = wf != NULL && is_finished(s, wf);
+    free(wf);
+    if (hit) return 1;
+  }
   if (s->isolated_n == 0) return 0;
   snapshot(&r, m, f);
   for (i = 0; !hit && i < s->isolated_n; i++)
@@ -690,6 +718,7 @@ typedef struct {
   char *why; /* the reason of a value that cannot be written */
   size_t why_n;
   const char *wf; /* the instance of the workflow_instance write */
+  const char *only; /* T11a: only the entries of this instance; NULL: all */
 } flush_ctx;
 
 /* Outcome of a flush step. */
@@ -894,6 +923,13 @@ static int in_aggregate(const row *r, size_t a) {
   return r->m != NULL && r->m->aggregate == a;
 }
 
+/* 1 when the flush writes entry e: every entry, or (T11a) one whose last
+ * committed or current row belongs to instance only. */
+static int picked(const char *only, const entry *e) {
+  return only == NULL || in_instance(&e->base, only) ||
+         in_instance(&e->cur, only);
+}
+
 /* One aggregate: its DELETEs, UPDATEs and INSERTs, each in the order of
  * the changes, then the rows of the instances it wrote, in the order of
  * the changes. */
@@ -904,22 +940,26 @@ static int flush_aggregate(flush_ctx *fc, size_t a) {
   int rc = F_OK;
   for (i = 0; rc == F_OK && i < s->n; i++) {
     entry *e = &s->e[i];
-    if ((writes(e) & W_DELETE) && in_aggregate(&e->base, a))
+    if ((writes(e) & W_DELETE) && in_aggregate(&e->base, a) &&
+        picked(fc->only, e))
       rc = write_delete(fc, &e->base);
   }
   for (i = 0; rc == F_OK && i < s->n; i++) {
     entry *e = &s->e[i];
-    if ((writes(e) & W_UPDATE) && in_aggregate(&e->cur, a))
+    if ((writes(e) & W_UPDATE) && in_aggregate(&e->cur, a) &&
+        picked(fc->only, e))
       rc = write_update(fc, e);
   }
   for (i = 0; rc == F_OK && i < s->n; i++) {
     entry *e = &s->e[i];
-    if ((writes(e) & W_INSERT) && in_aggregate(&e->cur, a))
+    if ((writes(e) & W_INSERT) && in_aggregate(&e->cur, a) &&
+        picked(fc->only, e))
       rc = write_insert(fc, &e->cur);
   }
   for (i = 0; rc == F_OK && i < s->n; i++) {
     const entry *e = &s->e[i];
     int w = writes(e);
+    if (!picked(fc->only, e)) continue;
     if ((w & W_DELETE) && in_aggregate(&e->base, a)) touch(&in, &e->base);
     if ((w & (W_UPDATE | W_INSERT)) && in_aggregate(&e->cur, a))
       touch(&in, &e->cur);
@@ -930,12 +970,18 @@ static int flush_aggregate(flush_ctx *fc, size_t a) {
   return rc;
 }
 
-static int flush(clpd_orm_syncer *s, FILE *log, char *why, size_t n) {
+/* Writes the recorded changes (with only, T11a: those of that instance;
+ * the failed instance is then reset only by a full flush, which runs
+ * once per cycle at its end). */
+static int flush(clpd_orm_syncer *s, FILE *log, char *why, size_t n,
+                 const char *only) {
   flush_ctx fc;
   size_t i, a;
   int rc = F_OK;
-  s->failed[0] = '\0';
-  for (i = 0; i < s->n && writes(&s->e[i]) == W_NONE; i++) {
+  if (only == NULL) s->failed[0] = '\0';
+  for (i = 0;
+       i < s->n && (writes(&s->e[i]) == W_NONE || !picked(only, &s->e[i]));
+       i++) {
   }
   if (i == s->n) return F_OK;
   memset(&fc, 0, sizeof fc);
@@ -943,6 +989,7 @@ static int flush(clpd_orm_syncer *s, FILE *log, char *why, size_t n) {
   fc.log = log;
   fc.why = why;
   fc.why_n = n;
+  fc.only = only;
   if (strcmp(clpd_db_backend(s->db), "postgresql") == 0) {
     /* Where the DDL functions and workflow_instance put the tables. */
     if (clpd_orm_tx_current_schema(s->db, fc.schema, why, n) != 0) {
@@ -1047,6 +1094,10 @@ void clpd_orm_sync_detach(clpd_orm_syncer *s) {
   free(s->strikes);
   while (s->isolated_n > 0) free(s->isolated[--s->isolated_n]);
   free(s->isolated);
+  while (s->finished_n > 0) free(s->finished[--s->finished_n]);
+  free(s->finished);
+  while (s->finishing_n > 0) free(s->finishing[--s->finishing_n]);
+  free(s->finishing);
   wfset_free(&s->touched);
   wfset_free(&s->pending);
   free(s->e);
@@ -1119,6 +1170,47 @@ static int is_isolated(const clpd_orm_syncer *s, const char *wf) {
   return 0;
 }
 
+/* 1 when instance wf was finished by a committed cycle (T11a). */
+static int is_finished_committed(const clpd_orm_syncer *s, const char *wf) {
+  return s->finished_n > 0 &&
+         bsearch(&wf, s->finished, s->finished_n, sizeof *s->finished,
+                 cmp_text) != NULL;
+}
+
+/* 1 when instance wf was finished by a committed cycle or in the open one
+ * (T11a). */
+static int is_finished(const clpd_orm_syncer *s, const char *wf) {
+  size_t i;
+  if (is_finished_committed(s, wf)) return 1;
+  for (i = 0; i < s->finishing_n; i++)
+    if (strcmp(s->finishing[i], wf) == 0) return 1;
+  return 0;
+}
+
+/* The instances the open cycle finished are finished for good (a commit)
+ * or not at all (a rollback). */
+static void finishing_end(clpd_orm_syncer *s, int committed) {
+  while (s->finishing_n > 0) {
+    char *wf = s->finishing[--s->finishing_n];
+    size_t lo = 0, hi = s->finished_n;
+    if (!committed || is_finished_committed(s, wf)) {
+      free(wf);
+      continue;
+    }
+    while (lo < hi) { /* the insertion point, keeping the order */
+      size_t mid = lo + (hi - lo) / 2;
+      if (strcmp(s->finished[mid], wf) < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    s->finished = xrealloc(s->finished,
+                           (s->finished_n + 1) * sizeof *s->finished);
+    memmove(&s->finished[lo + 1], &s->finished[lo],
+            (s->finished_n - lo) * sizeof *s->finished);
+    s->finished[lo] = wf;
+    s->finished_n++;
+  }
+}
+
 /* Instance wf stops being synchronized: its recorded changes are dropped
  * and later changes of its facts are not recorded. */
 static void isolate_instance(clpd_orm_syncer *s, const char *wf,
@@ -1152,6 +1244,8 @@ static void rolled_back(clpd_orm_syncer *s, const char *why, int uncounted,
   size_t i, n = 0;
   if (s == NULL) return;
   s->cycle_open = 0;
+  s->abort_pending = 0;
+  finishing_end(s, 0); /* the rollback undid their final state (T11a) */
   for (i = 0; i < s->touched.n; i++)
     wfset_add(&ev, s->touched.v[i].wf, s->touched.v[i].pkg);
   wfset_clear(&s->touched);
@@ -1201,6 +1295,7 @@ static void rolled_back(clpd_orm_syncer *s, const char *why, int uncounted,
       fflush(log);
       continue;
     }
+    if (is_finished_committed(s, wf)) continue; /* ended for good */
     for (k = 0; k < pk.n; k++)
       if (strcmp(pk.v[k].wf, wf) == 0 && pk.v[k].pkg != NULL &&
           pk.v[k].pkg->orm != NULL && pk.v[k].pkg->orm_templates != NULL)
@@ -1295,8 +1390,15 @@ int clpd_orm_sync_begin_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx,
 int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
   char why[1024];
   int rc;
+  if (s != NULL && tx->db != NULL && s->abort_pending) {
+    /* A lifecycle function's flush met a value it cannot write (T11a). */
+    snprintf(why, sizeof why, "%s", s->abort_why);
+    clpd_orm_tx_abort(tx, log, why);
+    rolled_back(s, why, 0, log);
+    return -1;
+  }
   if (s != NULL && tx->db != NULL && !clpd_db_atomic_failed(tx->db) &&
-      flush(s, log, why, sizeof why) == F_ABORT) {
+      flush(s, log, why, sizeof why, NULL) == F_ABORT) {
     clpd_orm_tx_abort(tx, log, why);
     rolled_back(s, why, 0, log);
     return -1;
@@ -1315,7 +1417,59 @@ int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log) {
     wfset_clear(&s->touched);
     forget_blame(s);
     strikes_clear(s); /* a commit resets the counts */
+    finishing_end(s, 1);
     s->cycle_open = 0;
   }
   return rc;
+}
+
+int clpd_orm_sync_flush_instance(clpd_orm_syncer *s, const char *wf,
+                                 FILE *log) {
+  char why[1024];
+  size_t i;
+  int rc;
+  if (s == NULL) return 0;
+  /* The cycle is already lost: nothing more is written. */
+  if (s->abort_pending || clpd_db_atomic_failed(s->db)) return -1;
+  rc = flush(s, log, why, sizeof why, wf);
+  if (rc == F_ABORT) {
+    s->abort_pending = 1;
+    snprintf(s->abort_why, sizeof s->abort_why, "%s", why);
+  }
+  if (rc != F_OK) return -1;
+  /* Written inside the cycle transaction: a rollback must evict and reload
+   * every instance whose rows it wrote, as for any touched instance. */
+  for (i = 0; s->cycle_open && i < s->n; i++) {
+    const entry *e = &s->e[i];
+    char text[4096];
+    if (!picked(wf, e)) continue;
+    if (e->base.m != NULL) {
+      wf_text(&e->base, text, sizeof text);
+      wfset_add(&s->touched, text, e->base.m->pkg);
+    }
+    if (e->cur.m != NULL) {
+      wf_text(&e->cur, text, sizeof text);
+      wfset_add(&s->touched, text, e->cur.m->pkg);
+    }
+  }
+  drop_instance(s, wf); /* written: never again at the end */
+  return 0;
+}
+
+void clpd_orm_sync_finish(clpd_orm_syncer *s, const char *wf) {
+  char *w = (char *)wf; /* retract_instances only reads it */
+  if (s == NULL) return;
+  if (!is_finished(s, wf)) {
+    s->finishing = xrealloc(s->finishing,
+                            (s->finishing_n + 1) * sizeof *s->finishing);
+    s->finishing[s->finishing_n++] = xstrdup(wf);
+  }
+  /* Suspended: no DELETE, and what was recorded for the facts is dropped;
+   * the instance counts as touched with the packages of its facts. */
+  retract_instances(s, &w, 1, s->cycle_open ? &s->touched : NULL);
+  drop_instance(s, wf);
+}
+
+int clpd_orm_sync_isolated(const clpd_orm_syncer *s, const char *wf) {
+  return s != NULL && is_isolated(s, wf);
 }

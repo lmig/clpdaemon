@@ -1595,7 +1595,7 @@ if command -v sqlite3 >/dev/null 2>&1; then
   want='table ddl_order: CREATE TABLE "ddl_order" ("wf_id" TEXT NOT NULL, "line_no" INTEGER NOT NULL, "note" TEXT, PRIMARY KEY ("wf_id", "line_no"))
 index sqlite_autoindex_ddl_order_1: 
 index sqlite_autoindex_workflow_instance_1: 
-table workflow_instance: CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
+table workflow_instance: CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "reason" TEXT, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
   [ "$got" = "$want" ] || fail "orm ddl: the generated table" "got [$got], want [$want]"
   # A second run keeps the existing table and its row (IF NOT EXISTS), and
   # the refused drop leaves both.
@@ -1870,7 +1870,7 @@ if command -v sqlite3 >/dev/null 2>&1; then
   cases=$((cases + 1))
   got=$(sqlite3 tx.db "SELECT type || ' ' || name || ': ' || coalesce(sql, '') FROM sqlite_master ORDER BY name" 2>&1)
   want='index sqlite_autoindex_workflow_instance_1: 
-table workflow_instance: CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
+table workflow_instance: CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "reason" TEXT, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
   [ "$got" = "$want" ] || fail "cycle tx: rolled back, workflow_instance created" "got [$got], want [$want]"
   # --check writes nothing: no workflow_instance; nor does a daemon whose
   # packages have no mapping (dbrun.db above).
@@ -2500,6 +2500,120 @@ d1|x'
   [ "$got" = "$want" ] || fail "sd: the stored rows" "got [$got], want [$want]"
 else
   echo "cli_test.sh: sqlite3 not found; the T10g SD case is skipped" >&2
+fi
+
+# --- lifecycle functions (T11a, docs/orm.md#lifecycle-functions) -------------
+# Without a database wf-complete and wf-fail do not exist either.
+mkdir lifenodb
+conf lifenodb/package.conf 'definition = nodb
+version = 1
+files = r.clp'
+conf lifenodb/r.clp '(deftemplate go (slot wf-id))
+(defrule r (go (wf-id ?w)) => (wf-complete ?w))'
+conf lifenodb.conf 'node_id = n1
+packages = lifenodb'
+check "life: no functions without a database" 1 "" \
+  "clpdaemon: nodb@1: clips: [EXPRNPSR3] lifenodb/r.clp, Line 2: Missing function declaration for 'wf-complete'.
+clpdaemon: nodb@1: clips: ERROR:
+clpdaemon: nodb@1: clips: (defrule nodb@1::r
+clpdaemon: nodb@1: clips:    (go (wf-id ?w))
+clpdaemon: nodb@1: clips:    =>
+clpdaemon: nodb@1: clips:    (wf-complete
+clpdaemon: lifenodb/r.clp: load failed" -- --config lifenodb.conf --check
+# A running daemon: wf-complete writes the rule's pending modify first, then
+# status completed; wf-fail status failed with its reason; every fact of a
+# finished instance leaves working memory (show counts them), its mapped
+# row stays, a second call is refused with the exact line, and a fact
+# asserted for it later (late) is never written.
+mkdir lifepkg
+conf lifepkg/package.conf 'definition = life
+version = 1
+files = l.clp
+orm = orm.conf
+ingest = go'
+conf lifepkg/l.clp '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)) (slot why (type STRING) (default "")))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id))
+(deffacts seed (boot (wf-id w0)) (order (wf-id w1) (status new)) (memo (wf-id w1)) (order (wf-id w2) (status new)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))
+(defrule done (go (wf-id ?w) (act done)) ?o <- (order (wf-id ?w)) => (modify ?o (status done)) (wf-complete ?w))
+(defrule fail (go (wf-id ?w) (act fail) (why ?r)) => (wf-fail ?w ?r))
+(defrule again (go (wf-id ?w) (act again)) => (wf-complete ?w))
+(defrule late (go (wf-id ?w) (act late)) => (assert (order (wf-id ?w) (status late))))
+(defrule show (go (wf-id ?w) (act show)) => (printout t "show " ?w " orders=" (length$ (find-all-facts ((?f order)) (eq ?f:wf-id ?w))) " memos=" (length$ (find-all-facts ((?m memo)) (eq ?m:wf-id ?w))) crlf))'
+conf lifepkg/orm.conf 'order.table = life_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default'
+rconf liferun.conf "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/liferun.db
+packages = lifepkg"
+# linject <n> <json>: injects a fact and waits for cycle <n>.
+linject() {
+  acase "life: inject $2" "OK queued" admin.sock "inject $2\\n"
+  wait_status admin.sock " cycles=$1 " || ok=0
+}
+cases=$((cases + 1))
+start liferun.conf admin.sock
+wait_status admin.sock ' cycles=1 ' || ok=0
+if command -v sqlite3 >/dev/null 2>&1; then
+  life1=$(sqlite3 liferun.db "SELECT updated_at FROM workflow_instance WHERE wf_id = 'w1'" 2>&1)
+  sleep 0.05 # a later millisecond for the next updated_at
+fi
+linject 2 '{"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"done"}}}'
+linject 3 '{"template":"go","slots":{"wf-id":{"sym":"w2"},"act":{"sym":"fail"},"why":"no stock"}}'
+linject 4 '{"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"again"}}}'
+linject 5 '{"template":"go","slots":{"wf-id":{"sym":"w2"},"act":{"sym":"again"}}}'
+linject 6 '{"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"late"}}}'
+linject 7 '{"template":"go","slots":{"wf-id":{"sym":"w1"},"act":{"sym":"show"}}}'
+linject 8 '{"template":"go","slots":{"wf-id":{"sym":"w2"},"act":{"sym":"show"}}}'
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: wf-complete: instance 'w1' is already completed
+[PRCCODE4] Execution halted during the actions of defrule 'again'.
+clpdaemon: wf-complete: instance 'w2' is already failed
+[PRCCODE4] Execution halted during the actions of defrule 'again'.
+clpdaemon: received SIGTERM, stopping"
+if [ "$ok" != 1 ] || [ "$rc" != 0 ] || [ "$(cat out.txt)" != "show w1 orders=1 memos=0${NL}show w2 orders=0 memos=0" ] || [ "$(cat err.txt)" != "$want" ]; then
+  fail "life: a running daemon finishes its instances" "exit $rc, lines seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  got=$(sqlite3 liferun.db "SELECT wf_id || '|' || status FROM life_order ORDER BY wf_id; SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || coalesce(reason, 'NULL') || '|' || (updated_at > created_at) FROM workflow_instance ORDER BY wf_id; SELECT count(*) FROM workflow_instance WHERE wf_id = 'w1' AND updated_at <> '$life1'" 2>&1)
+  want='w1|done
+w2|new
+w1|life|1|completed|NULL|1
+w2|life|1|failed|no stock|1
+1'
+  [ "$got" = "$want" ] || fail "life: the stored rows" "got [$got], want [$want]"
+  # A workflow_instance table of another shape (the T10 table, without
+  # reason) is refused at startup with the exact line, exit 1, and the
+  # daemon writes nothing; --check does not look at it.
+  sqlite3 lifeold.db 'CREATE TABLE "workflow_instance" ("wf_id" TEXT NOT NULL, "definition" TEXT NOT NULL, "version" TEXT NOT NULL, "status" TEXT NOT NULL, "parent_wf_id" TEXT, "owner_node" TEXT, "lease_until" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, PRIMARY KEY ("wf_id"))'
+  rconf lifeold.conf "node_id = n1
+tick_interval_ms = 60000
+database = sqlite:$WORK/lifeold.db
+packages = lifepkg"
+  RUN='timeout 10'
+  check "life: a workflow_instance of another shape" 1 "" \
+    "clpdaemon: the workflow_instance table does not match the daemon's: missing column 'reason'" -- --config lifeold.conf
+  RUN=
+  cases=$((cases + 1))
+  [ ! -e admin.sock ] || fail "life: no admin socket after the refusal" "$(ls -l admin.sock)"
+  cases=$((cases + 1))
+  got=$(sqlite3 lifeold.db "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name; SELECT count(*) FROM workflow_instance" 2>&1)
+  [ "$got" = "workflow_instance${NL}0" ] || fail "life: nothing written after the refusal" "got [$got]"
+  check "life: --check does not check the shape" 0 "clpdaemon: lifeold.conf: configuration OK" "" -- --config lifeold.conf --check
+  # Once the column is added (the documented upgrade) the daemon starts.
+  sqlite3 lifeold.db 'ALTER TABLE workflow_instance ADD COLUMN reason TEXT'
+  daemon "life: the upgraded table is accepted" lifeold.conf TERM "clpdaemon: n1: running
+clpdaemon: received SIGTERM, stopping"
+else
+  echo "cli_test.sh: sqlite3 not found; the T11a row checks are skipped" >&2
 fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"

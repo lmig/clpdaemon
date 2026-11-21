@@ -667,5 +667,96 @@ q 'DROP TABLE IF EXISTS pgau_audit' >/dev/null
 q 'DROP FUNCTION IF EXISTS pgau_trg()' >/dev/null
 q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
 
+# T11a: wf-complete and wf-fail against PostgreSQL. wf-complete writes the
+# rule's pending modify first, then status completed (reason NULL) with a
+# later updated_at; wf-fail status failed with its reason; the instance's
+# facts leave working memory (show counts them), its mapped rows stay, a
+# second call is refused with the exact line, and a later fact (late) is
+# never written. Then a workflow_instance of another shape (the T10 table,
+# without reason) is refused at startup.
+mkdir lifepkg
+printf '%s\n' 'definition = pglife
+version = 3
+files = l.clp
+orm = orm.conf
+ingest = go' >lifepkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)) (slot why (type STRING) (default "")))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id))
+(deffacts seed (boot (wf-id w0)) (order (wf-id w1) (status new)) (memo (wf-id w1)) (order (wf-id w2) (status new)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))
+(defrule done (go (wf-id ?w) (act done)) ?o <- (order (wf-id ?w)) => (modify ?o (status done)) (wf-complete ?w))
+(defrule fail (go (wf-id ?w) (act fail) (why ?r)) => (wf-fail ?w ?r))
+(defrule again (go (wf-id ?w) (act again)) => (wf-complete ?w))
+(defrule late (go (wf-id ?w) (act late)) => (assert (order (wf-id ?w) (status late))))
+(defrule show (go (wf-id ?w) (act show)) => (printout t "show " ?w " orders=" (length$ (find-all-facts ((?f order)) (eq ?f:wf-id ?w))) " memos=" (length$ (find-all-facts ((?m memo)) (eq ?m:wf-id ?w))) crlf))' >lifepkg/l.clp
+printf '%s\n' 'order.table = pglife_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default' >lifepkg/orm.conf
+printf '%s\n' "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+admin_socket = $WORK/admin.sock
+database = $CONNINFO
+packages = lifepkg" >life.conf
+q 'DROP TABLE IF EXISTS pglife_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+: >out.txt
+"$BIN" --config life.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_q "SELECT count(*) FROM pglife_order" '2' || ok=0
+life1=$(q "SELECT updated_at::text FROM workflow_instance WHERE wf_id = 'w1'")
+: >inject.txt
+cyc=1
+for j in '"w1"},"act":{"sym":"done"}' '"w2"},"act":{"sym":"fail"},"why":"no stock"' \
+  '"w1"},"act":{"sym":"again"}' '"w2"},"act":{"sym":"again"}' '"w1"},"act":{"sym":"late"}' \
+  '"w1"},"act":{"sym":"show"}' '"w2"},"act":{"sym":"show"}'; do
+  cyc=$((cyc + 1))
+  "$ADMIN" admin.sock "inject {\"template\":\"go\",\"slots\":{\"wf-id\":{\"sym\":$j}}\\n" >>inject.txt 2>&1
+  n=0
+  while ! "$ADMIN" admin.sock 'status\n' 2>/dev/null | grep -q " cycles=$cyc "; do
+    n=$((n + 1))
+    [ "$n" -gt 200 ] && { ok=0; break; }
+    sleep 0.05
+  done
+done
+stop_daemon "pg life"
+want="clpdaemon: n1: running
+clpdaemon: wf-complete: instance 'w1' is already completed
+[PRCCODE4] Execution halted during the actions of defrule 'again'.
+clpdaemon: wf-complete: instance 'w2' is already failed
+[PRCCODE4] Execution halted during the actions of defrule 'again'.
+clpdaemon: received SIGTERM, stopping"
+cases=$((cases + 1))
+[ "$ok" = 1 ] && [ "$(cat err.txt)" = "$want" ] && [ "$(cat out.txt)" = "show w1 orders=1 memos=0${NL}show w2 orders=0 memos=0" ] &&
+  [ "$(cat inject.txt)" = "OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued" ] ||
+  fail "pg life: a running daemon finishes its instances" "cycles seen $ok, inject [$(cat inject.txt)], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+got=$(q "SELECT wf_id || '|' || status FROM pglife_order ORDER BY wf_id")
+[ "$got" = "w1|done${NL}w2|new" ] || fail "pg life: the mapped rows" "got [$got]"
+cases=$((cases + 1))
+got=$(q "SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || coalesce(reason, 'NULL') || '|' || (updated_at > created_at)::int FROM workflow_instance ORDER BY wf_id")
+[ "$got" = "w1|pglife|3|completed|NULL|1${NL}w2|pglife|3|failed|no stock|1" ] || fail "pg life: the instance rows" "got [$got]"
+cases=$((cases + 1))
+got=$(q "SELECT count(*) FROM workflow_instance WHERE wf_id = 'w1' AND updated_at::text <> '$life1'")
+[ "$got" = 1 ] || fail "pg life: updated_at changed" "got [$got] (before [$life1])"
+# The T10 table, without reason: refused at startup, exit 1, nothing written.
+q 'DROP TABLE IF EXISTS pglife_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+q 'CREATE TABLE workflow_instance (wf_id TEXT NOT NULL, definition TEXT NOT NULL, version TEXT NOT NULL, status TEXT NOT NULL, parent_wf_id TEXT, owner_node TEXT, lease_until TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (wf_id))' >/dev/null
+timeout 20 "$BIN" --config life.conf >out.txt 2>err.txt
+rc=$?
+cases=$((cases + 1))
+[ "$rc" = 1 ] && [ ! -s out.txt ] && [ "$(cat err.txt)" = "clpdaemon: the workflow_instance table does not match the daemon's: missing column 'reason'" ] ||
+  fail "pg life: a workflow_instance of another shape" "exit $rc, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+got=$(q "SELECT count(*) FROM workflow_instance")$(q "SELECT count(*) FROM information_schema.tables WHERE table_name = 'pglife_order'")
+[ "$got" = 00 ] || fail "pg life: nothing written after the refusal" "got [$got]"
+[ ! -e admin.sock ] || fail "pg life: no admin socket after the refusal" "$(ls -l admin.sock)"
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
 printf '%d/%d PostgreSQL CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

@@ -33,14 +33,26 @@ typedef struct {
   clpd_orm_syncer *sync;
 } clpd_orm_ddl;
 
-/* Defines the five functions, and the five DML functions of src/orm_dml.h
- * (T10d), in env with ddl as their context. Returns 0, or -1 when CLIPS
- * refuses a definition (for example a name already defined). */
+/* Defines the five functions, the five DML functions of src/orm_dml.h
+ * (T10d) and the lifecycle functions of src/orm_life.h (T11a), in env
+ * with ddl as their context. Returns 0, or -1 when CLIPS refuses a
+ * definition (for example a name already defined). */
 int clpd_orm_ddl_register(Environment *env, clpd_orm_ddl *ddl);
 
 /* For the DML functions (src/orm_dml.c), which share the DDL functions'
  * caller scope and messages. */
 #define CLPD_ORM_DDL_NAME_SIZE 201 /* an argument as messages show it */
+
+/* The caller scope of every function that changes the database: only the
+ * actions of a rule (executing) of a loaded package. Returns 1 with *pkg
+ * that package, or 0 with *pkg NULL, the error logged
+ *   clpdaemon: <udf>: only a rule of a rule package may call it (no rule
+ *   is executing)
+ *   clpdaemon: <udf>: only a rule of a rule package may call it (rule
+ *   '<rule>' is in module '<module>')
+ * the CLIPS error thrown and FALSE in ret. */
+int clpd_orm_ddl_caller(UDFContext *ctx, UDFValue *ret,
+                        const clpd_package **pkg);
 
 /* Resolves the first argument of the calling function (its context a
  * clpd_orm_ddl) as a template, with the caller scope of db-create-table:
