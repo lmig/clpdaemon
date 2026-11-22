@@ -464,7 +464,7 @@ ex(eng, 'engerr', ee, 'n1', 'again')
 chk('A6: operator cannot set another state (policy WITH CHECK)', sqlstate(lambda: op.execute(
     "UPDATE mensaje_intercambio SET estado='CONSUMIDO', actualizado=now() WHERE id=%s" % ee)) == '42501'
     and row(ee)[0] == 'ERROR')
-ex(op, 'reproc', ee)
+ex(op, 'reproc', ee)   # puts ee back to RECIBIDO (it is ERROR after the denied update) for the checks below
 for st_ in ('RECIBIDO', 'ASIGNADO', 'CONSUMIDO'):
     oi = in_row('evt-op-' + st_.lower())
     if st_ != 'RECIBIDO':
@@ -476,8 +476,9 @@ for st_ in ('RECIBIDO', 'ASIGNADO', 'CONSUMIDO'):
         "UPDATE mensaje_intercambio SET estado='RECIBIDO', wf_id='fi-x', asignado_a=NULL, lease_hasta=NULL, "
         "actualizado=now() WHERE id=%s" % oi).rowcount == 0 and row(oi, 'estado,wf_id,asignado_a,payload') == before,
         row(oi, 'estado,wf_id,asignado_a,payload'))
-chk('R1-001: operator update policy USING limits the state', "SIN_CORRELACION" in one(
-    "select qual from pg_policies where policyname='mensaje_intercambio_operador_update'")[0])
+op_qual = one("select qual from pg_policies where policyname='mensaje_intercambio_operador_update'")[0]
+chk('R1-001: operator update policy USING limits the direction and the state',
+    all(x in op_qual for x in ('direccion', 'SIN_CORRELACION', 'ERROR')), op_qual)
 chk('A6: operator cannot update OUT rows (0 rows)', op.execute(
     "UPDATE mensaje_intercambio SET error='x' WHERE id=%s" % o2).rowcount == 0 and row(o2, 'error')[0] != 'x')
 chk('operator cannot change endpoint_logico (42501)', sqlstate(lambda: op.execute(
@@ -539,17 +540,18 @@ pm = row(wm2, cols)
 st = sqlstate(lambda: cn.execute("UPDATE mensaje_intercambio SET actualizado = now() WHERE id = %s" % wm2))
 chk('T12b: an update that leaves an own OUT row PENDIENTE: 42501 (WITH CHECK)', st == '42501' and row(wm2, cols) == pm, st)
 eng.execute("UPDATE mensaje_intercambio SET estado='ENVIADO', asignado_a='gw-m', intentos=1 WHERE id IN (%s,%s)" % (wm1, wm2))
-updatable = one("select count(*) from mensaje_intercambio where direccion='OUT' and endpoint_logico='installer' "
-                "and estado in ('PENDIENTE','EN_ENVIO','REINTENTO','ENVIADO')")[0]
-snap = adm.execute("select id, actualizado from mensaje_intercambio where not (direccion='OUT' and "
-                   "endpoint_logico='installer' and estado in ('PENDIENTE','EN_ENVIO','REINTENTO','ENVIADO')) "
-                   "order by id").fetchall()
+OWN_OPEN_OUT = ("direccion='OUT' and endpoint_logico='installer' "
+                "and estado in ('PENDIENTE','EN_ENVIO','REINTENTO','ENVIADO')")
+updatable = one('select count(*) from mensaje_intercambio where ' + OWN_OPEN_OUT)[0]
+pending = one("select count(*) from mensaje_intercambio where direccion='OUT' and endpoint_logico='installer' "
+              "and estado='PENDIENTE'")[0]
+chk('M03 setup: at least 2 own non-final OUT rows', updatable >= 2, updatable)
+chk('M03 setup: no own OUT row PENDIENTE (the update would fail WITH CHECK)', pending == 0, pending)
+OTHERS = 'select id, actualizado from mensaje_intercambio where not (' + OWN_OPEN_OUT + ') order by id'
+snap = adm.execute(OTHERS).fetchall()
 n = cn.execute("UPDATE mensaje_intercambio SET actualizado = now()").rowcount
 chk('M03: a WHERE-less connector update touches only its own non-final OUT rows',
-    n == updatable and adm.execute(
-        "select id, actualizado from mensaje_intercambio where not (direccion='OUT' and endpoint_logico='installer' "
-        "and estado in ('PENDIENTE','EN_ENVIO','REINTENTO','ENVIADO')) order by id").fetchall() == snap, (n, updatable))
-chk('M03 setup: at least 2 own non-final OUT rows', updatable >= 2, updatable)
+    n == updatable and adm.execute(OTHERS).fetchall() == snap, (n, updatable))
 
 for fid, fst in ((a1, 'CONFIRMADO'), (o2, 'ERROR')):
     before = row(fid, 'estado,siguiente_intento,error')
@@ -631,6 +633,20 @@ chk('R3: an answer on another endpoint of the same role does not confirm the OUT
     k == 0 and row(y1)[0] == 'EN_ENVIO', (k, row(y1)))
 chk('R3: the answer on the OUT row\'s endpoint confirms it',
     ex(crm, 'confirm', 'wfY:1', 'crm') == 1 and row(y1)[0] == 'CONFIRMADO')
+# §3.5: the column grant, not only the policy, blocks moving an OUT row to another endpoint of the same role
+y2 = out('wfY2', 'wfY2:1', ep='crm')
+before = row(y2, 'endpoint_logico,estado')
+try:
+    crm.execute("UPDATE mensaje_intercambio SET endpoint_logico='billing' WHERE id=%s" % y2)
+    st, msg = None, ''
+except psycopg.Error as e:
+    st, msg = e.sqlstate, str(e)
+chk('3.5: move an own OUT row to another endpoint of the same role: 42501 permission denied (column grant)',
+    st == '42501' and 'permission denied' in msg and row(y2, 'endpoint_logico,estado') == before, (st, msg))
+chk('3.5: endpoint_logico in no connector UPDATE grant',
+    not one("select has_column_privilege('connector_crm', 'mensaje_intercambio', 'endpoint_logico', 'UPDATE')")[0])
+# settle y2 so the concurrency run below claims only its own rows
+eng.execute("UPDATE mensaje_intercambio SET estado='CONFIRMADO', actualizado=now() WHERE id=%s" % y2)
 # installer answers with a correlacion_id of a crm OUT row: stored, but the intake (8.2) never routes it there
 r = ex(cn, 'insert', 'installer', 'work-order-created', None, 'evt-cross', 'wfX:1',
        json.dumps({"schema": "work-order-created@1", "data": {}}), None)

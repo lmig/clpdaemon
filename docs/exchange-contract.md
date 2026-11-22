@@ -486,7 +486,7 @@ Rules:
 
 ### 6.3 Responses
 
-A response to an `OUT` row is an `IN` row with the same `correlacion_id` and its own `tipo_mensaje` (for example `work-order-created` answering `work-order-request`). For a synchronous protocol, insert it in the transaction that [settles](#74-send-result) the `OUT` row. For an asynchronous protocol, insert it when the answer arrives and, in the same transaction, confirm the `OUT` row (§7.7). If the external system does not echo `correlacion_id`, leave it `NULL` and set `ref_externa`: the intake then correlates through `correlacion`.
+A response to an `OUT` row is an `IN` row with the same `correlacion_id`, inserted under the `endpoint_logico` of the `OUT` row (§7.7, §8.2), and its own `tipo_mensaje` (for example `work-order-created` answering `work-order-request`). For a synchronous protocol, insert it in the transaction that [settles](#74-send-result) the `OUT` row. For an asynchronous protocol, insert it when the answer arrives and, in the same transaction, confirm the `OUT` row (§7.7). If the external system does not echo `correlacion_id`, leave it `NULL` and set `ref_externa`: the intake then correlates through `correlacion`.
 
 ### 6.4 Order
 

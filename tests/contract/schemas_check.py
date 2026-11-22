@@ -166,6 +166,9 @@ neg = {
     'float 1.0e20 (env)': (ve, setd('f', 1.0e20)),
     'float -1.0e20 (env)': (ve, setd('f', -1.0e20)),
     'float 9.3e18 (env)': (ve, setd('f', 9.3e18)),
+    # the exact boundary doubles: 2^63 and the next double below -2^63
+    'float 2^63 = 9223372036854775808.0 (env)': (ve, setd('f', float(2**63))),
+    'float -9223372036854777856.0, next double below -2^63 (env)': (ve, setd('f', -9223372036854777856.0)),
     'string 8193 ASCII characters (env)': (ve, setd('s', 'a' * 8193)),
     'string 8193 two-byte characters (env)': (ve, setd('s', 'é' * 8193)),
     'array 1025 elements (env)': (ve, setd('a', [1] * 1025)),
@@ -190,6 +193,9 @@ pos = {
     'float 2.5 (env)': (ve, setd('f', 2.5)),
     'float 9.2e18 (env)': (ve, setd('f', 9.2e18)),
     'float -9.2e18 (env)': (ve, setd('f', -9.2e18)),
+    # the exact boundary doubles: the largest double below 2^63, and -2^63 (int64 min)
+    'float 9223372036854774784.0, largest double below 2^63 (env)': (ve, setd('f', 9223372036854774784.0)),
+    'float -2^63 = -9223372036854775808.0 (env)': (ve, setd('f', -9223372036854775808.0)),
     'string 8192 ASCII characters (env)': (ve, setd('s', 'a' * 8192)),
     # section 4.2: the limit counts characters, so 8192 x U+00E9 (16384 bytes) is allowed
     'string 8192 two-byte characters (env)': (ve, setd('s', 'é' * 8192)),
