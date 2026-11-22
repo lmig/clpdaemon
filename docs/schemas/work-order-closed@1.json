@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:clpdaemon:schema:work-order-closed@1",
+  "title": "work-order-closed, version 1",
+  "description": "Example message type (exchange contract 1.0, section 4): the installer reports that a work order is closed. Direction IN, endpoint_logico 'installer', ref_externa the work order number. The receiving package defines the deftemplate work-order-closed with the slots wf-id, work-order, closed-at, result and notes.",
+  "type": "object",
+  "required": ["schema", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "work-order-closed@1" },
+    "data": {
+      "type": "object",
+      "required": ["work-order", "closed-at", "result"],
+      "additionalProperties": false,
+      "properties": {
+        "work-order": {
+          "description": "Work order number in the installer's system (also the row's ref_externa).",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "closed-at": {
+          "description": "Closing time, RFC 3339 in UTC.",
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$"
+        },
+        "result": {
+          "description": "Outcome of the work order. A SYMBOL slot in the receiving package.",
+          "type": "string",
+          "enum": ["ok", "failed", "cancelled"]
+        },
+        "notes": {
+          "description": "Free text from the technician. Optional; the slot default applies when absent.",
+          "type": "string",
+          "maxLength": 2000
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema": "work-order-closed@1",
+      "data": { "work-order": "OI-55", "closed-at": "2026-11-17T10:22:00Z", "result": "ok" }
+    },
+    {
+      "schema": "work-order-closed@1",
+      "data": { "work-order": "OI-56", "closed-at": "2026-11-17T11:05:30.250Z", "result": "failed", "notes": "No access to the building" }
+    }
+  ]
+}

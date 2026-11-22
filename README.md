@@ -22,7 +22,7 @@ Directories are created by the task that introduces them.
 | `engine/` | Daemon (engine node): event loop, tracing, plugin loader, admin socket, exchange consumer | T1–T15 |
 | `plugins/` | C plugins: `example/`, `orm/`, `zmq/` | T6, T8–T10, T14 |
 | `packages/` | Rule packages (workflow definitions and samples) | T4, T16 |
-| `contracts/` | Exchange table DDL and message JSON Schemas | T12 |
+| `docs/exchange-contract.md`, `docs/schemas/` | Exchange contract (table DDL, states, rules) and message JSON Schemas | T12 |
 | `dispatcher/` | `clpd-dispatch` | T18–T20 |
 | `connectors/` | Connectors to external systems, any language (later phase) | — |
 | `deploy/` | systemd units and deployment assets | T17 |
