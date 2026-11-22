@@ -106,7 +106,7 @@ Key constraint (CLIPS APG 6.4.2 §1.2): *"Each environment can have at most one 
 
 ## 5. Non-functional requirements
 - **NFR-1 Concurrency:** one thread per CLIPS environment; no CLIPS call from any other thread.
-- **NFR-2 Security:** admin socket local only; no remote code evaluation path; parameterized SQL only; plugins loaded only from configured paths; database credentials never logged.
+- **NFR-2 Security:** admin socket local only; no remote code evaluation path; parameterized SQL only; plugins loaded only from configured paths; database credentials never logged; each connector logs in with its own role and, through column grants and row-level security, reads and changes only the exchange rows of its own `endpoint_logico` values and never sets `wf_id` (exchange contract §3.5).
 - **NFR-3 Consistency:** state change, consumption of inbound messages and production of outbound messages are atomic per cycle (single PostgreSQL database, D23).
 - **NFR-4 Observability:** per-instance audit trail from the trace (`wf_id`) and the exchange table; metrics exposed by nodes and dispatcher.
 - **NFR-5 Capacity:** volumes unknown (D14/D29). The design must scale horizontally; capacity is established by load tests (T23); exchange table retention and partitioning are configurable and decided in T23, keeping the columns and deduplication behaviour of exchange contract v1.0 (§3.3).
@@ -120,6 +120,7 @@ Key constraint (CLIPS APG 6.4.2 §1.2): *"Each environment can have at most one 
 | `workflow_instance` | engine | `wf_id` PK, definition, version, status, parent `wf_id`, owner node, lease, timestamps |
 | `mensaje_intercambio` | shared contract | inbound and outbound messages (see exchange contract) |
 | `correlacion` | dispatcher/engine | `(endpoint_logico, ref_externa)` (primary key) → `wf_id`; DDL in the exchange contract §3.4 |
+| `conector_endpoint` | operations (table owner) | `(rol, endpoint_logico)`: the endpoints each connector role may read and change, used by the row-level security policies; exchange contract §3.5 |
 | aggregate tables | engine (new) or existing systems (mapped) | per-workflow business state, keyed by `wf_id` + local key |
 
 ## 7. Configuration (initial keys)

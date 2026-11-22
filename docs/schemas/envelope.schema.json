@@ -26,9 +26,22 @@
   "$defs": {
     "scalar": {
       "anyOf": [
-        { "type": "string", "maxLength": 8192 },
-        { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 },
-        { "type": "number", "not": { "type": "integer" } }
+        {
+          "description": "At most 8192 characters (Unicode code points, as maxLength counts them; exchange contract section 4.2).",
+          "type": "string",
+          "maxLength": 8192
+        },
+        {
+          "description": "Integral value (2 and 2.0 alike) in the int64 range; mapped to the slot's type (section 4.3). Validators that parse numbers as IEEE 754 doubles (JavaScript) cannot check these bounds exactly beyond 2^53 (section 4.2).",
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        {
+          "description": "Number with a fractional part: FLOAT.",
+          "type": "number",
+          "not": { "type": "integer" }
+        }
       ]
     },
     "value": {
