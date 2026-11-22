@@ -104,11 +104,16 @@ void clpd_orm_sync_touch(clpd_orm_syncer *s, const char *wf,
  * it. NULL is accepted (nothing happens).
  *
  * clpd_orm_sync_isolated is 1 when wf is no longer synchronized (a write
- * that failed for good, the poison retry), else 0 (also for s NULL). */
+ * that failed for good, the poison retry), else 0 (also for s NULL).
+ *
+ * clpd_orm_sync_mapped is 1 when a loaded package has an orm mapping, so
+ * the daemon created the workflow_instance table (T10a), else 0 (also for
+ * s NULL): without one nothing reads that table (T11e). */
 int clpd_orm_sync_flush_instance(clpd_orm_syncer *s, const char *wf,
                                  FILE *log);
 void clpd_orm_sync_finish(clpd_orm_syncer *s, const char *wf);
 int clpd_orm_sync_isolated(const clpd_orm_syncer *s, const char *wf);
+int clpd_orm_sync_mapped(const clpd_orm_syncer *s);
 
 /* The parameter for the value v in column c, by the write rules of the
  * synchronization (docs/orm.md#write-rules; the DML functions use them
@@ -214,8 +219,9 @@ int clpd_orm_sync_evict_idle(clpd_orm_syncer *s, FILE *log);
  * (src/ingest.h clpd_ingest_admit_fn, whose CLPD_INGEST_* values it
  * returns), inside the open cycle transaction. wf_id is the
  * value the wf-id slot of the fact about to be asserted will hold (NULL:
- * no wf-id slot). Returns CLPD_INGEST_ASSERT at once for s NULL, no cycle
- * open, a value that names no instance (src/orm_sync.c value_text), an
+ * no wf-id slot). Returns CLPD_INGEST_ASSERT at once for s NULL, no
+ * loaded package with an orm mapping (no workflow_instance table, T11e),
+ * no cycle open, a value that names no instance (src/orm_sync.c value_text), an
  * instance with a fact in working memory (a count the hooks keep, O(1))
  * or an isolated one (never reloaded). Otherwise reads the instance's
  * workflow_instance row:

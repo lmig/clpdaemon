@@ -144,6 +144,13 @@ static void finish(UDFContext *ctx, UDFValue *ret, const char *status,
   }
   wf_of(&a, wf, sizeof wf);
   shown(wf, name);
+  if (!clpd_orm_sync_mapped(ddl->sync)) {
+    clpd_orm_ddl_fail(ctx, ret, NULL, NULL,
+                      "instance '%s': no loaded package has an orm mapping, "
+                      "so there is no " CLPD_ORM_INSTANCE_TABLE " table",
+                      name);
+    return;
+  }
   if (clpd_orm_sync_isolated(ddl->sync, wf)) {
     clpd_orm_ddl_fail(ctx, ret, NULL, NULL,
                       "instance '%s' is no longer synchronized", name);

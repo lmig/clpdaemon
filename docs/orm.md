@@ -360,6 +360,7 @@ The same log line format, CLIPS evaluation error and `FALSE` as the [DDL errors]
 |---|---|
 | Not called from the actions of a rule of a rule package | `clpdaemon: <udf>: only a rule of a rule package may call it (no rule is executing)`, `clpdaemon: <udf>: only a rule of a rule package may call it (rule '<rule>' is in module '<module>')` |
 | A wrong argument type or count | reported by CLIPS itself |
+| No loaded package has an `orm` mapping, so the daemon created no `workflow_instance` table (T11e) | `clpdaemon: <udf>: instance '<wf-id>': no loaded package has an orm mapping, so there is no workflow_instance table` |
 | The instance is [isolated](#failures) (no longer synchronized) | `clpdaemon: <udf>: instance '<wf-id>' is no longer synchronized` |
 | PostgreSQL: no schema of the `search_path` exists | `clpdaemon: <udf>: instance '<wf-id>': no current schema (the search_path names no existing schema)` |
 | The instance's row belongs to another definition | `clpdaemon: <udf>: instance '<wf-id>' belongs to definition <definition>, not to definition <caller-definition> of the calling rule` |
@@ -382,6 +383,7 @@ clpdaemon: wf-complete: instance 'w1' is already completed
 - The instance's pending changes are written by the call itself, so the final state never precedes them in the database; they are then no longer pending, and the instances they wrote count as touched (a rollback reloads them).
 - Ended instances are remembered in memory (sorted, until the daemon restarts), so their later facts are never written; the database row is the authority for a second call, also after a restart.
 - A rolled-back cycle never reloads an instance a committed cycle ended (its later facts are evicted and dropped); it does reload one the rolled-back cycle itself ended.
+- Without any loaded package with an `orm` mapping the daemon creates no `workflow_instance` table ([`database.md`](database.md)), so the call is refused before any statement and changes nothing (T11e): there is no row to hold the final state, and a refused call leaves the instance's facts in place.
 - `--check` does not check the shape of `workflow_instance` (it writes nothing and reads no table either); the daemon checks it at startup, after the `CREATE TABLE IF NOT EXISTS` ([`database.md`](database.md#shape-check)).
 
 ## Automatic synchronization
@@ -591,7 +593,7 @@ An idle instance that does not qualify is checked again one idle period later, n
 
 ## On-demand rehydration
 
-An instance with no fact in working memory (evicted when idle, ended, or not loaded since the daemon started) is reloaded from the database when an input arrives for it (T11d, FR-9, FR-2, D4, D18, L107 "Bajo demanda al llegar una entrada"). There is no reload at startup: after a restart every instance comes back this way, at its first input. Only with a `database`; without one every ingested fact is asserted as before.
+An instance with no fact in working memory (evicted when idle, ended, or not loaded since the daemon started) is reloaded from the database when an input arrives for it (T11d, FR-9, FR-2, D4, D18, L107 "Bajo demanda al llegar una entrada"). There is no reload at startup: after a restart every instance comes back this way, at its first input. Only with a `database` and at least one loaded package with an `orm` mapping; without a database, or when no package has a mapping (the daemon then creates no `workflow_instance` table, T11e), every ingested fact is asserted as before and nothing is read.
 
 When the [ingest drain](ingest.md#queue), inside the [cycle transaction](database.md#cycle-transaction), is about to assert a fact (every [check](ingest.md#rejection-messages) passed) whose `wf-id` (the value the document gives, else the slot's default; its text as [`workflow_instance`](#workflow_instance-rows) keys it) names an instance with no fact in working memory, the daemon reads the instance's row (`SELECT "definition", "version", "status" FROM "workflow_instance" WHERE "wf_id" = $1`, on PostgreSQL qualified with `current_schema()`), and:
 

@@ -2966,6 +2966,47 @@ clpdaemon: received SIGTERM, stopping"
 else
   echo "cli_test.sh: sqlite3 not found; the T11d database cases are skipped" >&2
 fi
+# T11e B1: with a database and no package with an orm mapping there is no
+# workflow_instance table, so the admission never reads it and the facts are
+# processed as without the T11d admission; wf-complete is refused with an
+# exact message and changes nothing.
+mkdir nopkg
+conf nopkg/package.conf 'definition = nomap
+version = 1
+files = r.clp
+ingest = order, event'
+conf nopkg/r.clp '(deftemplate order (slot wf-id))
+(deftemplate event (slot wf-id) (slot kind (type SYMBOL)))
+(defrule seen (order (wf-id ?w)) => (printout t "seen " ?w crlf))
+(defrule done (event (wf-id ?w) (kind done)) => (wf-complete ?w))'
+rconf norun.conf "node_id = n1
+tick_interval_ms = 50
+cycle_min_interval_ms = 10
+database = sqlite:$WORK/nomap.db
+packages = nopkg"
+cases=$((cases + 1))
+start norun.conf admin.sock
+acase "no mapping: inject" "OK queued
+OK queued" admin.sock 'inject {"template":"order","slots":{"wf-id":"n1"}}\ninject {"template":"order","slots":{"wf-id":"n2"}}\n'
+wait_line out.txt "seen n1" || ok=0
+wait_line out.txt "seen n2" || ok=0
+wait_status admin.sock ' queue=0 facts=3$' || ok=0
+acase "no mapping: inject done" "OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"n1","kind":{"sym":"done"}}}\n'
+wait_line err.txt "clpdaemon: wf-complete: instance 'n1': no loaded package has an orm mapping, so there is no workflow_instance table" || ok=0
+wait_status admin.sock ' queue=0 facts=4$' || ok=0
+kill -TERM "$pid" 2>/dev/null
+wait_exit "$pid"
+want="clpdaemon: n1: running
+clpdaemon: wf-complete: instance 'n1': no loaded package has an orm mapping, so there is no workflow_instance table
+[PRCCODE4] Execution halted during the actions of defrule 'done'.
+clpdaemon: received SIGTERM, stopping"
+[ "$ok" = 1 ] && [ "$rc" = 0 ] && [ "$(sort out.txt)" = "seen n1${NL}seen n2" ] && [ "$(cat err.txt)" = "$want" ] ||
+  fail "no mapping: facts processed, no workflow_instance read" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+if command -v sqlite3 >/dev/null 2>&1; then
+  cases=$((cases + 1))
+  [ -z "$(sqlite3 nomap.db "SELECT name FROM sqlite_master WHERE name = 'workflow_instance'" 2>&1)" ] ||
+    fail "no mapping: no workflow_instance table" "[$(sqlite3 nomap.db .tables 2>&1)]"
+fi
 
 printf '%d/%d CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

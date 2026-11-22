@@ -988,8 +988,70 @@ case $st1 in *' queue=0 facts=1') ;; *) fail "pg rehydrate: dropped facts are no
 cases=$((cases + 1))
 [ -n "$rh_before" ] && [ "$rh_after" = "$rh_before" ] && [ "$(rhrows)" = "$rh_before" ] ||
   fail "pg rehydrate: nothing written for dropped facts" "before [$rh_before], after [$rh_after], at exit [$(rhrows)]"
+# T11e: the reload reads workflow_instance under another session's ACCESS
+# EXCLUSIVE lock (lock_timeout 100 ms through options): the read fails
+# with 55P03, the cycle is retried, nothing is isolated, and the event is
+# processed with the stored state after the release.
+sed "s|^database = .*|database = $CONNINFO options='-c lock_timeout=100'|" rh.conf >rhlock.conf
+: >out.txt
+: >err.txt
+"$BIN" --config rhlock.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_has err.txt 'clpdaemon: n1: running' || ok=0
+n=0
+while [ ! -S admin.sock ] && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+inj=$("$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":"k1","status":{"sym":"new"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+wait_has err.txt "clpdaemon: evict: instance 'k1' after 1 s without activity" || ok=0
+evstatus ' queue=0 facts=1$' || ok=0
+locked=1
+cx_hold "pg T11e reload under a workflow_instance lock" workflow_instance 'ACCESS EXCLUSIVE' 1.5 AccessExclusiveLock || locked=0
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"k1","kind":{"sym":"look"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+wait "$hpid"
+hrc=$?
+wait_has out.txt "saw k1 new" || ok=0
+stop_daemon "pg T11e reload under a workflow_instance lock"
+reads=$(grep -c "^clpdaemon: rehydrate: instance 'k1': table 'workflow_instance': $CXLT\$" err.txt)
+cases=$((cases + 1))
+if [ "$locked" = 1 ]; then
+  [ "$ok" = 1 ] && [ "$hrc" = 0 ] && [ "$reads" -ge 2 ] && [ "$(cat out.txt)" = "saw k1 new" ] &&
+    [ "$(grep -c "$CXISO" err.txt)" = 0 ] && ! grep -q 'is not reloaded' err.txt ||
+    fail "pg T11e reload under a workflow_instance lock: retried, no isolation" "seen $ok, holder exit $hrc, failed reads $reads (want >= 2), stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
 q 'DROP TABLE IF EXISTS pgrh_order' >/dev/null
 q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
+# T11e B1: a database and no package with an orm mapping: no
+# workflow_instance table, nothing reads it, the facts are processed.
+mkdir nopkg
+printf '%s\n' 'definition = nomap
+version = 1
+files = r.clp
+ingest = order' >nopkg/package.conf
+printf '%s\n' '(deftemplate order (slot wf-id))
+(defrule seen (order (wf-id ?w)) => (printout t "seen " ?w crlf))' >nopkg/r.clp
+sed 's|^packages = .*|packages = nopkg|' rh.conf >nomap.conf
+: >out.txt
+: >err.txt
+"$BIN" --config nomap.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_has err.txt 'clpdaemon: n1: running' || ok=0
+n=0
+while [ ! -S admin.sock ] && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+inj=$("$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":"n1"}}\ninject {"template":"order","slots":{"wf-id":"n2"}}\n' 2>&1)
+[ "$inj" = "OK queued${NL}OK queued" ] || ok=0
+wait_has out.txt "seen n1" || ok=0
+wait_has out.txt "seen n2" || ok=0
+evstatus ' queue=0 facts=3$' || ok=0
+stop_daemon "pg T11e no mapping"
+cases=$((cases + 1))
+[ "$ok" = 1 ] && [ "$(sort out.txt)" = "seen n1${NL}seen n2" ] &&
+  [ "$(cat err.txt)" = "clpdaemon: n1: running${NL}clpdaemon: received SIGTERM, stopping" ] &&
+  [ "$(q "SELECT count(*) FROM information_schema.tables WHERE table_name = 'workflow_instance'")" = 0 ] ||
+  fail "pg T11e no mapping: facts processed, no workflow_instance" "seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
 
 printf '%d/%d PostgreSQL CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

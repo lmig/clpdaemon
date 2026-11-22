@@ -143,6 +143,7 @@ struct clpd_orm_syncer {
   size_t isolated_n;
   char failed[4096]; /* the instance of the write that failed, or "" */
   const clpd_packages *p;
+  int mapped; /* a package has an orm mapping: workflow_instance exists */
   int cycle_open; /* between a begin and the end of its cycle */
   wfset touched;  /* what the open cycle asserted or retracted */
   wfset pending;  /* evicted instances to reload when the next cycle starts */
@@ -1083,6 +1084,7 @@ int clpd_orm_sync_attach(Environment *env, clpd_db *db,
   for (i = 0; i < p->count; i++) {
     const clpd_package *pkg = &p->items[i];
     if (first_of_definition(p, i)) s->aggregates++;
+    if (pkg->orm != NULL) s->mapped = 1; /* as create_instance_table */
     if (pkg->orm == NULL || pkg->orm_templates == NULL) continue;
     /* The aggregate: the index of the definition, in package order. */
     for (aggregate = 0, k = 0; k < i; k++) {
@@ -1537,6 +1539,10 @@ int clpd_orm_sync_isolated(const clpd_orm_syncer *s, const char *wf) {
   return s != NULL && is_isolated(s, wf);
 }
 
+int clpd_orm_sync_mapped(const clpd_orm_syncer *s) {
+  return s != NULL && s->mapped;
+}
+
 /* --- idle eviction (T11c) --------------------------------------------- */
 
 void clpd_orm_sync_set_idle_after(clpd_orm_syncer *s, long long ms) {
@@ -1824,7 +1830,7 @@ int clpd_orm_sync_admit(clpd_orm_syncer *s, const CLIPSValue *wf_id,
                         FILE *log) {
   char *wf;
   int rc;
-  if (s == NULL || wf_id == NULL || !s->cycle_open ||
+  if (s == NULL || !s->mapped || wf_id == NULL || !s->cycle_open ||
       (wf = value_text(wf_id)) == NULL)
     return CLPD_INGEST_ASSERT;
   rc = live_has(s, wf) || is_isolated(s, wf) ? CLPD_INGEST_ASSERT
