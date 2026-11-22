@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:clpdaemon:schema:delivery-failed@1",
+  "title": "delivery-failed, version 1",
+  "description": "IN message a connector writes when it gives up on an OUT message (dead letter, exchange contract 1.0, section 7.6). Row: direccion 'IN', tipo_mensaje 'delivery-failed', the endpoint_logico, correlacion_id and ref_externa of the failed OUT row, msg_id_externo 'delivery-failed:<out id>'. The engine defines the deftemplate delivery-failed for every package (T13).",
+  "type": "object",
+  "required": ["schema", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "delivery-failed@1" },
+    "data": {
+      "type": "object",
+      "required": ["out-id", "out-type", "attempts", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "out-id": {
+          "description": "id of the failed OUT row.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "out-type": {
+          "description": "tipo_mensaje of the failed OUT row.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,62}$"
+        },
+        "attempts": {
+          "description": "intentos of the failed OUT row: the number of times it was claimed for sending.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "description": "Last error, one line, at most 1000 characters (the OUT row's error column).",
+          "type": "string",
+          "maxLength": 1000
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema": "delivery-failed@1",
+      "data": { "out-id": 1042, "out-type": "work-order-request", "attempts": 8, "reason": "HTTP 503 from installer API" }
+    }
+  ]
+}

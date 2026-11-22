@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:clpdaemon:schema:envelope:1",
+  "title": "clpdaemon exchange envelope",
+  "description": "The payload column of every mensaje_intercambio row (exchange contract 1.0, section 4). A payload validates against this schema and against the schema of its message type, docs/schemas/<tipo_mensaje>@<version>.json.",
+  "type": "object",
+  "required": ["schema", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "description": "<tipo_mensaje>@<version>. The part before '@' equals the row's tipo_mensaje column.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}@[1-9][0-9]{0,8}$"
+    },
+    "data": {
+      "description": "Slot name to value. The engine sets wf-id and correlacion-id from the row, so data never carries them.",
+      "type": "object",
+      "maxProperties": 1024,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]{0,62}$",
+        "not": { "enum": ["wf-id", "correlacion-id"] }
+      },
+      "additionalProperties": { "$ref": "#/$defs/value" }
+    }
+  },
+  "$defs": {
+    "scalar": {
+      "anyOf": [
+        { "type": "string", "maxLength": 8192 },
+        { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 },
+        { "type": "number", "not": { "type": "integer" } }
+      ]
+    },
+    "value": {
+      "anyOf": [
+        { "$ref": "#/$defs/scalar" },
+        { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/scalar" } }
+      ]
+    }
+  },
+  "examples": [
+    {
+      "schema": "work-order-closed@1",
+      "data": { "work-order": "OI-55", "closed-at": "2026-11-17T10:22:00Z", "result": "ok" }
+    },
+    {
+      "schema": "delivery-failed@1",
+      "data": { "out-id": 1042, "out-type": "work-order-request", "attempts": 8, "reason": "HTTP 503 from installer API" }
+    }
+  ]
+}

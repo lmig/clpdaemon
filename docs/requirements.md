@@ -39,7 +39,7 @@ clpdaemon is a daemon that executes **workflows coded as CLIPS rule packages**. 
   installer, ...)                                    │ mensaje_intercambio    │◄── clpd-dispatch
        ◄──────────►   connector-x  ────────────────► │   IN / OUT             │    (correlate, create
                                                      │ workflow_instance      │     instance, assign,
-                                                     │ correlation            │     notify via ZeroMQ)
+                                                     │ correlacion            │     notify via ZeroMQ)
                                                      │ aggregate tables       │          │
                                                      └────────────────────────┘          ▼
                                                                 ▲             clpdaemon node 1..N
@@ -91,12 +91,12 @@ Key constraint (CLIPS APG 6.4.2 §1.2): *"Each environment can have at most one 
 - **FR-27** Changes made to aggregate tables by processes other than the engine must reach the engine as `IN` messages (written by those processes or by database triggers into the exchange table). (D22)
 
 ### 4.7 Exchange and notification
-- **FR-28** All interaction with external systems goes through the single table `mensaje_intercambio` defined in `docs/exchange-contract.md`. The engine never calls an external system. (S12, S13)
-- **FR-29** In one cycle transaction a node reads its `ASIGNADO` rows ordered by `id`, asserts them as facts, runs, writes aggregate state and `OUT` rows, and marks the `IN` rows `CONSUMIDO`. (S12, S13)
-- **FR-30** Deduplication by `UNIQUE(endpoint_logico, direccion, msg_id_externo)`; responses correlate by `correlacion_id`. (S13)
-- **FR-31** The dispatcher notifies the node over ZeroMQ **after** its `COMMIT`. Notifications carry only hints; nodes also poll their assigned rows every `safety_poll_interval_ms`. A lost notification never loses data. (S14)
+- **FR-28** All interaction with external systems goes through the single table `mensaje_intercambio` defined in `docs/exchange-contract.md` (contract v1.0, T12: DDL, states, envelope and per-type JSON Schemas under `docs/schemas/`). The engine never calls an external system. (S12, S13)
+- **FR-29** In one cycle transaction a node reads its `ASIGNADO` rows ordered by `id`, asserts them as facts (the `data` of the envelope mapped to the slots of the deftemplate named by `tipo_mensaje`, with the slot's declared CLIPS types), runs, writes aggregate state and `OUT` rows, and marks the `IN` rows `CONSUMIDO`, or `ERROR` with the reason in `error` when `data` does not map; `ERROR` is terminal until an operator puts the row back to `RECIBIDO` (exchange contract §4.3, §9; L117). (S12, S13)
+- **FR-30** Deduplication by `UNIQUE(endpoint_logico, direccion, msg_id_externo)` (`INSERT ... ON CONFLICT DO NOTHING`); responses correlate by `correlacion_id`, unsolicited events by `(endpoint_logico, ref_externa)` through `correlacion`; rows that cannot be correlated are retried for a configurable window (default 10 min) and then stay `SIN_CORRELACION` for an operator. `OUT` delivery is at least once, claimed with a lease and retried per `endpoint_logico` (defaults 8 attempts, backoff 1 s to 1 h with jitter); after the last attempt the connector writes the dead letter and a `delivery-failed` `IN` message (exchange contract §7, §8). (S13)
+- **FR-31** The dispatcher notifies the node over ZeroMQ **after** its `COMMIT`. Notifications carry only hints; nodes also poll their assigned rows every `safety_poll_interval_ms`. A lost notification never loses data. Connectors may send an optional ZeroMQ wake-up hint to the intake after their `COMMIT`; socket types, endpoints and frames are fixed in the exchange contract §10. (S14)
 - **FR-32** The ZeroMQ plugin also supports direct pub/sub fact injection for non-durable sources through the ingest pipeline (FR-21). Durable external messages always use the exchange table. (S8)
-- **FR-33** Inbound synchronous interfaces are handled by connectors: queries read the database; commands are answered `202 Accepted` with the `wf_id` and the outcome is delivered by callback or later query. (D25)
+- **FR-33** Inbound synchronous interfaces are handled by connectors: queries read the database; commands are answered `202 Accepted` with the `id` of the inserted `IN` row (the `wf_id` is assigned later by the dispatcher and is readable by a later query on that row) and the outcome is delivered by callback or later query. (D25, L118)
 
 ### 4.8 Distribution (v2) and resilience (v3)
 - **FR-34** Each node has a `node_id`, belongs to groups, and sends a heartbeat (ZeroMQ) with load metrics (queue length, last cycle duration, fact count, agenda size) and loaded `definition@version` list. (S9)
@@ -109,7 +109,7 @@ Key constraint (CLIPS APG 6.4.2 §1.2): *"Each environment can have at most one 
 - **NFR-2 Security:** admin socket local only; no remote code evaluation path; parameterized SQL only; plugins loaded only from configured paths; database credentials never logged.
 - **NFR-3 Consistency:** state change, consumption of inbound messages and production of outbound messages are atomic per cycle (single PostgreSQL database, D23).
 - **NFR-4 Observability:** per-instance audit trail from the trace (`wf_id`) and the exchange table; metrics exposed by nodes and dispatcher.
-- **NFR-5 Capacity:** volumes unknown (D14/D29). The design must scale horizontally; capacity is established by load tests (T23); exchange table retention and partitioning are configurable.
+- **NFR-5 Capacity:** volumes unknown (D14/D29). The design must scale horizontally; capacity is established by load tests (T23); exchange table retention and partitioning are configurable and decided in T23, keeping the columns and deduplication behaviour of exchange contract v1.0 (§3.3).
 - **NFR-6 Portability:** Linux (systemd). CLIPS sources vendored unmodified.
 - **NFR-7 Testability:** every behavior covered by automated tests through public interfaces (CLI, socket, database, trace files); SQLite backend for fast tests, PostgreSQL for integration tests.
 
@@ -119,7 +119,7 @@ Key constraint (CLIPS APG 6.4.2 §1.2): *"Each environment can have at most one 
 |---|---|---|
 | `workflow_instance` | engine | `wf_id` PK, definition, version, status, parent `wf_id`, owner node, lease, timestamps |
 | `mensaje_intercambio` | shared contract | inbound and outbound messages (see exchange contract) |
-| `correlacion` | dispatcher/engine | `(endpoint_logico, ref_externa)` → `wf_id` |
+| `correlacion` | dispatcher/engine | `(endpoint_logico, ref_externa)` (primary key) → `wf_id`; DDL in the exchange contract §3.4 |
 | aggregate tables | engine (new) or existing systems (mapped) | per-workflow business state, keyed by `wf_id` + local key |
 
 ## 7. Configuration (initial keys)
