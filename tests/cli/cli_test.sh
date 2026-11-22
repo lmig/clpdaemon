@@ -2937,12 +2937,13 @@ clpdaemon: received SIGTERM, stopping"
   acase "rehydrate: inject done" "OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"done"}}}\n'
   wait_status admin.sock ' queue=0 facts=1$' || ok=0
   [ "$(odsql "SELECT status FROM workflow_instance WHERE wf_id = 'e1'")" = completed ] || ok=0
-  odsql "INSERT INTO workflow_instance (wf_id, definition, version, status, created_at, updated_at) VALUES ('f1', 'od', '1', 'failed', 'x', 'x'), ('p1', 'other', '2', 'active', 'x', 'x')" >/dev/null
+  odsql "INSERT INTO workflow_instance (wf_id, definition, version, status, created_at, updated_at) VALUES ('f1', 'od', '1', 'failed', 'x', 'x'), ('p1', 'other', '2', 'active', 'x', 'x'), ('v2', 'od', '2', 'active', 'x', 'x')" >/dev/null
   od_before=$(odrows)
   acase "rehydrate: inject for finished and foreign instances" "OK queued
 OK queued
-OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\ninject {"template":"order","slots":{"wf-id":"f1","status":{"sym":"late"}}}\ninject {"template":"event","slots":{"wf-id":"p1"}}\n'
-  wait_line err.txt "clpdaemon: ingest: instance 'p1' belongs to package other@2, which is not loaded; fact dropped" || ok=0
+OK queued
+OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\ninject {"template":"order","slots":{"wf-id":"f1","status":{"sym":"late"}}}\ninject {"template":"event","slots":{"wf-id":"p1"}}\ninject {"template":"event","slots":{"wf-id":"v2","kind":{"sym":"look"}}}\n'
+  wait_line err.txt "clpdaemon: ingest: instance 'v2' belongs to package od@2, which is not loaded; fact dropped" || ok=0
   wait_status admin.sock ' queue=0 facts=1$' || ok=0
   sleep 0.3
   st1=$("$ADMIN" admin.sock 'status\n' 2>&1)
@@ -2953,6 +2954,7 @@ OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{
 clpdaemon: ingest: instance 'e1' is completed; fact dropped
 clpdaemon: ingest: instance 'f1' is failed; fact dropped
 clpdaemon: ingest: instance 'p1' belongs to package other@2, which is not loaded; fact dropped
+clpdaemon: ingest: instance 'v2' belongs to package od@2, which is not loaded; fact dropped
 clpdaemon: received SIGTERM, stopping"
   [ "$ok" = 1 ] && [ "$rc" = 0 ] && [ "$(cat out.txt)" = "saw e1 other" ] && [ "$(cat err.txt)" = "$want" ] ||
     fail "rehydrate: restart then inject, finished instances dropped" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
@@ -2978,7 +2980,8 @@ ingest = order, event'
 conf nopkg/r.clp '(deftemplate order (slot wf-id))
 (deftemplate event (slot wf-id) (slot kind (type SYMBOL)))
 (defrule seen (order (wf-id ?w)) => (printout t "seen " ?w crlf))
-(defrule done (event (wf-id ?w) (kind done)) => (wf-complete ?w))'
+(defrule done (event (wf-id ?w) (kind done)) => (wf-complete ?w))
+(defrule bad (event (wf-id ?w) (kind bad)) => (wf-fail ?w "why"))'
 rconf norun.conf "node_id = n1
 tick_interval_ms = 50
 cycle_min_interval_ms = 10
@@ -2994,14 +2997,20 @@ wait_status admin.sock ' queue=0 facts=3$' || ok=0
 acase "no mapping: inject done" "OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"n1","kind":{"sym":"done"}}}\n'
 wait_line err.txt "clpdaemon: wf-complete: instance 'n1': no loaded package has an orm mapping, so there is no workflow_instance table" || ok=0
 wait_status admin.sock ' queue=0 facts=4$' || ok=0
+acase "no mapping: inject bad" "OK queued" admin.sock 'inject {"template":"event","slots":{"wf-id":"n2","kind":{"sym":"bad"}}}\n'
+wait_line err.txt "clpdaemon: wf-fail: instance 'n2': no loaded package has an orm mapping, so there is no workflow_instance table" || ok=0
+# Both refusals leave every fact in place: the clock, n1, n2 and the events.
+wait_status admin.sock ' queue=0 facts=5$' || ok=0
 kill -TERM "$pid" 2>/dev/null
 wait_exit "$pid"
 want="clpdaemon: n1: running
 clpdaemon: wf-complete: instance 'n1': no loaded package has an orm mapping, so there is no workflow_instance table
 [PRCCODE4] Execution halted during the actions of defrule 'done'.
+clpdaemon: wf-fail: instance 'n2': no loaded package has an orm mapping, so there is no workflow_instance table
+[PRCCODE4] Execution halted during the actions of defrule 'bad'.
 clpdaemon: received SIGTERM, stopping"
 [ "$ok" = 1 ] && [ "$rc" = 0 ] && [ "$(sort out.txt)" = "seen n1${NL}seen n2" ] && [ "$(cat err.txt)" = "$want" ] ||
-  fail "no mapping: facts processed, no workflow_instance read" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+  fail "no mapping: facts processed, wf-complete and wf-fail refused, no workflow_instance read" "exit $rc, seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
 if command -v sqlite3 >/dev/null 2>&1; then
   cases=$((cases + 1))
   [ -z "$(sqlite3 nomap.db "SELECT name FROM sqlite_master WHERE name = 'workflow_instance'" 2>&1)" ] ||
