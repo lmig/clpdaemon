@@ -3,6 +3,8 @@
 
 #include "packages.h"
 
+#include "clock.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1085,11 +1087,111 @@ static void test_orm_versions_share_table(void) {
   done(&r);
 }
 
+static void clock_setup(Environment *env) {
+  EXPECT(clpd_clock_define(env) == 0);
+}
+
+/* T11b: every generated package module imports MAIN::clpd-clock, so its
+ * rules match the clock fact without a wf-id (lint-exempt); the loader
+ * defines the template when the environment has none yet, and keeps the
+ * one the core defined. */
+static void test_clock_imported(void) {
+  const char *dirs[2];
+  int setup;
+  run r;
+  dirs[0] = package("clk-a", "definition = clka\nversion = 1\nfiles = a.clp\n");
+  write_file(dirs[0], "a.clp",
+             "(deftemplate due (slot wf-id) (slot at))\n"
+             "(defrule ring ?d <- (due (wf-id ?w) (at ?at))\n"
+             "  (clpd-clock (now-ms ?n&:(>= ?n ?at))) => (retract ?d))\n");
+  dirs[1] = package("clk-b", "definition = clkb\nversion = 1\nfiles = b.clp\n");
+  write_file(dirs[1], "b.clp", "(defrule tick (clpd-clock (now ?s)) =>)\n");
+  for (setup = 0; setup < 2; setup++) {
+    Deftemplate *core;
+    load_setup = setup ? clock_setup : NULL;
+    load(&r, dirs, 2);
+    load_setup = NULL;
+    EXPECT(r.rc == 0 && err_matches(&r, ""));
+    core = FindDeftemplate(r.env, "MAIN::clpd-clock");
+    EXPECT(core != NULL && clpd_clock_is_template(core));
+    /* Visible from each package module as its own name. */
+    SetCurrentModule(r.env, FindDefmodule(r.env, "clka@1"));
+    EXPECT(FindDeftemplate(r.env, "clpd-clock") == core);
+    SetCurrentModule(r.env, FindDefmodule(r.env, "clkb@1"));
+    EXPECT(FindDeftemplate(r.env, "clpd-clock") == core);
+    SetCurrentModule(r.env, FindDefmodule(r.env, "MAIN"));
+    Reset(r.env);
+    SetCurrentModule(r.env, FindDefmodule(r.env, "clka@1"));
+    EXPECT(AssertString(r.env, "(due (wf-id w1) (at 5))") != NULL);
+    SetCurrentModule(r.env, FindDefmodule(r.env, "MAIN"));
+    EXPECT(AssertString(r.env, "(clpd-clock (now-ms 4) (now \"x\"))") != NULL);
+    clpd_packages_focus(r.env, &r.pkgs);
+    EXPECT(Run(r.env, -1) == 1); /* tick only: 4 < 5 */
+    EXPECT(AssertString(r.env, "(clpd-clock (now-ms 5) (now \"y\"))") != NULL);
+    clpd_packages_focus(r.env, &r.pkgs);
+    EXPECT(Run(r.env, -1) == 2); /* ring and tick */
+    done(&r);
+  }
+}
+
+/* T11b: a package cannot define its own clpd-clock (the name is reserved
+ * for the core's template), with or without a module name; the load fails
+ * after CLIPS's own diagnostics and names the file. */
+static void test_clock_reserved(void) {
+  static const char *const texts[] = {
+      "(deftemplate clpd-clock (slot now-ms))\n",
+      "(deftemplate own@1::clpd-clock\n  \"comment\" (slot x))\n"};
+  const char *dirs[1];
+  char want[2048];
+  size_t i;
+  run r;
+  dirs[0] = package("own", "definition = own\nversion = 1\nfiles = c.clp, never.clp\n");
+  for (i = 0; i < 2; i++) {
+    write_file(dirs[0], "c.clp", texts[i]);
+    load(&r, dirs, 1);
+    snprintf(want, sizeof want,
+             "clpdaemon: own@1: clips: [CSTRCPSR3] %s/c.clp, Line %d: Cannot "
+             "define deftemplate 'clpd-clock' because of an import/export "
+             "conflict.\n"
+             "clpdaemon: own@1: clips: ERROR:\n"
+             "clpdaemon: own@1: clips: (deftemplate own@1::clpd-clock\n"
+             "clpdaemon: %s/c.clp: load failed\n"
+             "clpdaemon: %s/c.clp: deftemplate 'clpd-clock' is reserved by the "
+             "core (MAIN::clpd-clock)\n",
+             dirs[0], 1, dirs[0], dirs[0]);
+    EXPECT(r.rc != 0);
+    EXPECT(err_matches(&r, want));
+    EXPECT(FindDeftemplate(r.env, "own@1::clpd-clock") == NULL ||
+           clpd_clock_is_template(FindDeftemplate(r.env, "own@1::clpd-clock")));
+    done(&r);
+  }
+  /* MAIN::clpd-clock itself: outside the package module, and reserved. */
+  write_file(dirs[0], "c.clp", "(deftemplate MAIN::clpd-clock (slot x))\n");
+  load(&r, dirs, 1);
+  snprintf(want, sizeof want,
+           "clpdaemon: %s/c.clp: deftemplate 'clpd-clock' is reserved by the "
+           "core (MAIN::clpd-clock)\n"
+           "clpdaemon: %s/c.clp: deftemplate 'MAIN::clpd-clock' is outside "
+           "the package module own@1\n",
+           dirs[0], dirs[0]);
+  EXPECT(r.rc != 0);
+  EXPECT(err_matches(&r, want));
+  done(&r);
+  /* A template whose name only starts with it is not the clock. */
+  write_file(dirs[0], "c.clp", "(deftemplate clpd-clocks (slot wf-id))\n");
+  write_file(dirs[0], "never.clp", "");
+  load(&r, dirs, 1);
+  EXPECT(r.rc == 0 && err_matches(&r, ""));
+  done(&r);
+}
+
 int main(void) {
   if (mkdtemp(root) == NULL) {
     perror("packages_test");
     return 2;
   }
+  test_clock_imported();
+  test_clock_reserved();
   test_two_packages_focus();
   test_no_packages();
   test_missing_file_and_next_package();

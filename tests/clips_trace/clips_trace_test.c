@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 
 #include "clips_trace.h"
+#include "clock.h"
 #include "log.h"
 
 #include "../common/expect.h"
@@ -55,6 +56,9 @@ typedef struct {
   FILE *err;
 } fixture;
 
+/* When set, setup defines the core's clock template first (T11b). */
+static int setup_clock;
+
 static int setup(fixture *f, int facts, int rules, const char *constructs) {
   unlink(text_path);
   unlink(jsonl_path);
@@ -65,6 +69,7 @@ static int setup(fixture *f, int facts, int rules, const char *constructs) {
   clpd_trace_set_clock(f->trace, fixed_clock);
   f->env = CreateEnvironment();
   EXPECT(f->env != NULL);
+  if (setup_clock) EXPECT(clpd_clock_define(f->env) == 0);
   if (constructs != NULL)
     EXPECT(LoadFromString(f->env, constructs, strlen(constructs)));
   f->ct = NULL;
@@ -505,6 +510,76 @@ static void test_attach_failure(void) {
   clpd_trace_close(t);
 }
 
+static long long clock_sec;
+
+static void test_clock_source(long long *sec, long *nsec) {
+  *sec = clock_sec;
+  *nsec = 0;
+}
+
+/* T11b: the clock fact's assert (and retract) are traced like any fact,
+ * its modifies never: not the per-cycle update, not a modify by a rule or
+ * a command. A rule matching it fires as usual (its basis lists the clock
+ * fact; the wf_id is the one of the first basis fact that has one). */
+static void test_clock_modify_not_traced(void) {
+  fixture f;
+  clpd_clock *c;
+  setup_clock = 1;
+  if (setup(&f, 1, 1,
+            "(defmodule p@1 (import MAIN deftemplate clpd-clock))"
+            "(deftemplate p@1::order (slot wf-id) (slot status))"
+            "(defrule p@1::late (clpd-clock (now-ms ?n&:(>= ?n 2000)))"
+            " ?o <- (order (wf-id ?w) (status open))"
+            " => (modify ?o (status late)))") != 0) {
+    setup_clock = 0;
+    return;
+  }
+  setup_clock = 0;
+  SetCurrentModule(f.env, FindDefmodule(f.env, "MAIN"));
+  Reset(f.env);
+  c = clpd_clock_create(f.env);
+  EXPECT(c != NULL);
+  if (c == NULL) {
+    teardown(&f);
+    return;
+  }
+  clpd_clock_set_source(c, test_clock_source);
+  clock_sec = 1;
+  EXPECT(clpd_clock_update(c) == 0);
+  SetCurrentModule(f.env, FindDefmodule(f.env, "p@1"));
+  EXPECT(AssertString(f.env, "(order (wf-id w1) (status open))") != NULL);
+  SetCurrentModule(f.env, FindDefmodule(f.env, "MAIN"));
+  clock_sec = 2;
+  EXPECT(clpd_clock_update(c) == 0);
+  Focus(FindDefmodule(f.env, "p@1"));
+  EXPECT(Run(f.env, -1) == 1);
+  clpd_clips_trace_flush(f.ct);
+  eval(f.env, "(modify 1 (now \"by hand\"))");
+  clock_sec = 3;
+  EXPECT(clpd_clock_update(c) == 0);
+  EXPECT(Retract(clpd_clock_fact(c)) == RE_NO_ERROR);
+  clock_sec = 4;
+  EXPECT(clpd_clock_update(c) == 0);
+  clock_sec = 5;
+  EXPECT(clpd_clock_update(c) == 0);
+  clpd_clock_destroy(c);
+  teardown(&f);
+  expect_file("clock events", text_path,
+              TS "- FACT+ f-1 (clpd-clock (now-ms 1000) (now \"1970-01-01T00:00:01.000Z\"))\n"
+              TS "w1 FACT+ f-2 (order (wf-id w1) (status open))\n"
+              TS "w1 FIRE p@1::late f-1,f-2\n"
+              TS "w1 FACT~ f-2 (order (wf-id w1) (status late))\n"
+              TS "- FACT- f-1 (clpd-clock (now-ms 3000) (now \"1970-01-01T00:00:03.000Z\"))\n"
+              TS "- FACT+ f-3 (clpd-clock (now-ms 4000) (now \"1970-01-01T00:00:04.000Z\"))\n");
+  expect_file("clock events", jsonl_path,
+              JTS "\"event\":\"assert\",\"fact\":1,\"template\":\"clpd-clock\",\"text\":\"(clpd-clock (now-ms 1000) (now \\\"1970-01-01T00:00:01.000Z\\\"))\"}\n"
+              JTS "\"wf_id\":\"w1\",\"event\":\"assert\",\"fact\":2,\"template\":\"order\",\"text\":\"(order (wf-id w1) (status open))\"}\n"
+              JTS "\"wf_id\":\"w1\",\"event\":\"fire\",\"module\":\"p@1\",\"rule\":\"late\",\"facts\":[1,2]}\n"
+              JTS "\"wf_id\":\"w1\",\"event\":\"modify\",\"fact\":2,\"template\":\"order\",\"text\":\"(order (wf-id w1) (status late))\"}\n"
+              JTS "\"event\":\"retract\",\"fact\":1,\"template\":\"clpd-clock\",\"text\":\"(clpd-clock (now-ms 3000) (now \\\"1970-01-01T00:00:03.000Z\\\"))\"}\n"
+              JTS "\"event\":\"assert\",\"fact\":3,\"template\":\"clpd-clock\",\"text\":\"(clpd-clock (now-ms 4000) (now \\\"1970-01-01T00:00:04.000Z\\\"))\"}\n");
+}
+
 int main(void) {
   if (mkdtemp(dir) == NULL) {
     perror("mkdtemp");
@@ -523,6 +598,7 @@ int main(void) {
   test_line_cap();
   test_aborted_modify();
   test_attach_failure();
+  test_clock_modify_not_traced();
   unlink(text_path);
   unlink(jsonl_path);
   rmdir(dir);

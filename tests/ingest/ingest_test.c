@@ -35,7 +35,8 @@ static const char templates[] =
     "  (slot n (type INTEGER) (range 0 10))\n"
     "  (slot color (allowed-symbols red green))\n"
     "  (multislot nums (type INTEGER) (range 0 9)))\n"
-    "(deftemplate hidden (slot wf-id))\n";
+    "(deftemplate hidden (slot wf-id))\n"
+    "(deftemplate nowf (slot x))\n";
 
 static void setup(void) {
   char dir[sizeof root + 8], path[sizeof root + 32];
@@ -49,7 +50,8 @@ static void setup(void) {
   mkdir(dir, 0700);
   snprintf(path, sizeof path, "%s/package.conf", dir);
   write_file(path, "definition = shop\nversion = 1\nfiles = t.clp\n"
-                   "ingest = order, plain\n");
+                   "ingest = order, plain, nowf\n"
+                   "lint_exempt = template:nowf\n");
   snprintf(path, sizeof path, "%s/t.clp", dir);
   write_file(path, templates);
   env = CreateEnvironment();
@@ -535,6 +537,96 @@ static void test_post_during_drain(void) {
          slot_is(last_fact("order"), "qty", INTEGER_TYPE, "555"));
 }
 
+/* The admission of the drain (T11d, clpd_ingest_drain_admit): called
+ * once per fact that passed every check, right before its assert, with
+ * the value its wf-id slot will hold (the document's, else the slot's
+ * default; NULL without a wf-id slot); never for a rejected document.
+ * DROP frees the fact unasserted; STOP leaves it and every later fact
+ * queued, in order, and ends the drain with -1. */
+static int admitted, admit_next[8];
+static char admit_seen[512];
+
+static int admit_record(void *ctx, const CLIPSValue *wf) {
+  size_t len = strlen(admit_seen);
+  int rc = admit_next[admitted < 8 ? admitted : 7];
+  (void)ctx;
+  if (wf == NULL)
+    snprintf(admit_seen + len, sizeof admit_seen - len, "NULL;");
+  else if (wf->header->type == STRING_TYPE)
+    snprintf(admit_seen + len, sizeof admit_seen - len, "\"%s\";",
+             wf->lexemeValue->contents);
+  else if (wf->header->type == SYMBOL_TYPE)
+    snprintf(admit_seen + len, sizeof admit_seen - len, "%s;",
+             wf->lexemeValue->contents);
+  else if (wf->header->type == INTEGER_TYPE)
+    snprintf(admit_seen + len, sizeof admit_seen - len, "%lld;",
+             wf->integerValue->contents);
+  else
+    snprintf(admit_seen + len, sizeof admit_seen - len, "?;");
+  admitted++;
+  return rc;
+}
+
+static void test_admission(void) {
+  size_t before = fact_count(), asserted = 99;
+  int i;
+  rejections = 0;
+  admitted = 0;
+  admit_seen[0] = '\0';
+  for (i = 0; i < 8; i++) admit_next[i] = CLPD_INGEST_ASSERT;
+  /* Without an admission: the same as clpd_ingest_drain. */
+  EXPECT(post("{\"template\":\"order\",\"slots\":{\"qty\":901}}") == 0);
+  EXPECT(clpd_ingest_drain_admit(env, &pkgs, on_reject, NULL, NULL, NULL,
+                                 &asserted) == 0);
+  EXPECT(asserted == 1 && fact_count() == before + 1);
+  /* The value given, the slot default (nil), an integer, no wf-id slot;
+   * a rejected document is not admitted; the second fact is dropped. */
+  admit_next[1] = CLPD_INGEST_DROP;
+  EXPECT(post("{\"template\":\"order\",\"slots\":{\"wf-id\":\"w9\","
+              "\"qty\":902}}") == 0);
+  EXPECT(post("{\"template\":\"order\",\"slots\":{\"qty\":903}}") == 0);
+  EXPECT(post("{\"template\":\"order\",\"slots\":{\"bogus\":1}}") == 0);
+  EXPECT(post("{\"template\":\"plain\",\"slots\":{\"wf-id\":7}}") == 0);
+  EXPECT(post("{\"template\":\"nowf\",\"slots\":{\"x\":1}}") == 0);
+  asserted = 99;
+  EXPECT(clpd_ingest_drain_admit(env, &pkgs, on_reject, NULL, admit_record,
+                                 NULL, &asserted) == 0);
+  EXPECT(strcmp(admit_seen, "\"w9\";nil;7;NULL;") == 0);
+  EXPECT(asserted == 3 && rejections == 1);
+  EXPECT(fact_count() == before + 4);
+  EXPECT(slot_is(last_fact("order"), "qty", INTEGER_TYPE, "902"));
+  EXPECT(clpd_ingest_queue_length() == 0);
+  /* STOP on the second fact: the first is asserted, the second and third
+   * stay queued in order; the next drain starts with the second. */
+  admitted = 0;
+  admit_seen[0] = '\0';
+  admit_next[0] = CLPD_INGEST_ASSERT;
+  admit_next[1] = CLPD_INGEST_STOP;
+  EXPECT(post("{\"template\":\"order\",\"slots\":{\"wf-id\":\"s1\","
+              "\"qty\":911}}") == 0);
+  EXPECT(post("{\"template\":\"order\",\"slots\":{\"wf-id\":\"s2\","
+              "\"qty\":912}}") == 0);
+  EXPECT(post("{\"template\":\"order\",\"slots\":{\"wf-id\":\"s3\","
+              "\"qty\":913}}") == 0);
+  asserted = 99;
+  EXPECT(clpd_ingest_drain_admit(env, &pkgs, on_reject, NULL, admit_record,
+                                 NULL, &asserted) == -1);
+  EXPECT(asserted == 1 && strcmp(admit_seen, "\"s1\";\"s2\";") == 0);
+  EXPECT(fact_count() == before + 5);
+  EXPECT(slot_is(last_fact("order"), "qty", INTEGER_TYPE, "911"));
+  EXPECT(clpd_ingest_queue_length() == 2);
+  admitted = 0;
+  admit_seen[0] = '\0';
+  admit_next[1] = CLPD_INGEST_ASSERT;
+  EXPECT(clpd_ingest_drain_admit(env, &pkgs, on_reject, NULL, admit_record,
+                                 NULL, &asserted) == 0);
+  EXPECT(asserted == 2 && strcmp(admit_seen, "\"s2\";\"s3\";") == 0);
+  EXPECT(slot_is(last_fact("order"), "qty", INTEGER_TYPE, "913"));
+  EXPECT(fact_count() == before + 7 && clpd_ingest_queue_length() == 0);
+  EXPECT(strcmp(DefmoduleName(GetCurrentModule(env)), "MAIN") == 0);
+  rejections = 0;
+}
+
 int main(void) {
   setup();
   test_assert_all_types();
@@ -548,6 +640,7 @@ int main(void) {
   test_full_queue();
   test_notify();
   test_threads();
+  test_admission();
   clpd_ingest_clear();
   clpd_packages_free(&pkgs);
   DestroyEnvironment(env);

@@ -7,7 +7,9 @@
 
 typedef struct clpd_engine clpd_engine;
 
-/* Creates the environment and installs the halt check. NULL on failure. */
+/* Creates the environment with the core's clock template MAIN::clpd-clock
+ * (src/clock.h; no clock fact yet) and installs the halt check. NULL on
+ * failure. */
 clpd_engine *clpd_engine_create(void);
 Environment *clpd_engine_env(clpd_engine *e);
 /* Runs at most max_rules firings (-1 = unlimited). Stops early when SIGTERM

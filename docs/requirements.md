@@ -53,14 +53,14 @@ Key constraint (CLIPS APG 6.4.2 §1.2): *"Each environment can have at most one 
 
 ### 4.1 Daemon and engine core
 - **FR-1** The daemon runs in the foreground under systemd (`Type=notify`); it does not double-fork. `--foreground` is the default; `--config <file>` selects the configuration; `--check` validates configuration and packages and exits. (S1)
-- **FR-2** Startup order: read configuration → open trace → create environment → load plugins → load rule packages → `Reset` once → rehydrate (if configured) → enter event loop. Any load error aborts startup with a non-zero exit code and a message naming the file and the error. (S1, S2)
+- **FR-2** Startup order: read configuration → open trace → create environment → load plugins → load rule packages → `Reset` once → enter event loop; with a database, instances are rehydrated on demand when an input for one arrives (FR-9, T11d), not eagerly at startup. Any load error aborts startup with a non-zero exit code and a message naming the file and the error. (S1, S2)
 - **FR-3** A cycle runs (a) when a notification arrives, no sooner than `cycle_min_interval_ms` after the previous cycle, and (b) every `tick_interval_ms`. Setting both to the same value yields a pure periodic tick. (S3, D27)
 - **FR-4** Each cycle calls `Run` with a configurable `max_rules_per_cycle` limit (`-1` = unlimited). `Reset` is never called per cycle. (S3)
 - **FR-5** `SIGTERM`/`SIGINT` stop the daemon gracefully: an engine periodic function sets `SetHaltRules`, the current cycle finishes or rolls back, plugins shut down, the environment is destroyed. `SIGHUP` reopens the trace files. (S1)
 
 ### 4.2 Rule packages and workflows
 - **FR-6** A rule package is a directory with a manifest naming the definition, version and ordered `.clp` files. Each package is a `defmodule` named `definition@version`. (S2, S10)
-- **FR-7** Every deftemplate of a workflow package has a `wf-id` slot. At load time a lint step reports templates without `wf-id` and rules whose patterns do not join on the same `?wf-id`; lint errors are fatal unless the package declares an explicit exemption. (S10)
+- **FR-7** Every deftemplate of a workflow package has a `wf-id` slot. At load time a lint step reports templates without `wf-id` and rules whose patterns do not join on the same `?wf-id` (patterns on the core's clock fact `clpd-clock`, FR-10, are exempt); lint errors are fatal unless the package declares an explicit exemption. (S10)
 - **FR-8** The core provides lifecycle functions `(wf-complete ?wf-id)` and `(wf-fail ?wf-id ?reason)`: they persist the final state and retract all facts of the instance. (S10, D4)
 - **FR-9** Instances without activity for `idle_eviction_after` are evicted from working memory and rehydrated from the database when a message for them arrives. (D4, D18)
 - **FR-10** The core maintains a clock fact updated every cycle so rules can express deadlines and timeouts. (S10)

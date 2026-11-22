@@ -41,7 +41,7 @@ One `key = value` per line; lines may end in LF or CRLF, and spaces and tabs cou
 | `cycle_min_interval_ms` | non-negative integer, not greater than `tick_interval_ms` | `200` |
 | `max_rules_per_cycle` | `-1` (unlimited) or a positive integer | `10000` |
 | `safety_poll_interval_ms` | positive integer | `5000` |
-| `idle_eviction_after` | duration: positive integer followed by `s`, `m` or `h` | `30m` |
+| `idle_eviction_after` | duration: positive integer followed by `s`, `m` or `h`: a workflow instance without activity (a change of one of its facts, a rule firing for it) for that long is evicted from working memory at the start of a cycle, when all its facts are of `sync = auto` templates and none of its changes is waiting to be written; its rows stay ([`orm.md`](orm.md#idle-eviction)). Eviction needs a `database`: without one the key is accepted and nothing is evicted | `30m` |
 | `admin_socket` | path of the admin socket ([`admin-socket.md`](admin-socket.md)); its directory must exist; `none` disables the socket (use `./none` for a file named `none`) | `/run/clpdaemon/admin.sock` |
 | `admin_socket_mode` | permission bits of the admin socket: 3 or 4 octal digits (a 4-digit value starts with `0`), no bits for others, e.g. `0600`, `0660` | `0600` |
 | `trace_text` | path, empty = disabled ([`trace.md`](trace.md)) | empty |

@@ -16,6 +16,7 @@
 
 #include "log.h"
 #include "orm_dml.h"
+#include "orm_life.h"
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -292,19 +293,26 @@ static int resolve_any(UDFContext *ctx, UDFValue *ret, target *out) {
  * of another module) is refused. */
 static int resolve_own(UDFContext *ctx, UDFValue *ret, name_kind kind,
                        target *out) {
+  const clpd_package *caller;
+  if (!clpd_orm_ddl_caller(ctx, ret, &caller)) return 0;
+  return resolve(ctx, ret, caller, caller->manifest.definition, kind, out);
+}
+
+int clpd_orm_ddl_caller(UDFContext *ctx, UDFValue *ret,
+                        const clpd_package **pkg) {
   const clpd_orm_ddl *ddl = ctx->context;
   Environment *env = ctx->environment;
   Defrule *rule = EngineData(env)->ExecutingRule;
-  const clpd_package *caller;
   char rule_name[NAME_SHOWN + 1], module_name[NAME_SHOWN + 1];
 
+  *pkg = NULL;
   if (rule == NULL || !rule->executing) {
     fail(ctx, ret, "only a rule of a rule package may call it (no rule is "
                    "executing)");
     return 0;
   }
-  caller = package_of(ddl->packages, rule->header.whichModule->theModule);
-  if (caller == NULL) {
+  *pkg = package_of(ddl->packages, rule->header.whichModule->theModule);
+  if (*pkg == NULL) {
     shown(DefruleName(rule), rule_name, sizeof rule_name);
     shown(DefmoduleName(rule->header.whichModule->theModule), module_name,
           sizeof module_name);
@@ -312,7 +320,7 @@ static int resolve_own(UDFContext *ctx, UDFValue *ret, name_kind kind,
                    "in module '%s')", rule_name, module_name);
     return 0;
   }
-  return resolve(ctx, ret, caller, caller->manifest.definition, kind, out);
+  return 1;
 }
 
 /* Runs one generated statement; on failure logs it with the target. */
@@ -705,7 +713,8 @@ int clpd_orm_ddl_register(Environment *env, clpd_orm_ddl *ddl) {
       AddUDF(env, "db-nextval", "bl", 1, 1, "sy", next_value,
              "clpd_orm_nextval", ddl) != AUE_NO_ERROR)
     return -1;
-  return clpd_orm_dml_register(env, ddl);
+  if (clpd_orm_dml_register(env, ddl) != 0) return -1;
+  return clpd_orm_life_register(env, ddl);
 }
 
 int clpd_orm_ddl_resolve_template(UDFContext *ctx, UDFValue *ret,

@@ -53,6 +53,16 @@ int clpd_orm_sync_attach(Environment *env, clpd_db *db,
  * CLPD_ORM_SYNC_ISOLATE_AFTER after the attach. NULL is accepted. */
 #define CLPD_ORM_SYNC_ISOLATE_AFTER 3
 void clpd_orm_sync_set_isolate_after(clpd_orm_syncer *s, int n);
+/* Idle eviction (T11c, FR-9, docs/orm.md#idle-eviction): the idle period
+ * in milliseconds (ms >= 1; CLPD_ORM_SYNC_IDLE_AFTER_MS after the attach,
+ * the default of idle_eviction_after) and the monotonic clock the
+ * activity times come from (NULL: CLOCK_MONOTONIC; tests replace it).
+ * Set both before the first fact is asserted. NULL s is accepted. */
+#define CLPD_ORM_SYNC_IDLE_AFTER_MS (30LL * 60 * 1000)
+typedef long long clpd_orm_sync_clock(void *ctx);
+void clpd_orm_sync_set_idle_after(clpd_orm_syncer *s, long long ms);
+void clpd_orm_sync_set_clock(clpd_orm_syncer *s, clpd_orm_sync_clock *clock,
+                             void *ctx);
 /* Removes the hooks and frees s. NULL is accepted. */
 void clpd_orm_sync_detach(clpd_orm_syncer *s);
 
@@ -68,6 +78,42 @@ int clpd_orm_sync_suspended(const clpd_orm_syncer *s);
  * instance whose facts changed. NULL is accepted. */
 void clpd_orm_sync_touch(clpd_orm_syncer *s, const char *wf,
                          const clpd_package *pkg);
+
+/* The lifecycle functions (T11a, src/orm_life.h), from a rule inside the
+ * open cycle transaction.
+ *
+ * clpd_orm_sync_flush_instance writes the recorded changes of instance wf
+ * now (the flush of clpd_orm_sync_end_cycle restricted to the entries
+ * whose last committed or current row belongs to wf: its DELETEs,
+ * UPDATEs, INSERTs and workflow_instance row, same statements, same order,
+ * same failure lines), then forgets them and notes the instances written
+ * as touched by the cycle (a rollback evicts and reloads them). Returns 0
+ * (also with nothing to write, or s NULL), or -1 when nothing more may be
+ * written in the cycle (a statement of it failed already, or a value
+ * could not be written before) or the flush failed: a refused write or a
+ * value it cannot write logs its sync: line, the instance of that write
+ * is isolated when the cycle ends, and the cycle is rolled back there (a
+ * value through clpd_orm_tx_abort, as for the end-of-cycle flush).
+ *
+ * clpd_orm_sync_finish ends instance wf in memory: every fact carrying
+ * its wf-id is retracted with the recording suspended (no DELETE, its
+ * rows stay), the instance counts as touched by the open cycle, and from
+ * now on no fact of it is recorded (never written). A rolled-back cycle
+ * forgets that it ended (the rehydration reloads it); after a commit it
+ * stays ended until the syncer is detached, and a rollback never reloads
+ * it. NULL is accepted (nothing happens).
+ *
+ * clpd_orm_sync_isolated is 1 when wf is no longer synchronized (a write
+ * that failed for good, the poison retry), else 0 (also for s NULL).
+ *
+ * clpd_orm_sync_mapped is 1 when a loaded package has an orm mapping, so
+ * the daemon created the workflow_instance table (T10a), else 0 (also for
+ * s NULL): without one nothing reads that table (T11e). */
+int clpd_orm_sync_flush_instance(clpd_orm_syncer *s, const char *wf,
+                                 FILE *log);
+void clpd_orm_sync_finish(clpd_orm_syncer *s, const char *wf);
+int clpd_orm_sync_isolated(const clpd_orm_syncer *s, const char *wf);
+int clpd_orm_sync_mapped(const clpd_orm_syncer *s);
 
 /* The parameter for the value v in column c, by the write rules of the
  * synchronization (docs/orm.md#write-rules; the DML functions use them
@@ -145,5 +191,65 @@ int clpd_orm_sync_begin_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
  * (the changes of the instances it did not touch are kept). s may be
  * NULL. */
 int clpd_orm_sync_end_cycle(clpd_orm_syncer *s, clpd_orm_tx *tx, FILE *log);
+
+/* The idle eviction (T11c), at the start of a cycle, before
+ * clpd_orm_sync_begin_cycle (outside the cycle transaction; it sends no
+ * statement). The syncer keeps the time of the last activity of each
+ * instance: an assert, modify or retract of a fact carrying its wf-id
+ * (any template; facts loaded with the recording suspended, by db-load or
+ * the rehydration, included) and the firing of a rule whose rule wf-id
+ * (see clpd_orm_sync_end_cycle) is the instance. An instance idle for the
+ * idle period is evicted when every fact carrying its wf-id is of a
+ * template mapped with sync = auto, it has no recorded change waiting to
+ * be written, and it is neither isolated nor waiting for a reload: its
+ * facts are retracted with the recording suspended (nothing is written,
+ * its rows stay), its activity is forgotten, and
+ *   clpdaemon: evict: instance '<wf-id>' after <n> s without activity
+ * is logged (<n> whole seconds since its last activity; <wf-id> shown
+ * like the rehydrate: lines), oldest activity first. An idle instance
+ * that does not qualify is checked again one idle period later; one with
+ * no fact left is forgotten without a line. Instances that a lifecycle
+ * function ended or that were isolated have no activity kept. Returns the
+ * number of instances evicted; 0 for s NULL (no database) or while a
+ * cycle is open. */
+int clpd_orm_sync_evict_idle(clpd_orm_syncer *s, FILE *log);
+
+/* The on-demand rehydration (T11d, FR-9;
+ * docs/orm.md#on-demand-rehydration): the admission of the ingest drain
+ * (src/ingest.h clpd_ingest_admit_fn, whose CLPD_INGEST_* values it
+ * returns), inside the open cycle transaction. wf_id is the
+ * value the wf-id slot of the fact about to be asserted will hold (NULL:
+ * no wf-id slot). Returns CLPD_INGEST_ASSERT at once for s NULL, no
+ * loaded package with an orm mapping (no workflow_instance table, T11e),
+ * no cycle open, a value that names no instance (src/orm_sync.c value_text), an
+ * instance with a fact in working memory (a count the hooks keep, O(1))
+ * or an isolated one (never reloaded). Otherwise reads the instance's
+ * workflow_instance row:
+ *   no row: CLPD_INGEST_ASSERT (a new instance);
+ *   status completed or failed: logs
+ *     clpdaemon: ingest: instance '<wf-id>' is <status>; fact dropped
+ *   and returns CLPD_INGEST_DROP;
+ *   any other status, the package definition@version of the row not
+ *   loaded: logs
+ *     clpdaemon: ingest: instance '<wf-id>' belongs to package
+ *     <definition>@<version>, which is not loaded; fact dropped
+ *   and returns CLPD_INGEST_DROP;
+ *   otherwise loads the instance with clpd_orm_load_instance (that
+ *   package, without echo) and returns CLPD_INGEST_ASSERT.
+ * A failed statement logs
+ *   clpdaemon: rehydrate: instance '<wf-id>': table 'workflow_instance':
+ *   <message>
+ * (the row) or the rehydrate: line of clpd_orm_sync_begin_cycle (a
+ * SELECT of the load; what the instance loaded is retracted), or
+ * "clpdaemon: rehydrate: <message>" (PostgreSQL current_schema()), and
+ * returns CLPD_INGEST_STOP: the cycle can no longer commit, and
+ * clpd_orm_sync_end_cycle rolls it back (its cycle transaction line
+ * follows). A failure that is neither CLPD_DB_LOST nor CLPD_DB_TRANSIENT
+ * (T10f) also isolates the instance (the isolation line of
+ * clpd_orm_sync_end_cycle follows at once). <wf-id>, <definition> and
+ * <version> are shown with control characters as '?', at most 200
+ * bytes. */
+int clpd_orm_sync_admit(clpd_orm_syncer *s, const CLIPSValue *wf_id,
+                        FILE *log);
 
 #endif

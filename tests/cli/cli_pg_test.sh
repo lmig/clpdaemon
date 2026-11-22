@@ -25,6 +25,8 @@
 # (B) isolates nothing and the row is written after the release; UNIQUE,
 # lock timeout, lock timeout, UNIQUE isolates only after the second
 # UNIQUE (D).
+# T11d: on-demand rehydration (evict then inject, restart then inject,
+# finished instances and an unloaded package dropped).
 set -u
 
 U='usage: cli_pg_test.sh <clpdaemon> <admin-client> <conninfo> <password>'
@@ -563,7 +565,9 @@ elif [ "$(grep -c '^clpdaemon: cycle transaction failed: ' err.txt)" != 1 ]; the
 fi
 wait "$hpid"
 hrc=$?
-held=$(grep -c "$CXISO" err.txt)
+# No isolation count here: the lock is already released when the holder
+# exits, so d1 may be isolated before this point; the order check below
+# (UTUI) pins that the isolation came after the second UNIQUE.
 cases=$((cases + 1))
 wait_has err.txt "$CXDISO" || fail "$D: d1 isolated" "stderr [$(cat err.txt)]"
 cx_seed "$D" d2
@@ -575,9 +579,9 @@ seq=$(grep -e '^clpdaemon: cycle transaction failed: ' -e "$CXISO" err.txt |
   sed -e "s/.*$CXLT.*/T/" -e 's/.*(SQLSTATE 23505); retrying.*/U/' -e "s/^clpdaemon: sync: instance .*/I/" | uniq | tr -d '\n')
 cases=$((cases + 1))
 if [ "$locked" = 1 ]; then
-  [ "$hrc" = 0 ] && [ "$held" = 0 ] && [ "$u" = 2 ] && [ "$t" -ge 2 ] && [ "$seq" = UTUI ] &&
+  [ "$hrc" = 0 ] && [ "$u" = 2 ] && [ "$t" -ge 2 ] && [ "$seq" = UTUI ] &&
     [ "$(grep -c "$CXISO" err.txt)" = 1 ] && grep -qxF "$CXDISO" err.txt ||
-    fail "$D: isolated after the second UNIQUE only" "holder exit $hrc, isolations while held $held, unique $u (want 2), lock timeouts $t (want >= 2), order [$seq] (want UTUI), stderr [$(cat err.txt)]"
+    fail "$D: isolated after the second UNIQUE only" "holder exit $hrc, unique $u (want 2), lock timeouts $t (want >= 2), order [$seq] (want UTUI), stderr [$(cat err.txt)]"
 fi
 cases=$((cases + 1))
 got=$(q "SELECT wf_id || '|' || status FROM pgcx_order ORDER BY wf_id; SELECT wf_id || '|' || body FROM pgcx_memo")
@@ -666,6 +670,388 @@ q 'DROP TABLE IF EXISTS pgau_order' >/dev/null
 q 'DROP TABLE IF EXISTS pgau_audit' >/dev/null
 q 'DROP FUNCTION IF EXISTS pgau_trg()' >/dev/null
 q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
+# T11a: wf-complete and wf-fail against PostgreSQL. wf-complete writes the
+# rule's pending modify first, then status completed (reason NULL) with a
+# later updated_at; wf-fail status failed with its reason; the instance's
+# facts leave working memory, its mapped rows stay; since T11d every later
+# fact for a finished instance (again, late, show) is dropped at ingest
+# with the exact line (no rule fires, nothing is written). Then a workflow_instance of another shape (the T10 table,
+# without reason) is refused at startup.
+mkdir lifepkg
+printf '%s\n' 'definition = pglife
+version = 3
+files = l.clp
+orm = orm.conf
+ingest = go' >lifepkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate go (slot wf-id) (slot act (type SYMBOL)) (slot why (type STRING) (default "")))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id))
+(deffacts seed (boot (wf-id w0)) (order (wf-id w1) (status new)) (memo (wf-id w1)) (order (wf-id w2) (status new)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))
+(defrule done (go (wf-id ?w) (act done)) ?o <- (order (wf-id ?w)) => (modify ?o (status done)) (wf-complete ?w))
+(defrule fail (go (wf-id ?w) (act fail) (why ?r)) => (wf-fail ?w ?r))
+(defrule again (go (wf-id ?w) (act again)) => (wf-complete ?w))
+(defrule late (go (wf-id ?w) (act late)) => (assert (order (wf-id ?w) (status late))))
+(defrule show (go (wf-id ?w) (act show)) => (printout t "show " ?w " orders=" (length$ (find-all-facts ((?f order)) (eq ?f:wf-id ?w))) " memos=" (length$ (find-all-facts ((?m memo)) (eq ?m:wf-id ?w))) crlf))' >lifepkg/l.clp
+printf '%s\n' 'order.table = pglife_order
+order.owned = yes
+order.slot.wf-id = wf_id text symbol error
+order.slot.status = status text symbol default' >lifepkg/orm.conf
+printf '%s\n' "node_id = n1
+tick_interval_ms = 60000
+cycle_min_interval_ms = 10
+admin_socket = $WORK/admin.sock
+database = $CONNINFO
+packages = lifepkg" >life.conf
+q 'DROP TABLE IF EXISTS pglife_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+: >out.txt
+"$BIN" --config life.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_q "SELECT count(*) FROM pglife_order" '2' || ok=0
+life1=$(q "SELECT updated_at::text FROM workflow_instance WHERE wf_id = 'w1'")
+: >inject.txt
+cyc=1
+for j in '"w1"},"act":{"sym":"done"}' '"w2"},"act":{"sym":"fail"},"why":"no stock"' \
+  '"w1"},"act":{"sym":"again"}' '"w2"},"act":{"sym":"again"}' '"w1"},"act":{"sym":"late"}' \
+  '"w1"},"act":{"sym":"show"}' '"w2"},"act":{"sym":"show"}'; do
+  cyc=$((cyc + 1))
+  "$ADMIN" admin.sock "inject {\"template\":\"go\",\"slots\":{\"wf-id\":{\"sym\":$j}}\\n" >>inject.txt 2>&1
+  n=0
+  while ! "$ADMIN" admin.sock 'status\n' 2>/dev/null | grep -q " cycles=$cyc "; do
+    n=$((n + 1))
+    [ "$n" -gt 200 ] && { ok=0; break; }
+    sleep 0.05
+  done
+done
+stop_daemon "pg life"
+want="clpdaemon: n1: running
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w2' is failed; fact dropped
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w1' is completed; fact dropped
+clpdaemon: ingest: instance 'w2' is failed; fact dropped
+clpdaemon: received SIGTERM, stopping"
+cases=$((cases + 1))
+[ "$ok" = 1 ] && [ "$(cat err.txt)" = "$want" ] && [ ! -s out.txt ] &&
+  [ "$(cat inject.txt)" = "OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued" ] ||
+  fail "pg life: a running daemon finishes its instances" "cycles seen $ok, inject [$(cat inject.txt)], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+got=$(q "SELECT wf_id || '|' || status FROM pglife_order ORDER BY wf_id")
+[ "$got" = "w1|done${NL}w2|new" ] || fail "pg life: the mapped rows" "got [$got]"
+cases=$((cases + 1))
+got=$(q "SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || coalesce(reason, 'NULL') || '|' || (updated_at > created_at)::int FROM workflow_instance ORDER BY wf_id")
+[ "$got" = "w1|pglife|3|completed|NULL|1${NL}w2|pglife|3|failed|no stock|1" ] || fail "pg life: the instance rows" "got [$got]"
+cases=$((cases + 1))
+got=$(q "SELECT count(*) FROM workflow_instance WHERE wf_id = 'w1' AND updated_at::text <> '$life1'")
+[ "$got" = 1 ] || fail "pg life: updated_at changed" "got [$got] (before [$life1])"
+# The T10 table, without reason: refused at startup, exit 1, nothing written.
+q 'DROP TABLE IF EXISTS pglife_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+q 'CREATE TABLE workflow_instance (wf_id TEXT NOT NULL, definition TEXT NOT NULL, version TEXT NOT NULL, status TEXT NOT NULL, parent_wf_id TEXT, owner_node TEXT, lease_until TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (wf_id))' >/dev/null
+timeout 20 "$BIN" --config life.conf >out.txt 2>err.txt
+rc=$?
+cases=$((cases + 1))
+[ "$rc" = 1 ] && [ ! -s out.txt ] && [ "$(cat err.txt)" = "clpdaemon: the workflow_instance table does not match the daemon's: missing column 'reason'" ] ||
+  fail "pg life: a workflow_instance of another shape" "exit $rc, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+got=$(q "SELECT count(*) FROM workflow_instance")$(q "SELECT count(*) FROM information_schema.tables WHERE table_name = 'pglife_order'")
+[ "$got" = 00 ] || fail "pg life: nothing written after the refusal" "got [$got]"
+[ ! -e admin.sock ] || fail "pg life: no admin socket after the refusal" "$(ls -l admin.sock)"
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
+# T11b: the clock fact with PostgreSQL: in working memory (status counts
+# it), a rule matching it modifies a mapped fact, which is written, and
+# nothing is written for the clock fact itself (no table, no row, no
+# instance).
+mkdir clkpkg
+printf '%s\n' 'definition = pgclk
+version = 1
+files = c.clp
+orm = orm.conf' >clkpkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate job (slot wf-id) (slot state (type SYMBOL)))
+(deffacts seed (boot (wf-id w0)) (job (wf-id w1) (state waiting)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table job))
+(defrule seen ?j <- (job (wf-id ?w) (state waiting)) (clpd-clock (now-ms ?n&:(> ?n 0))) => (modify ?j (state seen)))' >clkpkg/c.clp
+printf '%s\n' 'job.table = pgclk_job
+job.owned = yes
+job.slot.wf-id = wf_id text symbol error
+job.slot.state = state text symbol default' >clkpkg/orm.conf
+printf '%s\n' "node_id = n1
+tick_interval_ms = 20
+cycle_min_interval_ms = 10
+admin_socket = $WORK/admin.sock
+database = $CONNINFO
+packages = clkpkg" >clk.conf
+q 'DROP TABLE IF EXISTS pgclk_job' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+tables_before=$(q "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'")
+"$BIN" --config clk.conf >out.txt 2>err.txt &
+pid=$!
+cases=$((cases + 1))
+wait_q "SELECT wf_id || ' ' || state FROM pgclk_job" 'w1 seen' ||
+  fail "pg clock: the rule on the clock fact" "got [$(q 'SELECT * FROM pgclk_job')], stderr [$(cat err.txt)]"
+n=0
+while ! "$ADMIN" admin.sock 'status\n' 2>/dev/null | grep -q ' cycles=5 \| cycles=[0-9][0-9]'; do
+  n=$((n + 1)); [ "$n" -gt 100 ] && break; sleep 0.05
+done
+cases=$((cases + 1))
+st=$("$ADMIN" admin.sock 'status\n' 2>&1)
+case $st in *' queue=0 facts=3') ;; *) fail "pg clock: the clock fact is counted" "got [$st]" ;; esac
+stop_daemon "pg clock"
+cases=$((cases + 1))
+got=$(q "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('pgclk_job', 'workflow_instance') ORDER BY 1")
+got=$got/$(q "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'")
+got=$got/$(q "SELECT wf_id || '|' || definition || '|' || status FROM workflow_instance ORDER BY wf_id")
+got=$got/$(q "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND column_name IN ('now_ms', 'now', 'now-ms')")
+[ "$got" = "pgclk_job${NL}workflow_instance/$((tables_before + 2))/w1|pgclk|active/0" ] && [ ! -s out.txt ] ||
+  fail "pg clock: nothing written for the clock fact" "got [$got], before [$tables_before], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+q 'DROP TABLE IF EXISTS pgclk_job' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
+# T11c: idle eviction with PostgreSQL. With idle_eviction_after = 1s the
+# instances whose facts are all of the sync = auto template (e1, and x\ny,
+# shown sanitized) are evicted with the exact line, oldest activity first;
+# u1 (an unmapped memo) and m1 (a sync = manual note) stay; the rows and
+# workflow_instance rows are unchanged by the eviction.
+mkdir evpkg
+printf '%s\n' 'definition = pgev
+version = 1
+files = e.clp
+orm = orm.conf
+ingest = order, memo, note' >evpkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate memo (slot wf-id))
+(deftemplate note (slot wf-id))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot (boot (wf-id ?w)) => (db-create-table order))' >evpkg/e.clp
+printf '%s\n' 'order.table = pgev_order
+order.owned = yes
+order.slot.wf-id = wf_id text string error
+order.slot.status = status text symbol default
+note.table = pgev_note
+note.owned = yes
+note.sync = manual
+note.slot.wf-id = wf_id text string error' >evpkg/orm.conf
+printf '%s\n' "node_id = n1
+tick_interval_ms = 50
+cycle_min_interval_ms = 10
+idle_eviction_after = 1s
+admin_socket = $WORK/admin.sock
+database = $CONNINFO
+packages = evpkg" >ev.conf
+q 'DROP TABLE IF EXISTS pgev_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+evrows() { q "SELECT wf_id || '|' || status FROM pgev_order ORDER BY 1"; q "SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || created_at || '|' || updated_at FROM workflow_instance ORDER BY 1"; }
+# evstatus <pattern>: up to 10 s for a status reply matching it.
+evstatus() {
+  n=0
+  while ! "$ADMIN" admin.sock 'status\n' 2>/dev/null | grep -q "$1"; do
+    n=$((n + 1)); [ "$n" -gt 200 ] && return 1; sleep 0.05
+  done
+}
+"$BIN" --config ev.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_has err.txt 'clpdaemon: n1: running' || ok=0
+n=0
+while [ ! -S admin.sock ] && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+inj=$("$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":"e1","status":{"sym":"new"}}}\ninject {"template":"order","slots":{"wf-id":"x\\ny","status":{"sym":"new"}}}\ninject {"template":"order","slots":{"wf-id":"u1","status":{"sym":"new"}}}\ninject {"template":"memo","slots":{"wf-id":"u1"}}\ninject {"template":"order","slots":{"wf-id":"m1","status":{"sym":"new"}}}\ninject {"template":"note","slots":{"wf-id":"m1"}}\n' 2>&1)
+[ "$inj" = "OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued${NL}OK queued" ] || ok=0
+evstatus ' queue=0 facts=8$' || ok=0
+ev_before=$(evrows)
+wait_has err.txt "clpdaemon: evict: instance 'x?y' after 1 s without activity" || ok=0
+evstatus ' queue=0 facts=6$' || ok=0
+ev_after=$(evrows)
+sleep 2.2
+st=$("$ADMIN" admin.sock 'status\n' 2>&1)
+stop_daemon "pg evict"
+cases=$((cases + 1))
+want="clpdaemon: n1: running
+clpdaemon: evict: instance 'e1' after 1 s without activity
+clpdaemon: evict: instance 'x?y' after 1 s without activity
+clpdaemon: received SIGTERM, stopping"
+[ "$ok" = 1 ] && [ ! -s out.txt ] && [ "$(cat err.txt)" = "$want" ] ||
+  fail "pg evict: idle instances with only auto facts are evicted" "seen $ok, inject [$inj], stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+case $st in *' queue=0 facts=6') ;; *) fail "pg evict: unmapped and manual facts keep their instance" "status [$st]" ;; esac
+cases=$((cases + 1))
+[ "$(q "SELECT wf_id || '|' || status FROM pgev_order ORDER BY 1")" = "e1|new${NL}m1|new${NL}u1|new${NL}x${NL}y|new" ] &&
+  [ -n "$ev_before" ] && [ "$ev_after" = "$ev_before" ] && [ "$(evrows)" = "$ev_before" ] ||
+  fail "pg evict: the evicted instances' rows are unchanged" "before [$ev_before], after [$ev_after], at exit [$(evrows)]"
+q 'DROP TABLE IF EXISTS pgev_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
+# T11d: on-demand rehydration with PostgreSQL. e1 is evicted (idle 1s),
+# another session changes its row, and a look event reloads the stored
+# state before it is asserted (saw prints it); after a restart nothing is
+# reloaded at startup and the same event reloads e1 again; done ends it;
+# then facts for finished instances (completed, failed by another writer)
+# and for an active instance whose package is not loaded are dropped with
+# their lines, nothing asserted, nothing written.
+mkdir odpkg
+printf '%s\n' 'definition = pgrh
+version = 1
+files = r.clp
+orm = orm.conf
+ingest = order, event' >odpkg/package.conf
+printf '%s\n' '(deftemplate boot (slot wf-id))
+(deftemplate order (slot wf-id) (slot status (type SYMBOL)))
+(deftemplate event (slot wf-id) (slot kind (type SYMBOL)))
+(deffacts seed (boot (wf-id w0)))
+(defrule boot ?b <- (boot (wf-id ?w)) => (retract ?b) (db-create-table order))
+(defrule saw (event (wf-id ?w) (kind look)) (order (wf-id ?w) (status ?s)) => (printout t "saw " ?w " " ?s crlf))
+(defrule done (event (wf-id ?w) (kind done)) => (wf-complete ?w))' >odpkg/r.clp
+printf '%s\n' 'order.table = pgrh_order
+order.owned = yes
+order.slot.wf-id = wf_id text string error
+order.slot.status = status text symbol default' >odpkg/orm.conf
+printf '%s\n' "node_id = n1
+tick_interval_ms = 50
+cycle_min_interval_ms = 10
+idle_eviction_after = 1s
+admin_socket = $WORK/admin.sock
+database = $CONNINFO
+packages = odpkg" >rh.conf
+q 'DROP TABLE IF EXISTS pgrh_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+rhrows() { q "SELECT wf_id || '|' || status FROM pgrh_order ORDER BY 1"; q "SELECT wf_id || '|' || definition || '|' || version || '|' || status || '|' || coalesce(reason, '-') || '|' || created_at || '|' || updated_at FROM workflow_instance ORDER BY 1"; }
+rh_start() {
+  : >out.txt
+  : >err.txt
+  "$BIN" --config rh.conf >out.txt 2>err.txt &
+  pid=$!
+  ok=1
+  wait_has err.txt 'clpdaemon: n1: running' || ok=0
+  n=0
+  while [ ! -S admin.sock ] && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+}
+rh_start
+inj=$("$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":"e1","status":{"sym":"new"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+evstatus ' queue=0 facts=2$' || ok=0
+wait_has err.txt "clpdaemon: evict: instance 'e1' after 1 s without activity" || ok=0
+evstatus ' queue=0 facts=1$' || ok=0
+[ "$(q "UPDATE pgrh_order SET status = 'other' WHERE wf_id = 'e1' RETURNING wf_id")" = e1 ] || ok=0
+rh_before=$(rhrows)
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+wait_has out.txt "saw e1 other" || ok=0
+evstatus ' queue=0 facts=3$' || ok=0
+rh_after=$(rhrows)
+stop_daemon "pg rehydrate: evict"
+cases=$((cases + 1))
+want="clpdaemon: n1: running
+clpdaemon: evict: instance 'e1' after 1 s without activity
+clpdaemon: received SIGTERM, stopping"
+[ "$ok" = 1 ] && [ "$(cat out.txt)" = "saw e1 other" ] && [ "$(cat err.txt)" = "$want" ] &&
+  [ -n "$rh_before" ] && [ "$rh_after" = "$rh_before" ] ||
+  fail "pg rehydrate: evict then inject reloads the stored state first" "seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)], before [$rh_before], after [$rh_after]"
+rh_start
+evstatus ' cycles=[1-9][0-9]* queue=0 facts=1$' || ok=0
+st0=$("$ADMIN" admin.sock 'status\n' 2>&1)
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+wait_has out.txt "saw e1 other" || ok=0
+evstatus ' queue=0 facts=3$' || ok=0
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"done"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+evstatus ' queue=0 facts=1$' || ok=0
+[ "$(q "SELECT status FROM workflow_instance WHERE wf_id = 'e1'")" = completed ] || ok=0
+q "INSERT INTO workflow_instance (wf_id, definition, version, status, created_at, updated_at) VALUES ('f1', 'pgrh', '1', 'failed', now(), now()), ('p1', 'other', '2', 'active', now(), now())" >/dev/null
+rh_before=$(rhrows)
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"e1","kind":{"sym":"look"}}}\ninject {"template":"order","slots":{"wf-id":"f1","status":{"sym":"late"}}}\ninject {"template":"event","slots":{"wf-id":"p1"}}\n' 2>&1)
+[ "$inj" = "OK queued${NL}OK queued${NL}OK queued" ] || ok=0
+wait_has err.txt "clpdaemon: ingest: instance 'p1' belongs to package other@2, which is not loaded; fact dropped" || ok=0
+evstatus ' queue=0 facts=1$' || ok=0
+sleep 0.3
+st1=$("$ADMIN" admin.sock 'status\n' 2>&1)
+rh_after=$(rhrows)
+stop_daemon "pg rehydrate: restart"
+cases=$((cases + 1))
+want="clpdaemon: n1: running
+clpdaemon: ingest: instance 'e1' is completed; fact dropped
+clpdaemon: ingest: instance 'f1' is failed; fact dropped
+clpdaemon: ingest: instance 'p1' belongs to package other@2, which is not loaded; fact dropped
+clpdaemon: received SIGTERM, stopping"
+[ "$ok" = 1 ] && [ "$(cat out.txt)" = "saw e1 other" ] && [ "$(cat err.txt)" = "$want" ] ||
+  fail "pg rehydrate: restart then inject, finished instances dropped" "seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+cases=$((cases + 1))
+case $st0 in *' queue=0 facts=1') ;; *) fail "pg rehydrate: no eager reload at startup" "status [$st0]" ;; esac
+cases=$((cases + 1))
+case $st1 in *' queue=0 facts=1') ;; *) fail "pg rehydrate: dropped facts are not asserted" "status [$st1]" ;; esac
+cases=$((cases + 1))
+[ -n "$rh_before" ] && [ "$rh_after" = "$rh_before" ] && [ "$(rhrows)" = "$rh_before" ] ||
+  fail "pg rehydrate: nothing written for dropped facts" "before [$rh_before], after [$rh_after], at exit [$(rhrows)]"
+# T11e: the reload reads workflow_instance under another session's ACCESS
+# EXCLUSIVE lock (lock_timeout 100 ms through options): the read fails
+# with 55P03, the cycle is retried, nothing is isolated, and the event is
+# processed with the stored state after the release.
+sed "s|^database = .*|database = $CONNINFO options='-c lock_timeout=100'|" rh.conf >rhlock.conf
+: >out.txt
+: >err.txt
+"$BIN" --config rhlock.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_has err.txt 'clpdaemon: n1: running' || ok=0
+n=0
+while [ ! -S admin.sock ] && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+inj=$("$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":"k1","status":{"sym":"new"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+wait_has err.txt "clpdaemon: evict: instance 'k1' after 1 s without activity" || ok=0
+evstatus ' queue=0 facts=1$' || ok=0
+locked=1
+cx_hold "pg T11e reload under a workflow_instance lock" workflow_instance 'ACCESS EXCLUSIVE' 1.5 AccessExclusiveLock || locked=0
+inj=$("$ADMIN" admin.sock 'inject {"template":"event","slots":{"wf-id":"k1","kind":{"sym":"look"}}}\n' 2>&1)
+[ "$inj" = "OK queued" ] || ok=0
+wait "$hpid"
+hrc=$?
+wait_has out.txt "saw k1 new" || ok=0
+stop_daemon "pg T11e reload under a workflow_instance lock"
+reads=$(grep -c "^clpdaemon: rehydrate: instance 'k1': table 'workflow_instance': $CXLT\$" err.txt)
+cases=$((cases + 1))
+if [ "$locked" = 1 ]; then
+  [ "$ok" = 1 ] && [ "$hrc" = 0 ] && [ "$reads" -ge 2 ] && [ "$(cat out.txt)" = "saw k1 new" ] &&
+    [ "$(grep -c "$CXISO" err.txt)" = 0 ] && ! grep -q 'is not reloaded' err.txt ||
+    fail "pg T11e reload under a workflow_instance lock: retried, no isolation" "seen $ok, holder exit $hrc, failed reads $reads (want >= 2), stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
+fi
+q 'DROP TABLE IF EXISTS pgrh_order' >/dev/null
+q 'DROP TABLE IF EXISTS workflow_instance' >/dev/null
+
+# T11e B1: a database and no package with an orm mapping: no
+# workflow_instance table, nothing reads it, the facts are processed.
+mkdir nopkg
+printf '%s\n' 'definition = nomap
+version = 1
+files = r.clp
+ingest = order' >nopkg/package.conf
+printf '%s\n' '(deftemplate order (slot wf-id))
+(defrule seen (order (wf-id ?w)) => (printout t "seen " ?w crlf))' >nopkg/r.clp
+sed 's|^packages = .*|packages = nopkg|' rh.conf >nomap.conf
+: >out.txt
+: >err.txt
+"$BIN" --config nomap.conf >out.txt 2>err.txt &
+pid=$!
+ok=1
+wait_has err.txt 'clpdaemon: n1: running' || ok=0
+n=0
+while [ ! -S admin.sock ] && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+inj=$("$ADMIN" admin.sock 'inject {"template":"order","slots":{"wf-id":"n1"}}\ninject {"template":"order","slots":{"wf-id":"n2"}}\n' 2>&1)
+[ "$inj" = "OK queued${NL}OK queued" ] || ok=0
+wait_has out.txt "seen n1" || ok=0
+wait_has out.txt "seen n2" || ok=0
+evstatus ' queue=0 facts=3$' || ok=0
+stop_daemon "pg T11e no mapping"
+cases=$((cases + 1))
+[ "$ok" = 1 ] && [ "$(sort out.txt)" = "seen n1${NL}seen n2" ] &&
+  [ "$(cat err.txt)" = "clpdaemon: n1: running${NL}clpdaemon: received SIGTERM, stopping" ] &&
+  [ "$(q "SELECT count(*) FROM information_schema.tables WHERE table_name = 'workflow_instance'")" = 0 ] ||
+  fail "pg T11e no mapping: facts processed, no workflow_instance" "seen $ok, stdout [$(cat out.txt)], stderr [$(cat err.txt)]"
 
 printf '%d/%d PostgreSQL CLI cases passed\n' $((cases - failures)) "$cases"
 [ "$failures" -eq 0 ]

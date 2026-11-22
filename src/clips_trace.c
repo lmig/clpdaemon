@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "clips_trace.h"
+#include "clock.h"
 #include "log.h"
 
 #include <stdlib.h>
@@ -58,6 +59,9 @@ struct clpd_clips_trace {
    * cleared there: a modify cut short (for example by a callback of
    * another component) cannot suppress later events. */
   Fact *modifying;
+  /* The fact being modified is the core's clock fact (T11b): its modify
+   * is not traced at all. */
+  int modifying_clock;
   long long old_index;
   char *old_tmpl, *old_text, *old_wf_id;
 };
@@ -237,6 +241,7 @@ static void on_retract(Environment *env, void *fact, void *ctx) {
 
 static void clear_modify(clpd_clips_trace *ct) {
   ct->modifying = NULL;
+  ct->modifying_clock = 0;
   free(ct->old_tmpl);
   free(ct->old_text);
   free(ct->old_wf_id);
@@ -246,13 +251,20 @@ static void clear_modify(clpd_clips_trace *ct) {
 /* Called with (old, NULL) before the change and (NULL, new) after it
  * (tmpltfun.c). The modified fact keeps its address and index; a modify
  * into an existing fact (duplicate) or a failed assert returns another fact
- * or NULL, and the old version was then only retracted. */
+ * or NULL, and the old version was then only retracted. A modify of the
+ * clock fact (the core's per-cycle update, or any other) writes nothing,
+ * its nested retract and assert included (T11b): it would add one event
+ * per cycle. */
 static void on_modify(Environment *env, Fact *old, Fact *new_fact, void *ctx) {
   clpd_clips_trace *ct = ctx;
   (void)env;
   if (old != NULL) {
     clear_modify(ct);
     ct->modifying = old;
+    if (clpd_clock_is_template(FactDeftemplate(old))) {
+      ct->modifying_clock = 1;
+      return;
+    }
     ct->old_index = FactIndex(old);
     ct->old_tmpl = xstrdup(DeftemplateName(FactDeftemplate(old)));
     ct->old_text = xstrdup(render_fact(ct, old));
@@ -260,6 +272,10 @@ static void on_modify(Environment *env, Fact *old, Fact *new_fact, void *ctx) {
     return;
   }
   if (ct->modifying == NULL) return;
+  if (ct->modifying_clock) {
+    clear_modify(ct); /* not traced */
+    return;
+  }
   if (new_fact == ct->modifying)
     trace_fact(ct, CLPD_TRACE_MODIFY, new_fact);
   else

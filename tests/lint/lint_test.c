@@ -1,6 +1,8 @@
 /* Unit tests for the wf-id lint of workflow rule packages (FR-7, L38). */
 #include "lint.h"
 
+#include "clock.h"
+
 #include <string.h>
 
 #include "../common/expect.h"
@@ -278,7 +280,49 @@ static void test_current_module_restored(void) {
   DestroyEnvironment(env);
 }
 
+/* T11b: patterns on the core's clock template (imported from MAIN) need
+ * no wf-id; they still count in the pattern numbers, and the other
+ * patterns of the rule are checked as usual. */
+static void test_clock_patterns_exempt(void) {
+  static const char *const rules[] = {
+      "(defrule tick (clpd-clock (now-ms ?n)) =>)",
+      "(defrule due (order (wf-id ?w) (id ?d)) "
+      "(clpd-clock (now-ms ?n&:(>= ?n ?d))) =>)",
+      "(defrule quiet (order (wf-id ?w)) (not (clpd-clock (now \"x\"))) =>)",
+      "(defrule mix ?c <- (clpd-clock) (order (wf-id ?w)) (item (wf-id ?x)) =>)",
+      "(defrule bare (clpd-clock) (item (qty 1)) =>)",
+      NULL};
+  const char *want =
+      PFX "rule 'mix': pattern 3 (item) binds wf-id to ?x, expected ?w from "
+          "pattern 2\n" PFX "rule 'bare': pattern 2 (item) does not bind "
+          "wf-id to a variable\n";
+  Environment *env = CreateEnvironment();
+  FILE *err = tmpfile();
+  char got[2048];
+  size_t i, n;
+  int count;
+  EXPECT(env != NULL && err != NULL);
+  if (env == NULL || err == NULL) return;
+  EXPECT(clpd_clock_define(env) == 0);
+  EXPECT(Build(env, "(defmodule " PKG " (import MAIN deftemplate clpd-clock))") ==
+         BE_NO_ERROR);
+  for (i = 0; base_templates[i] != NULL; i++)
+    EXPECT(Build(env, base_templates[i]) == BE_NO_ERROR);
+  for (i = 0; rules[i] != NULL; i++) EXPECT(Build(env, rules[i]) == BE_NO_ERROR);
+  count = clpd_lint_package(env, FindDefmodule(env, PKG), PKG, &no_exempt, err);
+  rewind(err);
+  n = fread(got, 1, sizeof got - 1, err);
+  got[n] = '\0';
+  fclose(err);
+  if (count != 2 || strcmp(got, want) != 0)
+    fprintf(stderr, "clock patterns: got %d errors:\n%s", count, got);
+  EXPECT(count == 2);
+  EXPECT(strcmp(got, want) == 0);
+  DestroyEnvironment(env);
+}
+
 int main(void) {
+  test_clock_patterns_exempt();
   test_clean_package();
   test_template_without_wf_id();
   test_exempt_template_and_its_patterns();

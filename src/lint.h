@@ -15,7 +15,9 @@ typedef struct {
   size_t rule_count;
 } clpd_lint_exempt;
 
-/* Lints the deftemplates and defrules of package module `module`. Each
+/* Lints the deftemplates and defrules of package module `module`; the
+ * patterns on the core's clock template clpd-clock (src/clock.h) are
+ * exempt from the wf-id rule. Each
  * error is one line "clpdaemon: <pkg>: lint: <message>" on `err`, where
  * <pkg> is `pkg_name` (definition@version). Leaves the current module of
  * `env` unchanged. Returns the number of errors (0 = clean). */

@@ -79,7 +79,23 @@ static void test_pending_sighup_does_not_halt(void) {
   clpd_engine_destroy(e);
 }
 
+/* The core defines MAIN::clpd-clock with the environment (T11b), exported
+ * so a module can import it; no clock fact until the daemon asserts it. */
+static void test_clock_template_defined(void) {
+  clpd_engine *e = clpd_engine_create();
+  Environment *env;
+  EXPECT(e != NULL);
+  if (e == NULL) return;
+  env = clpd_engine_env(e);
+  EXPECT(FindDeftemplate(env, "MAIN::clpd-clock") != NULL);
+  EXPECT(Build(env, "(defmodule p@1 (import MAIN deftemplate clpd-clock))") ==
+         BE_NO_ERROR);
+  EXPECT(GetNextFact(env, NULL) == NULL);
+  clpd_engine_destroy(e);
+}
+
 int main(void) {
+  test_clock_template_defined();
   test_cycle_limit();
   test_no_rules_no_firings();
   test_pending_stop_signal_halts(SIGTERM);
