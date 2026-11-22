@@ -5,6 +5,8 @@ usage: schemas_check.py [<schemas-dir> [<contract.md>]]
 
 Defaults come from the repository layout: <repo>/docs/schemas and
 <repo>/docs/exchange-contract.md, <repo> being two levels above this file.
+<schemas-dir> must hold envelope.schema.json, work-order-closed@1.json and
+delivery-failed@1.json: the negative and boundary payloads use them.
 
 Checks: every file is a valid JSON Schema draft 2020-12 and follows the file
 rules of the contract section 5.1; every `examples` entry validates against
@@ -12,7 +14,8 @@ its file and the envelope; the `json` blocks of the contract validate against
 the envelope (and their own schema when it is published); invalid payloads are
 rejected and boundary payloads accepted (section 4.2, 4.3).
 
-Exit status: 0 all checks passed, 1 a check failed, 2 usage or input error,
+Exit status: 0 all checks passed, 1 a check failed, 2 usage or input error
+(including a missing required schema file),
 77 the Python package jsonschema is not installed (ctest SKIP_RETURN_CODE).
 """
 import copy
@@ -61,9 +64,11 @@ try:
 except (OSError, ValueError) as e:
     print('schemas_check.py: %s' % e, file=sys.stderr)
     sys.exit(2)
-if 'envelope.schema.json' not in schemas:
-    print('schemas_check.py: %s has no envelope.schema.json' % SDIR, file=sys.stderr)
-    sys.exit(2)
+# the negative and boundary payloads below use these published schemas
+for required in ('envelope.schema.json', 'work-order-closed@1.json', 'delivery-failed@1.json'):
+    if required not in schemas:
+        print('schemas_check.py: %s has no %s' % (SDIR, required), file=sys.stderr)
+        sys.exit(2)
 
 env = schemas['envelope.schema.json']
 FC = FormatChecker()
@@ -157,6 +162,10 @@ neg = {
     'upper-case slot name (env)': (ve, setd('Bad', 1)),
     'int64 max + 1 (env)': (ve, setd('n', 9223372036854775808)),
     'int64 min - 1 (env)': (ve, setd('n', -9223372036854775809)),
+    # section 4.3: every double of magnitude >= 2^63 is integral, so FLOAT values are capped too
+    'float 1.0e20 (env)': (ve, setd('f', 1.0e20)),
+    'float -1.0e20 (env)': (ve, setd('f', -1.0e20)),
+    'float 9.3e18 (env)': (ve, setd('f', 9.3e18)),
     'string 8193 ASCII characters (env)': (ve, setd('s', 'a' * 8193)),
     'string 8193 two-byte characters (env)': (ve, setd('s', 'é' * 8193)),
     'array 1025 elements (env)': (ve, setd('a', [1] * 1025)),
@@ -179,6 +188,8 @@ pos = {
     'empty array (env)': (ve, setd('a', [])),
     'array 1024 elements (env)': (ve, setd('a', [1] * 1024)),
     'float 2.5 (env)': (ve, setd('f', 2.5)),
+    'float 9.2e18 (env)': (ve, setd('f', 9.2e18)),
+    'float -9.2e18 (env)': (ve, setd('f', -9.2e18)),
     'string 8192 ASCII characters (env)': (ve, setd('s', 'a' * 8192)),
     # section 4.2: the limit counts characters, so 8192 x U+00E9 (16384 bytes) is allowed
     'string 8192 two-byte characters (env)': (ve, setd('s', 'é' * 8192)),

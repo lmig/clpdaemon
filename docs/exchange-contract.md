@@ -215,7 +215,7 @@ The database, not only this text, keeps each connector to its own endpoints: col
 | `clpd_engine` (the name is the installation's choice) | Owns the tables. The engine nodes and the intake (v2: the dispatcher) connect as this role or as a member of it (with `INHERIT`, the default). | Everything. RLS is **enabled, not forced**, so it never restricts the owner or its members. Never run `ALTER TABLE ... FORCE ROW LEVEL SECURITY` on these tables. |
 | `clpd_connector` | Group role (`NOLOGIN`) of every connector. | The grants and policies below. |
 | One login role per connector, member of `clpd_connector` (for example `connector_installer`) | All the instances of one connector. | Only rows whose `endpoint_logico` is mapped to the role in `conector_endpoint`. |
-| `clpd_operator` | Group role (`NOLOGIN`) of the operators' login roles. | Reads every row; puts `IN` rows back to `RECIBIDO` (§9). |
+| `clpd_operator` | Group role (`NOLOGIN`) of the operators' login roles. | Reads every row; puts `IN` rows in `SIN_CORRELACION` or `ERROR` back to `RECIBIDO` (§9). |
 
 A connector role is never a member of `clpd_engine` or `clpd_operator`, never has `BYPASSRLS`, and never owns these tables. The roles (as a superuser or a role with `CREATEROLE`):
 
@@ -271,10 +271,10 @@ CREATE POLICY mensaje_intercambio_conector_insert ON mensaje_intercambio
   WITH CHECK (direccion = 'IN' AND estado = 'RECIBIDO' AND wf_id IS NULL
               AND endpoint_logico IN (SELECT ce.endpoint_logico FROM conector_endpoint ce
                                        WHERE ce.rol = current_user));
--- connectors: change only OUT rows of their endpoints (claim, settle, retry, dead letter, confirm)
+-- connectors: change only non-final OUT rows of their endpoints (claim, settle, retry, dead letter, confirm)
 CREATE POLICY mensaje_intercambio_conector_update ON mensaje_intercambio
   FOR UPDATE TO clpd_connector
-  USING (direccion = 'OUT'
+  USING (direccion = 'OUT' AND estado IN ('PENDIENTE', 'EN_ENVIO', 'REINTENTO', 'ENVIADO')
          AND endpoint_logico IN (SELECT ce.endpoint_logico FROM conector_endpoint ce
                                   WHERE ce.rol = current_user))
   WITH CHECK (direccion = 'OUT' AND estado <> 'PENDIENTE'
@@ -285,13 +285,13 @@ CREATE POLICY correlacion_conector_select ON correlacion
   FOR SELECT TO clpd_connector
   USING (endpoint_logico IN (SELECT ce.endpoint_logico FROM conector_endpoint ce
                               WHERE ce.rol = current_user));
--- operators: read everything, put IN rows back to RECIBIDO (§9)
+-- operators: read everything, put IN rows in SIN_CORRELACION or ERROR back to RECIBIDO (§9)
 CREATE POLICY mensaje_intercambio_operador_select ON mensaje_intercambio
   FOR SELECT TO clpd_operator
   USING (true);
 CREATE POLICY mensaje_intercambio_operador_update ON mensaje_intercambio
   FOR UPDATE TO clpd_operator
-  USING (direccion = 'IN')
+  USING (direccion = 'IN' AND estado IN ('SIN_CORRELACION', 'ERROR'))
   WITH CHECK (direccion = 'IN' AND estado = 'RECIBIDO');
 CREATE POLICY correlacion_operador_select ON correlacion
   FOR SELECT TO clpd_operator
@@ -309,8 +309,14 @@ What this enforces:
 | update `payload`, `direccion`, `endpoint_logico`, `msg_id_externo`, `tipo_mensaje`, `correlacion_id` or `ref_externa` | not in the `UPDATE` column grant | `42501` |
 | insert an `OUT` row, an `IN` row in another state, or a row of an endpoint not mapped to it | insert policy | `42501` ("new row violates row-level security policy") |
 | read, claim or update a row of an endpoint not mapped to it, or update any `IN` row | select and update policies | the row is invisible: 0 rows, no error |
-| move an `OUT` row to another endpoint or back to `PENDIENTE` | update policy `WITH CHECK` | `42501` |
+| update its own `OUT` rows in a final state (`CONFIRMADO`, `ERROR`), for example to send them again | update policy `USING` | 0 rows, no error |
+| move an `OUT` row to another endpoint | `endpoint_logico` is not in the `UPDATE` column grant | `42501` |
+| put an `OUT` row back to `PENDIENTE` | update policy `WITH CHECK` | `42501` |
 | write `correlacion` or `conector_endpoint`, or delete rows | no grant | `42501` |
+
+A policy sees the old row (`USING`) or the new row (`WITH CHECK`), never the pair, so it cannot tell a valid transition between the non-final states from an invalid one (for example `ENVIADO` → `REINTENTO`); the statements of §7 are the only transitions a connector makes. An `ENVIADO` row stays updatable because an answer confirms it (§7.7).
+
+An operator role can change only `IN` rows in `SIN_CORRELACION` or `ERROR`, and only to `RECIBIDO` (§9): a row that is `RECIBIDO`, `ASIGNADO` (an engine node is applying it) or `CONSUMIDO` (already applied) is invisible to its update, 0 rows, so a manual `UPDATE` can neither apply a message twice nor take a row away from its node.
 
 The claim's `$3` (§7.2) still names the endpoints an instance serves, so instances of one connector can split the endpoints of its role; an endpoint in `$3` that is not mapped to the role simply returns no rows. A connector can list its endpoints:
 
@@ -366,9 +372,11 @@ The engine maps `data` to the deftemplate named by `tipo_mensaje` in the instanc
 | string | STRING; SYMBOL when the slot's type allows SYMBOL and not STRING |
 | number with an integral value in the int64 range (`2`, `-7`, `2.0`) | INTEGER when the slot's type allows INTEGER and not FLOAT; FLOAT when it allows FLOAT and not INTEGER; when it allows both (or has no type), INTEGER if the stored number has no decimal point (`2`) and FLOAT if it has one (`2.0`) |
 | number with a fractional part (`2.5`) | FLOAT; not allowed for a slot that does not allow FLOAT |
-| number with an integral value outside the int64 range | not allowed |
+| number with an integral value outside the int64 range | not allowed, for every slot type, FLOAT included (see below) |
 | array of the values above | multifield, only for a multislot (`[]` is the empty multifield) |
 | `true`, `false`, `null`, an object, a nested array | not allowed |
+
+Every IEEE 754 double of magnitude 2^63 or more is integral, so the int64 bound caps FLOAT values too: a FLOAT slot holds at most about ±9.22e18 (`9.2e18` is allowed, `1.0e20` is not, with or without a decimal point), and the envelope rejects larger values. A message type whose value can exceed that range declares the slot as STRING and carries the number as a string.
 
 This is the JSON Schema 2020-12 data model: `2.0` is an integer there (`"type": "integer"` accepts it), and the engine accepts it for an INTEGER slot as `2`. A schema and the engine therefore agree when the schema types each property by its slot ([§5.1](#51-schema-file-rules), rule 5).
 
@@ -640,7 +648,9 @@ UPDATE mensaje_intercambio
 
 - `$4 = 'CONFIRMADO'` when the external system confirmed or answered synchronously; insert the answer as an `IN` row (§6.2, with the `OUT` row's `correlacion_id` and `msg_id_externo = 'response:<correlacion_id>'` unless the answer has its own id) in the **same** transaction.
 - `$4 = 'ENVIADO'` when the protocol is asynchronous (a queue accepted the message, a `202 Accepted`).
-- 1 row updated: commit. 0 rows: the claim was lost (another instance holds the row now), or an asynchronous answer already confirmed the row (§7.7); roll back, including the answer, and log it. The new holder sends again, and the idempotency key makes the external system drop the duplicate.
+- 1 row updated: commit. 0 rows: roll back, including the answer, and log it. There are two causes:
+  - the claim was lost (another instance holds the row now): the new holder sends again, and the idempotency key makes the external system drop the duplicate;
+  - an asynchronous answer already confirmed the row (§7.7): nothing more to do, the answer is already stored and the row is `CONFIRMADO`.
 
 ### 7.5 Retry
 
@@ -702,9 +712,11 @@ When the answer to an `OUT` row arrives, insert it as an `IN` row (§6.3) and, i
 ```sql
 UPDATE mensaje_intercambio
    SET estado = 'CONFIRMADO', lease_hasta = NULL, siguiente_intento = NULL, actualizado = now()
- WHERE direccion = 'OUT' AND correlacion_id = $1::text
+ WHERE direccion = 'OUT' AND correlacion_id = $1::text AND endpoint_logico = $2::text
    AND estado IN ('EN_ENVIO', 'REINTENTO', 'ENVIADO');
 ```
+
+`$1` is the answer's `correlacion_id` and `$2` the `endpoint_logico` the answer was inserted with: the same rule as the intake's correlation (§8.2, step 2), so an answer that arrives on another endpoint of the same connector role neither confirms the `OUT` row nor reaches the instance; the row keeps being sent, and the answer goes `SIN_CORRELACION`.
 
 The statement also confirms a row that is still `EN_ENVIO` (the answer overtook the settle) or `REINTENTO` (the attempt timed out but reached the external system): an answer proves delivery, so the row is never left `ENVIADO` or sent again. The instance that holds the claim then updates 0 rows when it settles, retries or dead-letters the row, and rolls back as for a lost claim (§7.4); nothing is lost, because the answer is already stored. 0 rows here is normal (the row is already `CONFIRMADO`, or it is `ERROR`): commit anyway. A late answer to a dead-lettered row still reaches the workflow as an `IN` row after its `delivery-failed`; the `OUT` row stays `ERROR`. The `IN` row is what the workflow sees; `CONFIRMADO` is for monitoring.
 
@@ -847,5 +859,5 @@ Connectors state the contract version they were built against. Every 1.x engine 
 
 | Version | Date | Changes |
 |---|---|---|
-| 1.0 | 2026-11-22 | First contract (T12, L117). From draft 0.1: `direccion` is `TEXT` (`CHAR(3)` padded `'IN'` to `'IN '`); constraints for states per direction, required `msg_id_externo` on `IN`, required `wf_id` and `correlacion_id` on `OUT`, fields required per state, payload shape and size; partial indexes for the pending states; `correlacion` DDL; the claim increments `intentos` (claim token) and keeps per-instance order; statements for lease extension, send result, retry, dead letter, confirmation and manual reprocess; envelope schema and the per-type schema process (`docs/schemas/`); value mapping by slot type; retry defaults and bounds; `SIN_CORRELACION` retry window; ZeroMQ wake-up and notification frames. Late messages for an ended instance are `CONSUMIDO` with the reason in `error`; synchronous commands are answered `202 Accepted` with the row `id`; a `correlacion` reference is never reassigned or released (L118). Verify follow-ups (T12a, L119): the lookup of a duplicate's `id` so a retried synchronous command gets the same `202` answer (§6.2); the drop statement and the `error` of a dropped `CONSUMIDO` row (§3.2, §6.5); string limits in characters, as JSON Schema counts them (§4.2); integral numbers such as `2.0` map by the slot type, matching JSON Schema `integer`, and schemas type properties by slot (§4.3, §5.1); the int64 caveat for double-based validators (§4.2); the review query and its index hold only `IN` rows (§3.3, §9); the operator role can set `wf_id` and `payload` when reprocessing, with a documented statement (§3.5, §9); row-level security: the group roles `clpd_connector` and `clpd_operator`, the table `conector_endpoint` mapping each connector role to its endpoints, column grants and policies so a connector reads and changes only rows of its endpoints and never sets `wf_id`, owner and engine unaffected (§3.5); an answer confirms an `OUT` row that is still `EN_ENVIO` or `REINTENTO` (§7.7); a `correlacion_id` with no `OUT` row of the same endpoint is `SIN_CORRELACION` (§8.2). |
+| 1.0 | 2026-11-22 | First contract (T12, L117). From draft 0.1: `direccion` is `TEXT` (`CHAR(3)` padded `'IN'` to `'IN '`); constraints for states per direction, required `msg_id_externo` on `IN`, required `wf_id` and `correlacion_id` on `OUT`, fields required per state, payload shape and size; partial indexes for the pending states; `correlacion` DDL; the claim increments `intentos` (claim token) and keeps per-instance order; statements for lease extension, send result, retry, dead letter, confirmation and manual reprocess; envelope schema and the per-type schema process (`docs/schemas/`); value mapping by slot type; retry defaults and bounds; `SIN_CORRELACION` retry window; ZeroMQ wake-up and notification frames. Late messages for an ended instance are `CONSUMIDO` with the reason in `error`; synchronous commands are answered `202 Accepted` with the row `id`; a `correlacion` reference is never reassigned or released (L118). Verify follow-ups (T12a, L119): the lookup of a duplicate's `id` so a retried synchronous command gets the same `202` answer (§6.2); the drop statement and the `error` of a dropped `CONSUMIDO` row (§3.2, §6.5); string limits in characters, as JSON Schema counts them (§4.2); integral numbers such as `2.0` map by the slot type, matching JSON Schema `integer`, and schemas type properties by slot (§4.3, §5.1); the int64 caveat for double-based validators (§4.2); the review query and its index hold only `IN` rows (§3.3, §9); the operator role can set `wf_id` and `payload` when reprocessing, with a documented statement (§3.5, §9); row-level security: the group roles `clpd_connector` and `clpd_operator`, the table `conector_endpoint` mapping each connector role to its endpoints, column grants and policies so a connector reads and changes only rows of its endpoints and never sets `wf_id`, owner and engine unaffected (§3.5); an answer confirms an `OUT` row that is still `EN_ENVIO` or `REINTENTO` (§7.7); a `correlacion_id` with no `OUT` row of the same endpoint is `SIN_CORRELACION` (§8.2). **Behavior change** from draft 0.1: an answer correlates only with an `OUT` row of the **same** `endpoint_logico`; an installation whose answers arrive on another endpoint (for example a separate webhook of the same external system) inserts them under the endpoint of the request (L121). Review follow-ups (T12b, L121): the operator update policy covers only `SIN_CORRELACION` and `ERROR` rows, so an operator cannot put a `RECIBIDO`, `ASIGNADO` or `CONSUMIDO` row back (§3.5); the connector update policy covers only non-final `OUT` rows, so a connector cannot reopen a `CONFIRMADO` or `ERROR` row (§3.5); the confirmation matches the answer's `endpoint_logico` (§7.7); the two causes of a settle that updates 0 rows (§7.4); the int64 bound caps FLOAT values (§4.3). |
 | 0.1 | — | Draft. |

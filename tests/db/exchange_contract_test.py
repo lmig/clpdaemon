@@ -288,8 +288,13 @@ for outcome in ('commit', 'rollback'):
         b.execute('COMMIT')
     th = threading.Thread(target=second)
     th.start()
-    time.sleep(0.5)
-    blocked = th.is_alive()
+    blocked = False   # the second backend waits on a lock while the first transaction is open
+    for _ in range(200):
+        if one("select count(*) from pg_stat_activity where pid = %s and wait_event_type = 'Lock'",
+               b.info.backend_pid)[0] == 1:
+            blocked = True
+            break
+        time.sleep(0.05)
     a.execute(outcome.upper())
     th.join(10)
     if outcome == 'commit':
@@ -360,7 +365,7 @@ ex(cn, 'settle', o1, 'gw-1', 2, 'ENVIADO')
 rows = ex(cn, 'claim', 'gw-1', 120000, eps, 20)
 chk('ENVIADO releases wfA:2', [x[0] for x in rows] == [o2], rows)
 cn.execute('BEGIN')
-c1 = ex(cn, 'confirm', 'wfA:1')
+c1 = ex(cn, 'confirm', 'wfA:1', 'installer')
 cn.execute('COMMIT')
 chk('7.7 confirm ENVIADO -> CONFIRMADO', c1 == 1 and row(o1)[0] == 'CONFIRMADO')
 eng.execute("UPDATE mensaje_intercambio SET lease_hasta=now()-interval '1ms' WHERE id=%s", (o2,))
@@ -404,7 +409,7 @@ chk('A8 setup: wfC:1 claimed', [(x[0], x[7]) for x in rows] == [(a1, 1)], rows)
 cn.execute('BEGIN')
 ex(cn, 'insert', 'installer', 'work-order-created', 'OI-60', 'evt-a8-1', 'wfC:1',
    json.dumps({"schema": "work-order-created@1", "data": {"order": "OI-60"}}), None)
-k = ex(cn, 'confirm', 'wfC:1')
+k = ex(cn, 'confirm', 'wfC:1', 'installer')
 cn.execute('COMMIT')
 chk('A8: answer before the settle confirms the EN_ENVIO row',
     k == 1 and row(a1, 'estado, lease_hasta') == ('CONFIRMADO', None), (k, row(a1, 'estado, lease_hasta')))
@@ -413,10 +418,10 @@ chk('A8: the late settle ENVIADO updates 0 rows; row stays CONFIRMADO',
 rows = ex(cn, 'claim', 'gw-1', 120000, eps, 20)
 chk('A8: CONFIRMADO releases wfC:2', [x[0] for x in rows] == [a2], rows)
 ex(cn, 'retry', a2, 'gw-1', 1, 3600000, 'timeout')
-chk('A8: answer to a REINTENTO row confirms it', ex(cn, 'confirm', 'wfC:2') == 1
+chk('A8: answer to a REINTENTO row confirms it', ex(cn, 'confirm', 'wfC:2', 'installer') == 1
     and row(a2, 'estado, siguiente_intento, lease_hasta') == ('CONFIRMADO', None, None))
 chk('A8: confirm on a CONFIRMADO or ERROR row: 0 rows',
-    ex(cn, 'confirm', 'wfC:2') == 0 and ex(cn, 'confirm', 'wfA:2') == 0 and row(o2)[0] == 'ERROR')
+    ex(cn, 'confirm', 'wfC:2', 'installer') == 0 and ex(cn, 'confirm', 'wfA:2', 'installer') == 0 and row(o2)[0] == 'ERROR')
 
 # ================================================================ intake window, engine ERROR, review, reprocess
 nc = in_row('evt-nc', ref_externa='OI-77')
@@ -454,9 +459,25 @@ chk('A6: reprocess with wf_id = NULL and a new payload as operator', ex(op, 'rep
 ex(eng, 'nocorr', nc0, 'x', 30000, 0)
 chk('A6: reprocess routing to an instance (wf_id set) as operator',
     ex(op, 'reproc_fix', nc0, 'fi-42', woc) == 1 and row(nc0, 'estado,wf_id') == ('RECIBIDO', 'fi-42'))
+ex(eng, 'assign', ee, 'fi-1', 'n1')
+ex(eng, 'engerr', ee, 'n1', 'again')
 chk('A6: operator cannot set another state (policy WITH CHECK)', sqlstate(lambda: op.execute(
     "UPDATE mensaje_intercambio SET estado='CONSUMIDO', actualizado=now() WHERE id=%s" % ee)) == '42501'
-    and row(ee)[0] == 'RECIBIDO')
+    and row(ee)[0] == 'ERROR')
+ex(op, 'reproc', ee)
+for st_ in ('RECIBIDO', 'ASIGNADO', 'CONSUMIDO'):
+    oi = in_row('evt-op-' + st_.lower())
+    if st_ != 'RECIBIDO':
+        ex(eng, 'assign', oi, 'fi-1', 'n1')
+    if st_ == 'CONSUMIDO':
+        ex(eng, 'consume', oi, 'n1')
+    before = row(oi, 'estado,wf_id,asignado_a,payload')
+    chk('R1-001: operator cannot put a %s row back to RECIBIDO (0 rows)' % st_, op.execute(
+        "UPDATE mensaje_intercambio SET estado='RECIBIDO', wf_id='fi-x', asignado_a=NULL, lease_hasta=NULL, "
+        "actualizado=now() WHERE id=%s" % oi).rowcount == 0 and row(oi, 'estado,wf_id,asignado_a,payload') == before,
+        row(oi, 'estado,wf_id,asignado_a,payload'))
+chk('R1-001: operator update policy USING limits the state', "SIN_CORRELACION" in one(
+    "select qual from pg_policies where policyname='mensaje_intercambio_operador_update'")[0])
 chk('A6: operator cannot update OUT rows (0 rows)', op.execute(
     "UPDATE mensaje_intercambio SET error='x' WHERE id=%s" % o2).rowcount == 0 and row(o2, 'error')[0] != 'x')
 chk('operator cannot change endpoint_logico (42501)', sqlstate(lambda: op.execute(
@@ -489,7 +510,7 @@ for k, a in {'extend': (60000,), 'settle': ('CONFIRMADO',), 'retry': (1000, 'x')
 chk('A7: dead letter of a foreign row: 0 rows, no IN row',
     ex(cn, 'dead', x1, 'crm-gw', 1, 'x') == [] and row(x1, cols) == crm_before
     and one("select count(*) from mensaje_intercambio where msg_id_externo='delivery-failed:%s'" % x1)[0] == 0)
-chk('A7: confirm of a foreign row: 0 rows', ex(cn, 'confirm', 'wfX:1') == 0 and row(x1, cols) == crm_before)
+chk('A7: confirm of a foreign row: 0 rows', ex(cn, 'confirm', 'wfX:1', 'crm') == 0 and row(x1, cols) == crm_before)
 chk('A7: raw UPDATE of a foreign row: 0 rows', cn.execute(
     "UPDATE mensaje_intercambio SET estado='CONFIRMADO' WHERE id=%s" % x1).rowcount == 0 and row(x1, cols) == crm_before)
 inown = row(r2210, 'estado,error')
@@ -499,6 +520,43 @@ chk('A7: connector cannot update its own IN rows (0 rows)', cn.execute(
 st = sqlstate(lambda: ex(cn, 'insert', 'crm', 'work-order-closed', None, 'forged-1', None, woc, None))
 chk('A7: insert for a foreign endpoint: 42501, nothing stored', st == '42501'
     and one("select count(*) from mensaje_intercambio where msg_id_externo='forged-1'")[0] == 0, st)
+# M03: the endpoint check of the insert policy, without RETURNING (no SELECT policy involved)
+st = sqlstate(lambda: cn.execute(
+    "INSERT INTO mensaje_intercambio (direccion,endpoint_logico,tipo_mensaje,msg_id_externo,payload,estado) "
+    "VALUES ('IN','crm','work-order-closed','forged-6','%s','RECIBIDO')" % woc.replace("'", "''")))
+chk('M03: plain INSERT (no RETURNING) for a foreign endpoint: 42501, nothing stored', st == '42501'
+    and one("select count(*) from mensaje_intercambio where msg_id_externo='forged-6'")[0] == 0, st)
+ins_pol = one("select with_check from pg_policies where policyname='mensaje_intercambio_conector_insert'")[0]
+chk('M03: insert policy keeps wf_id IS NULL and the conector_endpoint check',
+    'wf_id IS NULL' in ins_pol and 'conector_endpoint' in ins_pol and 'CURRENT_USER' in ins_pol.upper(), ins_pol)
+grants = [(r, priv) for r in ('clpd_connector', 'connector_installer', 'connector_crm')
+          for priv in ('INSERT', 'UPDATE')
+          if one("select has_column_privilege(%s, 'mensaje_intercambio', 'wf_id', %s)", r, priv)[0]]
+chk('M03: wf_id in no connector column grant', grants == [], grants)
+wm1 = out('wfM', 'wfM:1')   # non-final own OUT rows for the WHERE-less update
+wm2 = out('wfM2', 'wfM2:1')
+pm = row(wm2, cols)
+st = sqlstate(lambda: cn.execute("UPDATE mensaje_intercambio SET actualizado = now() WHERE id = %s" % wm2))
+chk('T12b: an update that leaves an own OUT row PENDIENTE: 42501 (WITH CHECK)', st == '42501' and row(wm2, cols) == pm, st)
+eng.execute("UPDATE mensaje_intercambio SET estado='ENVIADO', asignado_a='gw-m', intentos=1 WHERE id IN (%s,%s)" % (wm1, wm2))
+updatable = one("select count(*) from mensaje_intercambio where direccion='OUT' and endpoint_logico='installer' "
+                "and estado in ('PENDIENTE','EN_ENVIO','REINTENTO','ENVIADO')")[0]
+snap = adm.execute("select id, actualizado from mensaje_intercambio where not (direccion='OUT' and "
+                   "endpoint_logico='installer' and estado in ('PENDIENTE','EN_ENVIO','REINTENTO','ENVIADO')) "
+                   "order by id").fetchall()
+n = cn.execute("UPDATE mensaje_intercambio SET actualizado = now()").rowcount
+chk('M03: a WHERE-less connector update touches only its own non-final OUT rows',
+    n == updatable and adm.execute(
+        "select id, actualizado from mensaje_intercambio where not (direccion='OUT' and endpoint_logico='installer' "
+        "and estado in ('PENDIENTE','EN_ENVIO','REINTENTO','ENVIADO')) order by id").fetchall() == snap, (n, updatable))
+chk('M03 setup: at least 2 own non-final OUT rows', updatable >= 2, updatable)
+
+for fid, fst in ((a1, 'CONFIRMADO'), (o2, 'ERROR')):
+    before = row(fid, 'estado,siguiente_intento,error')
+    chk('T12b: connector cannot reopen its own %s OUT row (0 rows)' % fst,
+        before[0] == fst and cn.execute("UPDATE mensaje_intercambio SET estado='REINTENTO', siguiente_intento=now(), "
+                                        "error='x', actualizado=now() WHERE id=%s" % fid).rowcount == 0
+        and row(fid, 'estado,siguiente_intento,error') == before, before)
 forged = {
     'insert with wf_id': "INSERT INTO mensaje_intercambio (direccion,wf_id,endpoint_logico,tipo_mensaje,msg_id_externo,"
                          "payload,estado) VALUES ('IN','fi-000123','installer','work-order-closed','forged-2','%s',"
@@ -559,6 +617,20 @@ crm.execute('COMMIT')
 chk('A7: crm connector settles and inserts its answer', s == 1 and len(ins) == 1, (s, ins))
 chk('A7: crm connector reads only its correlacion rows', crm.execute(
     'select ref_externa from correlacion').fetchall() == [('C-1',)])
+# R3-confirm-endpoint-mismatch: connector_crm also serves 'billing'; an answer on billing never confirms a crm row
+eng.execute("INSERT INTO conector_endpoint (rol, endpoint_logico) VALUES ('connector_crm', 'billing')")
+y1 = out('wfY', 'wfY:1', ep='crm')
+rows = ex(crm, 'claim', 'crm-gw-1', 120000, ['crm', 'billing'], 20)
+chk('two endpoints: crm connector claims wfY:1', [x[0] for x in rows] == [y1], rows)
+crm.execute('BEGIN')
+ex(crm, 'insert', 'billing', 'invoice-issued', None, 'evt-bill-1', 'wfY:1',
+   json.dumps({"schema": "invoice-issued@1", "data": {}}), None)
+k = ex(crm, 'confirm', 'wfY:1', 'billing')
+crm.execute('COMMIT')
+chk('R3: an answer on another endpoint of the same role does not confirm the OUT row',
+    k == 0 and row(y1)[0] == 'EN_ENVIO', (k, row(y1)))
+chk('R3: the answer on the OUT row\'s endpoint confirms it',
+    ex(crm, 'confirm', 'wfY:1', 'crm') == 1 and row(y1)[0] == 'CONFIRMADO')
 # installer answers with a correlacion_id of a crm OUT row: stored, but the intake (8.2) never routes it there
 r = ex(cn, 'insert', 'installer', 'work-order-created', None, 'evt-cross', 'wfX:1',
        json.dumps({"schema": "work-order-created@1", "data": {}}), None)
@@ -581,7 +653,7 @@ def worker(n):
     try:
         role, ep = ('connector_installer', 'installer') if n % 2 else ('connector_crm', 'crm')
         c = conn(role)
-        name = 'cgw-%d' % n
+        name = 'cgw-%s-%d' % (ep, n)
         idle = 0
         while idle < 5:
             rows = ex(c, 'claim', name, 120000, ['installer', 'crm'], 7)
@@ -620,7 +692,7 @@ chk('concurrency: no row settled twice', one(
     "select count(*) from (select id from claimlog where ev='CONFIRMADO' group by id having count(*)>1) x")[0] == 0)
 chk('concurrency: each endpoint claimed only by its role', one(
     "select count(*) from claimlog l join mensaje_intercambio m on m.id=l.id where l.ev='EN_ENVIO' and "
-    "((m.endpoint_logico='installer') <> (l.who ~ '^cgw-[1357]$'))")[0] == 0)
+    "l.who NOT LIKE 'cgw-' || m.endpoint_logico || '-%%'")[0] == 0)
 viol = one("""
  WITH m AS (SELECT id, lag(id) OVER (PARTITION BY wf_id, endpoint_logico ORDER BY id) prev
               FROM mensaje_intercambio WHERE wf_id LIKE 'cw%%'),
